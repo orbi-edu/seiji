@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Seiji</title>
+<link rel="stylesheet" href="/view/assets/viewer.css">
+<script src="/view/assets/viewer.js" defer></script>
+</head>
+<body>
+<header class="bar">
+  <div class="who">
+    <span class="dot" id="dot" aria-hidden="true"></span>
+    <span class="name" id="name">Connecting…</span>
+    <span class="meta" id="meta"></span>
+  </div>
+  <div class="acts" id="acts">
+    <span class="badge" id="mode" hidden>View only</span>
+    <button type="button" id="home" title="Home (⌘⇧H)" data-control>Home</button>
+    <button type="button" id="lock" title="Lock (⌘L)" data-control>Lock</button>
+    <button type="button" id="shot" title="Save a screenshot (⌘S)">Screenshot</button>
+  </div>
+</header>
+<div class="note" id="note" hidden></div>
+<main class="stage" id="stage">
+  <div class="screen" id="screen" tabindex="0" aria-label="Simulator screen">
+    <img id="frame" alt="Simulator screen" draggable="false">
+    <div class="veil" id="veil">
+      <p id="veil-text">Starting the stream…</p>
+    </div>
+  </div>
+</main>
+<footer class="status" id="status">
+  <span id="lease"></span>
+  <span id="ends"></span>
+  <span id="viewers"></span>
+  <span class="keys" id="keys">Click to tap · hold to long-press · drag to swipe · scroll to scroll · type to type</span>
+</footer>
+</body>
+</html>

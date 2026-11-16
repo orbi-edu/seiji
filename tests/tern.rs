@@ -1,0 +1,180 @@
+//! The Tern plugin (`tern-plugin/`) in a headless Tern (`tern serve`), against a Seiji server
+//! with fake devices and the real `seiji` CLI. Skips when `tern` is not installed.
+
+mod common;
+
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use serde_json::{Value, json};
+
+use common::*;
+
+/// Lines Tern logs when a plugin handler raises or a view is rejected.
+const PLUGIN_ERRORS: [&str; 5] =
+    ["plugin handler failed", "plugin failed", "stencil_plugins: ", "unknown kind", "duplicate child key"];
+const LEAVES: [&str; 6] = [".sf-text", ".sf-item", ".sf-card-head", ".sf-badge", ".sf-tab", ".sf-kv"];
+
+fn tern() -> Option<PathBuf> {
+    std::env::var_os("PATH")?.to_str()?.split(':').map(|d| Path::new(d).join("tern")).find(|p| p.is_file())
+}
+
+fn copy_dir(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let dest = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir(&entry.path(), &dest);
+        } else {
+            std::fs::copy(entry.path(), dest).unwrap();
+        }
+    }
+}
+
+struct Tern {
+    bin: PathBuf,
+    sock: PathBuf,
+    log: PathBuf,
+    child: tokio::process::Child,
+    _dir: tempfile::TempDir,
+}
+
+impl Tern {
+    async fn start(bin: PathBuf, env: &Env, token: &str) -> Self {
+        // A short path: the control socket must fit in sockaddr_un.
+        let dir = tempfile::Builder::new().prefix("seijitern-").tempdir_in("/tmp").unwrap();
+        let app = dir.path().join("root/crates/app");
+        std::fs::create_dir_all(&app).unwrap();
+        copy_dir(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("tern-plugin"),
+            &dir.path().join("root/crates/plugins/fixtures/seiji"),
+        );
+        let (sock, log) = (dir.path().join("ctl.sock"), dir.path().join("serve.log"));
+        let child = tokio::process::Command::new(&bin)
+            .args(["serve", "--control"])
+            .arg(&sock)
+            .arg("--out")
+            .arg(dir.path().join("out"))
+            .current_dir(dir.path())
+            .env("TERN_CONFIG_DIR", dir.path().join("config"))
+            .env("STENCIL_FIXTURE_ROOT", &app)
+            .env("STENCIL_LOG", "warn,tern::plugin=info")
+            .env("SEIJI_BIN", env!("CARGO_BIN_EXE_seiji"))
+            .env("SEIJI_URL", &env.url)
+            .env("SEIJI_TOKEN", token)
+            .stdout(std::fs::File::create(&log).unwrap())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !sock.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "tern serve did not start: {}",
+                std::fs::read_to_string(&log).unwrap_or_default()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let t = Self { bin, sock, log, child, _dir: dir };
+        t.ctl(&["size", "1280 860"]).await;
+        t.ctl(&["ready"]).await;
+        t.ctl(&["plugins", "fixtures"]).await;
+        t.ctl(&["status-bar", "on"]).await;
+        t
+    }
+
+    async fn ctl(&self, words: &[&str]) -> Value {
+        let out = tokio::process::Command::new(&self.bin)
+            .args(["ctl", "--control"])
+            .arg(&self.sock)
+            .args(words)
+            .output()
+            .await
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let reply: Value = serde_json::from_str(stdout.lines().last().unwrap_or("{}")).unwrap();
+        assert_eq!(reply["ok"], true, "ctl {words:?}: {reply}");
+        reply
+    }
+
+    /// The visible text of the focused pane's `region`, one line per leaf node.
+    async fn text(&self, region: &str) -> String {
+        let selector = LEAVES.iter().map(|l| format!(".tn-pane.on .{region} {l}")).collect::<Vec<_>>().join(", ");
+        let reply = self.ctl(&["tree", &selector]).await;
+        reply["nodes"].as_array().unwrap().iter().filter_map(|n| n["text"].as_str()).collect::<Vec<_>>().join("\n")
+    }
+
+    async fn wait_for(&self, what: &str, selector: &str, ok: impl Fn(&str) -> bool) -> String {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let reply = self.ctl(&["tree", selector]).await;
+            let text = reply["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|n| n["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if ok(&text) {
+                return text;
+            }
+            assert!(Instant::now() < deadline, "{what} never showed; {selector} shows:\n{text}");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    async fn wait_text(&self, needle: &str, region: &str) -> String {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let text = self.text(region).await;
+            if text.contains(needle) {
+                return text;
+            }
+            assert!(Instant::now() < deadline, "{needle:?} never appeared; {region} shows:\n{text}");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    fn plugin_errors(&self) -> Vec<String> {
+        let log = std::fs::read_to_string(&self.log).unwrap_or_default();
+        log.lines().filter(|l| PLUGIN_ERRORS.iter().any(|m| l.contains(m))).map(String::from).collect()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_panel_opens_the_screen_beside_it_and_releases_the_device() {
+    let Some(bin) = tern() else {
+        eprintln!("skipped: tern is not on PATH");
+        return;
+    };
+    let env = setup(2).await;
+    let token = add_user(&env, "alice", QUOTA);
+    let c = client(&env, &token).await;
+    let lease = ok_json(&call(&c, "acquire_device", json!({"platform": "ios"})).await);
+    let lease_id = lease["lease_id"].as_str().unwrap().to_string();
+
+    let mut t = Tern::start(bin, &env, &token).await;
+    t.ctl(&["plugins", "run", "plugin.seiji.devices"]).await;
+    let main = t.wait_text(&lease_id, "sf-main").await;
+    assert!(main.contains("iphone-16") && main.contains("alice"), "{main}");
+    t.wait_for("the status segment", ".sl-plugin", |s| s.contains("Seiji") && s.contains("min left")).await;
+
+    // `o` asks for a viewer link and opens it in Tern's browser beside the panel.
+    t.ctl(&["key", "o"]).await;
+    let opened = format!("{}/view/open/", env.url);
+    t.wait_for("the browser beside the panel", ".tn-pane.web", |s| s.contains(&opened)).await;
+
+    // `x` asks first; enter releases the device.
+    t.ctl(&["click", ".tn-pane.dim .sf-main"]).await;
+    t.ctl(&["key", "x"]).await;
+    t.wait_text("Release iphone-16?", "sf-dock").await;
+    t.ctl(&["key", "enter"]).await;
+    t.wait_text("No devices", "sf-main").await;
+    assert_eq!(*env.fake.destroyed.lock().unwrap(), [lease_id]);
+
+    assert_eq!(t.plugin_errors(), Vec::<String>::new());
+    let _ = t.ctl(&["quit"]).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), t.child.wait()).await;
+}

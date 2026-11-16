@@ -1,0 +1,15 @@
+schema = 1
+id = "seiji"
+name = "Seiji"
+version = "0.1.0"
+description = "Your Seiji simulators inside Tern: budget, devices, runs, and the live screen in Tern's browser."
+icon = "monitor"
+host = "host.luau"
+window = "window.luau"
+# Tern 0.8.3 ignores a block's `font = "sans"`: this sheet gives Seiji's regions the UI face.
+styles = ["styles.css"]
+
+[[blocks]]
+id = "app"
+title = "Seiji"
+icon = "monitor"

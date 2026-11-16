@@ -1,0 +1,14 @@
+/*
+ * The `font: "sans"` the block declares, for Tern 0.8.3: that release adds no `sf-sans` class, so
+ * this sheet gives Seiji's regions the UI face. Machine strings stay mono through the span tokens.
+ */
+.sf-region[data-surface^="plugin.seiji."] {
+	font-family: var(--sans);
+	font-size: 13px;
+	line-height: 18px;
+}
+
+.sf-region[data-surface^="plugin.seiji."] :is(.sf-t-mono, .sf-t-key, .sf-t-code, .sf-t-path, .sf-t-num, .sf-code, .sf-input) {
+	font-family: var(--mono);
+	font-size: 12.5px;
+}

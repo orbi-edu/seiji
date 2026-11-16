@@ -1,0 +1,223 @@
+/* Seiji's screen viewer, drawn to sit in Tern's browser block: sans text, quiet grays, hairlines,
+   color only where it means something, light and dark from the system. */
+
+:root {
+  color-scheme: light dark;
+  --bg: #fbfbfc;
+  --l1: #ffffff;
+  --fg: #18181b;
+  --muted: #71717a;
+  --line: rgba(0, 0, 0, 0.09);
+  --hover: rgba(0, 0, 0, 0.05);
+  --accent: #2563eb;
+  --success: #16a34a;
+  --warning: #d97706;
+  --error: #dc2626;
+  --stage: #f1f1f3;
+  --sans: "Geist", -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+  --mono: "Geist Mono", "SF Mono", ui-monospace, Menlo, monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #111113;
+    --l1: #18181b;
+    --fg: #ededef;
+    --muted: #8b8b93;
+    --line: rgba(255, 255, 255, 0.09);
+    --hover: rgba(255, 255, 255, 0.06);
+    --accent: #60a5fa;
+    --success: #4ade80;
+    --warning: #fbbf24;
+    --error: #f87171;
+    --stage: #0b0b0d;
+  }
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--fg);
+  font: 13px/18px var(--sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+body {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  height: 40px;
+  padding: 0 10px 0 12px;
+  border-bottom: 1px solid var(--line);
+  background: var(--l1);
+  flex: none;
+}
+
+.who {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.name { font-weight: 600; white-space: nowrap; }
+
+.meta {
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--muted);
+  flex: none;
+}
+
+.dot.live { background: var(--success); }
+.dot.busy { background: var(--warning); }
+.dot.off { background: var(--error); }
+
+.acts {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+}
+
+button {
+  font: inherit;
+  color: var(--fg);
+  height: 26px;
+  padding: 0 10px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: var(--l1);
+}
+
+button:hover { background: var(--hover); }
+button:disabled { color: var(--muted); }
+button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+.badge {
+  font-size: 12px;
+  line-height: 18px;
+  padding: 0 7px;
+  border-radius: 9px;
+  border: 1px solid var(--line);
+  color: var(--muted);
+}
+
+.note {
+  flex: none;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--line);
+  color: var(--warning);
+  background: var(--l1);
+}
+
+.note.error { color: var(--error); }
+
+.stage {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  background: var(--stage);
+}
+
+.screen {
+  position: relative;
+  height: 100%;
+  max-width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  outline: none;
+}
+
+.screen img {
+  display: block;
+  max-height: 100%;
+  max-width: 100%;
+  border-radius: 24px;
+  box-shadow: 0 0 0 1px var(--line), 0 12px 32px rgba(0, 0, 0, 0.18);
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: none;
+  background: #000;
+}
+
+.screen:focus-visible img { box-shadow: 0 0 0 2px var(--accent), 0 12px 32px rgba(0, 0, 0, 0.18); }
+
+.veil {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+  pointer-events: none;
+}
+
+.veil[hidden] { display: none; }
+
+.touch {
+  position: absolute;
+  width: 34px;
+  height: 34px;
+  margin: -17px 0 0 -17px;
+  border-radius: 50%;
+  border: 2px solid var(--accent);
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+  pointer-events: none;
+  animation: touch 420ms ease-out forwards;
+}
+
+@keyframes touch {
+  from { opacity: 1; transform: scale(0.6); }
+  to { opacity: 0; transform: scale(1.4); }
+}
+
+.status {
+  flex: none;
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  height: 26px;
+  padding: 0 12px;
+  border-top: 1px solid var(--line);
+  background: var(--l1);
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.status #lease { font-family: var(--mono); font-size: 11.5px; }
+.status .keys { margin-left: auto; overflow: hidden; text-overflow: ellipsis; }
+
+.gone {
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+  padding: 24px;
+  text-align: center;
+}

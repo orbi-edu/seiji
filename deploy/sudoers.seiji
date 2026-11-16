@@ -1,0 +1,6 @@
+# /etc/sudoers.d/seiji  (install with: sudo visudo -cf deploy/sudoers.seiji && sudo install -m 440 deploy/sudoers.seiji /etc/sudoers.d/seiji)
+#
+# The daemon account may run only the two tenant helpers as root. Both refuse any target account
+# that is not in the seiji-tenants group, is an admin, or has uid < 501.
+Defaults:seiji !requiretty, env_reset
+seiji ALL=(root) NOPASSWD: /usr/local/bin/seiji exec-as *, /usr/local/bin/seiji kill-as *

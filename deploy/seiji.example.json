@@ -1,0 +1,70 @@
+{
+  "listen": {
+    "host": "0.0.0.0",
+    "port": 4780,
+    "allowedHosts": ["localhost", "127.0.0.1", "seiji.example.com"],
+    "publicUrl": "https://seiji.example.com"
+  },
+  "dataDir": "/usr/local/var/seiji",
+  "seats": 10,
+  "costPerDeviceHourUsd": 0.75,
+  "capacity": { "ios": 12, "android": 6 },
+  "defaultQuota": {
+    "monthlyMinutes": 1200,
+    "maxConcurrent": 2,
+    "maxLeaseMinutes": 120,
+    "idleMinutes": 15
+  },
+  "isolation": {
+    "mode": "os_user",
+    "userPrefix": "seiji-",
+    "helper": "/usr/local/bin/seiji"
+  },
+  "ios": {
+    "models": {
+      "iphone-16": {
+        "deviceType": "com.apple.CoreSimulator.SimDeviceType.iPhone-16",
+        "runtime": "com.apple.CoreSimulator.SimRuntime.iOS-18-5"
+      },
+      "ipad-air": {
+        "deviceType": "com.apple.CoreSimulator.SimDeviceType.iPad-Air-11-inch-M3",
+        "runtime": "com.apple.CoreSimulator.SimRuntime.iOS-18-5"
+      }
+    },
+    "defaultModel": "iphone-16"
+  },
+  "android": {
+    "sdkRoot": "/opt/android-sdk",
+    "avdHome": "/opt/android-avd",
+    "models": {
+      "pixel-8": { "avd": "pixel_8_api_35" }
+    },
+    "defaultModel": "pixel-8"
+  },
+  "axe": {
+    "bin": "/opt/homebrew/bin/axe",
+    "stepTimeoutSeconds": 60
+  },
+  "evidence": {
+    "retentionHours": 168,
+    "maxBytesPerUser": 5368709120,
+    "maxRunBytes": 2147483648,
+    "maxRunSeconds": 1800,
+    "maxSteps": 200
+  },
+  "xctest": {
+    "timeoutSeconds": 3600
+  },
+  "viewer": {
+    "fps": 10,
+    "scale": 0.5,
+    "quality": 70,
+    "maxViewersPerLease": 4,
+    "sessionHours": 12
+  },
+  "maestro": {
+    "bin": "/opt/maestro/bin/maestro",
+    "javaHome": "/opt/homebrew/opt/openjdk@17",
+    "flowTimeoutSeconds": 600
+  }
+}
