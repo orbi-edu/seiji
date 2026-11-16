@@ -8,6 +8,7 @@ This guide shows how to see and drive your Seiji simulators from [Tern](https://
 - [Requirements](#requirements)
 - [Install](#install)
 - [Sign in](#sign-in)
+- [Example: check a sign-in screen](#example-check-a-sign-in-screen)
 - [The panel](#the-panel)
 - [The screen](#the-screen)
 - [Links from agents](#links-from-agents)
@@ -35,20 +36,31 @@ This guide shows how to see and drive your Seiji simulators from [Tern](https://
 
 ## Install
 
-From a clone of this repository:
+You need Rust (`rustup`) and Tern desktop on your Mac. No clone is needed.
+
+**1. Install the `seiji` CLI.** It signs you in and keeps your token in the keychain. The plugin asks it for the token.
 
 ```sh
-cargo install --path .            # the seiji CLI
-tern plugin link tern-plugin      # use the plugin where it is
+cargo install --git https://github.com/wiljafor1/seiji
+seiji --version
 ```
 
-Or without a clone:
+**2. Install the plugin.**
 
 ```sh
 tern plugin install github.com/wiljafor1/seiji/tern-plugin
+tern plugin list            # seiji 0.1.0 Seiji — 1 blocks, 0 lenses, window  ready
 ```
 
-Tern started from the Dock may not have `~/.cargo/bin` on its PATH. Then set `SEIJI_BIN` to the CLI's path in the environment Tern starts with, or link the binary into `/usr/local/bin`.
+Tern loads it at once; no restart.
+
+**3. Let Tern find the CLI.** Tern started from the Dock may not have `~/.cargo/bin` on its PATH. When the panel says *The seiji CLI is missing*, point Tern at it and start Tern again:
+
+```sh
+launchctl setenv SEIJI_BIN "$HOME/.cargo/bin/seiji"
+```
+
+To work on the plugin itself, use the copy in a clone instead: `tern plugin link tern-plugin` from the repository's root. Tern then reads the files where they are. `tern plugin remove seiji` (installed) or `tern plugin unlink seiji` (linked) takes it out.
 
 ## Sign in
 
@@ -63,6 +75,38 @@ seiji logout
 ```
 
 `SEIJI_URL` and `SEIJI_TOKEN` override the keychain, for CI and tests.
+
+## Example: check a sign-in screen
+
+This example walks through a typical session. You boot an iPhone, try the sign-in screen by hand, then let an agent record the same check as a run with evidence. The pictures come from Seiji's test harness, which uses a fake simulator.
+
+**1. Open the panel.** Press ⌃⌥D, or run **Seiji: Devices** from the palette. The head shows your minutes this month.
+
+**2. Boot a device.** Press `n` and pick `iphone-16`. The row counts the seconds while it boots (30-90 s). When it says `ready`, install your app the usual way, for example by asking your agent to call `install_app`.
+
+**3. Look at it.** Press `s`. A screenshot appears in the device card.
+
+![The Devices tab with a screenshot in the device card](images/tern-devices.png)
+
+**4. Drive it.** Press `o`. The screen opens in Tern's browser beside the panel. Click **Email** and type an address, click **Password** and type, then click **Sign In**. Press `f` instead of `o` to float the screen over the panel while you work in another pane.
+
+![The screen in Tern's browser](images/tern-screen.png)
+
+**5. Let an agent record it.** In an agent pane (Claude Code, Codex, omp) connected to Seiji's MCP endpoint, ask:
+
+```text
+Call share_screen on my Seiji iPhone so I can watch. Then run_actions named
+"Sign in works": tap "Email", type "ana@example.com", tap "Sign In", and
+assert "Welcome, Ana!" is visible.
+```
+
+The agent prints a viewer link. Click it in the agent's pane: the screen opens beside that pane, and you watch the steps as they run. The link is view-only unless the agent passes `control: true`.
+
+**6. Use the evidence.** Press `tab` for **Runs**. The run's summary shows in its card: the verdict, every step and the files. Press `c` to copy the Markdown for your pull request, or `d` to save `evidence.zip` to `~/Downloads`.
+
+![The Runs tab with a run's summary](images/tern-runs.png)
+
+**7. Release the device.** Back in **Devices**, press `x`, then enter. The device stops counting against your minutes. The run and its evidence stay.
 
 ## The panel
 

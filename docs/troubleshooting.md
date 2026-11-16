@@ -537,7 +537,7 @@ A view-only session answers `403` with `This viewer is view-only.` for every inp
 
 **Cause:** The plugin runs `seiji token print --json` to read your token. Tern did not find `seiji`. A Tern started from the Dock does not get your shell's `PATH`.
 
-**Fix:** Install the CLI (`cargo install --path .` from a clone), or set `SEIJI_BIN` to the full path of `seiji` in the environment that starts Tern. Then sign in with `seiji login --url <server>` or **Seiji: Sign in** ([tern.md](tern.md)).
+**Fix:** Install the CLI (`cargo install --git https://github.com/wiljafor1/seiji`). Tern started from the Dock may not have `~/.cargo/bin` on its PATH: run `launchctl setenv SEIJI_BIN "$HOME/.cargo/bin/seiji"` and start Tern again. Then sign in with `seiji login --url <server>` or **Seiji: Sign in** ([tern.md](tern.md)).
 
 When the plugin says you are not signed in, `seiji token print` found no credential: run `seiji login --url <server>`.
 

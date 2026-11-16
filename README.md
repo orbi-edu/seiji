@@ -125,15 +125,28 @@ You need macOS with Xcode and an iOS simulator runtime, Rust 1.88 or later, and 
 
 ## Watch and drive the simulator in Tern
 
-The Seiji plugin for [Tern](https://tern.sh) desktop shows your budget, your devices and your runs in a panel. It opens a device's screen in the viewer, in Tern's browser beside the panel, where you watch it live and tap, swipe and type on it. The viewer works on iOS simulators only. From a clone of this repository, install the `seiji` CLI and the plugin on your Mac, then sign in with your token:
+The Seiji plugin for [Tern](https://tern.sh) desktop shows your budget, your devices and your runs in a panel. It opens a device's screen in the viewer, in Tern's browser beside the panel, where you watch it live and tap, swipe and type on it. The viewer works on iOS simulators only.
+
+![The Seiji panel in Tern: budget, devices and a screenshot](docs/images/tern-devices.png)
+
+Install the `seiji` CLI and the plugin on your Mac, then sign in with the token your admin gave you:
 
 ```sh
-cargo install --path .
-tern plugin link tern-plugin
-seiji login --url https://seiji.example.com
+cargo install --git https://github.com/wiljafor1/seiji
+tern plugin install github.com/wiljafor1/seiji/tern-plugin
+seiji login --url https://seiji.example.com    # paste the token
 ```
 
-[docs/tern.md](docs/tern.md) covers the panel, the keys and the limits.
+Then, in Tern:
+
+1. Press ⌃⌥D. The panel opens with your minutes and devices.
+2. Press `n` and pick `iphone-16` to boot a simulator.
+3. Press `o`. The screen opens beside the panel. Click to tap, drag to swipe, type to type.
+4. Ask your agent to `share_screen` and `run_actions`; click the link it prints to watch the run.
+5. Press `tab` for **Runs**, then `c` to copy the run's summary for your pull request.
+6. Press `x`, then enter, to release the device.
+
+[docs/tern.md](docs/tern.md) has the full walkthrough with pictures, the keys and the limits. When the panel says *The seiji CLI is missing*, run `launchctl setenv SEIJI_BIN "$HOME/.cargo/bin/seiji"` and start Tern again.
 
 ## Documentation
 
