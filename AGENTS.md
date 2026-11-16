@@ -23,6 +23,7 @@ Read these documents before you change a component:
 | MCP tools or HTTP routes | [docs/mcp.md](docs/mcp.md) |
 | `src/viewer.rs`, `src/viewer/`, `/view/…` routes | [docs/security.md](docs/security.md#the-viewer), [docs/mcp.md](docs/mcp.md#viewer-routes) |
 | `tern-plugin/`, `src/client.rs` | [docs/tern.md](docs/tern.md), [docs/cli.md](docs/cli.md) |
+| `src/forward.rs`, `seiji forward`, `/v1/leases/{lease_id}/forward` | [docs/apps.md](docs/apps.md), [docs/security.md](docs/security.md#tunnels-seiji-forward), [docs/mcp.md](docs/mcp.md#get-v1leaseslease_idforward) |
 | Config keys | [docs/configuration.md](docs/configuration.md) |
 | CLI commands or flags | [docs/cli.md](docs/cli.md) |
 | Install steps, `deploy/` | [docs/install.md](docs/install.md) |
@@ -35,7 +36,7 @@ document in the same commit.
 
 | Path | Contents |
 |---|---|
-| `src/main.rs` | The `seiji` CLI: `serve`, `user`, `usage`, `tenant`, `doctor`, the client commands `login`, `logout` and `token print`, and the hidden root helpers. |
+| `src/main.rs` | The `seiji` CLI: `serve`, `user`, `usage`, `tenant`, `doctor`, the client commands `login`, `logout`, `token print` and `forward`, and the hidden root helpers. |
 | `src/config.rs` | `seiji.json`: types, defaults, validation. |
 | `src/store.rs` | SQLite: users, leases (the usage ledger), builds, runs. Month windows and token hashing. |
 | `src/pool.rs` | Admission, acquire and release, operations on a lease, the reaper, recovery. |
@@ -48,14 +49,16 @@ document in the same commit.
 | `src/exec.rs` | `Runner`: runs a command as a user's account, captures output or streams it to a file, kills or interrupts process groups. |
 | `src/tenant.rs` | Root helpers and tenant account provisioning. Security-critical. |
 | `src/mcp.rs` | The MCP tools. |
-| `src/http.rs` | axum router: `/mcp`, `/v1/apps`, `/v1/runs/…`, `/v1/me`, `/v1/leases/{lease_id}/viewer`, `/v1/leases/{lease_id}/screenshot.jpg`, `/healthz`, bearer auth. Merges the viewer routes. |
+| `src/http.rs` | axum router: `/mcp`, `/v1/apps`, `/v1/runs/…`, `/v1/me`, `/v1/leases/{lease_id}/viewer`, `/v1/leases/{lease_id}/screenshot.jpg`, `/v1/leases/{lease_id}/forward` (WebSocket), `/healthz`, bearer auth. Merges the viewer routes. |
 | `src/viewer.rs` | The viewer: viewer links, tickets and viewer sessions (in memory), the `/view/…` routes and cookie checks, one shared AXe stream per lease, input under the op lock. Security-critical. |
 | `src/viewer/` | The viewer page assets, embedded in the binary: `index.html`, `viewer.js`, `viewer.css`. |
-| `src/client.rs` | The client commands on a developer's Mac: `login` (token into the keychain), `logout`, `token print`. |
+| `src/forward.rs` | `seiji forward`: the tunnel protocol (hello, OPEN, DATA and CLOSE frames), tunnel admission and the server loop on a loopback port, and the client end that dials one local port. |
+| `src/client.rs` | The client commands on a developer's Mac: `login` (token into the keychain), `logout`, `token print`, and `forward` (picks the lease, runs the tunnel, points the app at it). |
 | `tern-plugin/` | The Tern plugin: `plugin.toml`, `host.luau`, `window.luau`, `styles.css`, `lib/*.luau`. |
 | `tests/common/mod.rs` | Test harness: real HTTP and MCP, `FakeDevices` (a login screen and a fake stream), a stub `maestro`. |
 | `tests/e2e.rs`, `tests/runs.rs` | End-to-end tests: leases and billing; recorded runs and evidence. |
 | `tests/viewer.rs`, `tests/tern.rs` | The viewer; the Tern plugin in a headless Tern (skips without `tern` on `PATH`). |
+| `tests/forward.rs` | `seiji forward`: the tunnel end to end, its refusals, and the real CLI pointing the app. |
 | `assets/` | Logo: `logo-mark.svg`, `logo-light.svg`, `logo-dark.svg`. |
 | `deploy/` | Example config, sudoers rule, launchd plist. |
 | `docs/` | User and operator documentation. |

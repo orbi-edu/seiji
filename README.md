@@ -24,7 +24,8 @@ Seiji is for a team that rents one Mac, for example an AWS EC2 `mac-m4max.metal`
 | Devices | A fresh iOS simulator (or Android emulator) for each lease, models you choose in the config |
 | Recorded runs | `run_actions` (tap, type, swipe, scroll, button, key, `wait_for`, `assert_visible`, `assert_not_visible`, `screenshot`, `capture_tree`, `open_url`, `launch_app`, `terminate_app`, `sleep`), `run_xctest` (`test-without-building`, keeps the `.xcresult`), `run_flow` (Maestro) |
 | Evidence | Video, app log, crash reports, a screenshot per step, the accessibility tree at a failure, per-test results, a manifest with SHA-256s, a Markdown summary for pull requests, `evidence.zip`. Secret text is redacted |
-| Device control | Install, launch, terminate, uninstall, open URLs, fixed status bar, light or dark mode, simulated location, privacy permissions, push notifications, recent logs |
+| Device control | Install, launch, terminate, uninstall, open URLs, fixed status bar, light or dark mode, simulated location, privacy permissions, the React Native bundler location, push notifications, recent logs |
+| Dev servers | `seiji forward` opens a tunnel, so the device loads your app from Metro or another dev server on your laptop: Expo Go, Expo development builds, React Native debug builds |
 | Viewer | Watch a lease's iOS simulator live in a browser or in Tern, and tap, swipe and type on it. Agents share one-time viewer links with `share_screen` |
 | Agent interface | Remote MCP over Streamable HTTP with a bearer token (23 tools); file downloads under `/v1/runs/` |
 | Budgets | Seats, device-minutes per month, devices at the same time, maximum lease length, idle release, evidence bytes per user, an estimate in US dollars |
@@ -123,6 +124,17 @@ You need macOS with Xcode and an iOS simulator runtime, Rust 1.88 or later, and 
 
 > **Status:** Running `simctl`, AXe and `recordVideo` for a macOS account that never logged in to the GUI, through `launchctl asuser`, is not yet verified on a real EC2 host. `seiji doctor <user>` is the test. If it fails, set `isolation.mode` to `"shared"`. Then all people share the daemon account, and Seiji keeps them apart only through their tokens.
 
+## Test your app
+
+Install a build: the app carries its own bundle and needs nothing from your laptop. Or keep Metro on your laptop and open a tunnel to it with `seiji forward`, while you hold a device:
+
+```sh
+npx expo start
+seiji forward 8081 --expo-go
+```
+
+[docs/apps.md](docs/apps.md) covers both ways: Expo Go, Expo development builds, React Native and Android.
+
 ## Watch and drive the simulator in Tern
 
 The Seiji plugin for [Tern](https://tern.sh) desktop shows your budget, your devices and your runs in a panel. It opens a device's screen in the viewer, in Tern's browser beside the panel, where you watch it live and tap, swipe and type on it. The viewer works on iOS simulators only.
@@ -159,6 +171,7 @@ Then, in Tern:
 | [Install](docs/install.md) | EC2 Mac, accounts, sudoers, launchd, TLS, agent setup |
 | [Configuration](docs/configuration.md) | Every key of `seiji.json` |
 | [MCP and HTTP API](docs/mcp.md) | Tools, the actions reference, results, errors, uploads and downloads, viewer links |
+| [Testing your app](docs/apps.md) | Install a build, or run your dev server through `seiji forward` |
 | [Tern](docs/tern.md) | The Tern plugin and the viewer |
 | [CLI](docs/cli.md) | The `seiji` command |
 | [Security](docs/security.md) | Trust boundaries, root helpers, evidence handling, file permissions, known limits |

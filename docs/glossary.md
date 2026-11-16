@@ -17,6 +17,7 @@ All Seiji documents use these terms with these meanings only. [concepts.md](conc
 | **CoreSimulatorService** | The macOS service that owns the simulators of one account, in that account's launchd domain; each tenant account has its own, and so its own device set. |
 | **Daemon account** | The unprivileged, hidden macOS account `seiji` that runs `seiji serve`. |
 | **Device** | An iOS simulator (named `seiji-<lease id>`) or an Android emulator (`emulator-<console port>`), created for one lease and deleted at its release. |
+| **Device address** | `host:port` at which a lease's device reaches a tunnel: `127.0.0.1:<port>` on an iOS simulator, `10.0.2.2:<port>` on an Android emulator; `seiji forward` prints it ([apps.md](apps.md)). |
 | **Device-minute** | One minute that one lease exists, from admission (boot included) to its end. |
 | **Driver port** | The host TCP port that Seiji gives each lease and passes to Maestro as `--driver-host-port`. |
 | **End reason** | Why a lease ended: `released`, `idle`, `max_lease_duration`, `budget_exhausted`, `user_disabled`, `boot_failed` (not billed), `server_restart` or `server_shutdown`. |
@@ -43,6 +44,7 @@ All Seiji documents use these terms with these meanings only. [concepts.md](conc
 | **Tern plugin** | `tern-plugin/`: a [Tern](https://tern.sh) panel with a user's budget, devices and runs that opens the viewer beside it; it reads the token with `seiji token print --json` ([tern.md](tern.md)). |
 | **Ticket** | The single-use, 64-hex secret in a viewer link; it lives 60 s, in memory only, and `GET /view/open/<ticket>` trades it for a viewer session. |
 | **Token** | A user's credential, `sj_` plus 43 URL-safe base64 characters, sent as `Authorization: Bearer <token>` and stored only as its SHA-256. |
+| **Tunnel** | What `seiji forward` opens: a WebSocket to `GET /v1/leases/{lease_id}/forward` that carries every connection the device makes to its device address to one port on the developer's machine, such as Metro on `8081`; it ends with the client or the lease. |
 | **User** | A Seiji account with a token and a quota: a row in the `users` table. |
 | **Viewer** | The live view of a lease's iOS simulator screen in a browser or in Tern (`/view/…`), which can also send taps, swipes, typing and buttons; one AXe stream per lease serves every viewer of it. |
 | **Viewer link** | The one-time URL `<publicUrl>/view/open/<ticket>` from `share_screen` (view-only by default) or `POST /v1/leases/{lease_id}/viewer` (control by default), valid 60 s. |

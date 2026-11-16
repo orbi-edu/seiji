@@ -30,6 +30,7 @@ Each section gives a symptom, the checks to do, and the fix. The quoted texts ar
 - [App upload and install errors](#app-upload-and-install-errors)
 - [Screenshots](#screenshots)
 - [The viewer](#the-viewer)
+- [Tunnels](#tunnels)
 - [Leftover devices after a crash](#leftover-devices-after-a-crash)
 - [`cheat_sheet` fails](#cheat_sheet-fails)
 
@@ -292,7 +293,7 @@ ls -ld /usr /usr/local /usr/local/var /usr/local/var/seiji
 
 ## `<what> supports iOS simulators only for now`
 
-**Sign:** A tool fails with `<what> supports iOS simulators only for now`. `<what>` names the tool or the operation: `run_actions`, `run_xctest`, `launch_app`, `terminate_app`, `uninstall_app`, `open_url`, `push_notification` or `get_logs`. `configure_device` puts the operation first, for example `status_bar: status_bar supports iOS simulators only for now` (also `appearance`, `location`, `permissions`).
+**Sign:** A tool fails with `<what> supports iOS simulators only for now`. `<what>` names the tool or the operation: `run_actions`, `run_xctest`, `launch_app`, `terminate_app`, `uninstall_app`, `open_url`, `push_notification` or `get_logs`. `configure_device` puts the operation first, for example `status_bar: status_bar supports iOS simulators only for now` (also `appearance`, `location`, `permissions`, `react_native_bundler`).
 
 **Cause:** The lease holds an Android emulator. These tools use `xcrun simctl`, AXe or `xcodebuild`, which exist only for iOS simulators. Nothing ran.
 
@@ -473,7 +474,7 @@ Without `predicate`, `get_logs` uses the installed app's process and subsystem. 
 | `download exceeds <N> bytes` | `install_app` with `url` | The build is larger than `maxUploadBytes`. |
 | An error that mentions `redirect to a non-https URL` or `too many redirects` | `install_app` with `url` | Seiji follows at most 5 redirects, all `https`. Use the final `https` URL. The download also stops after 600 s. |
 | `installing app exited 2: iOS apps must be a .zip or .tar.gz containing a simulator .app bundle` | iOS | The file name must end with `.zip`, `.tar.gz` or `.tgz`. |
-| `installing app exited 2: no .app bundle inside the archive` | iOS | The archive has no `*.app` directory within three levels. |
+| `installing app exited 2: no .app bundle inside the archive` | iOS | The archive has no `*.app` directory within three levels, and no `Info.plist` at its top. An archive of a bundle's contents (Expo Go's simulator build) installs. |
 | `installing app exited <code>: <simctl output>` | iOS | Often a device build. Simulators need a simulator build (`-sdk iphonesimulator`). |
 | `Android apps must be an .apk` | Android | Upload an `.apk`. |
 | `installing app timed out`, `adb install timed out` | both | The install took more than 600 s. |
@@ -540,6 +541,58 @@ A view-only session answers `403` with `This viewer is view-only.` for every inp
 **Fix:** Install the CLI (`cargo install --git https://github.com/wiljafor1/seiji`). Tern started from the Dock may not have `~/.cargo/bin` on its PATH: run `launchctl setenv SEIJI_BIN "$HOME/.cargo/bin/seiji"` and start Tern again. Then sign in with `seiji login --url <server>` or **Seiji: Sign in** ([tern.md](tern.md)).
 
 When the plugin says you are not signed in, `seiji token print` found no credential: run `seiji login --url <server>`.
+
+## Tunnels
+
+`seiji forward` opens a tunnel, so the device reaches a port on your Mac ([apps.md](apps.md#run-your-dev-server-with-seiji-forward)). Its route and statuses are in [mcp.md](mcp.md#get-v1leaseslease_idforward), its options in [cli.md](cli.md#seiji-forward).
+
+### The server refuses the tunnel
+
+**Sign:** `seiji forward` exits 1 with `the server refused the tunnel (<status>): <message>`.
+
+| Status and message | Cause | Fix |
+|---|---|---|
+| `403 Forbidden`: `forwarding is off on this server` | The operator set `forward.enabled` to `false` ([configuration.md](configuration.md#forward)). | Install a build instead ([apps.md](apps.md#install-a-build)), or ask the operator. |
+| `429 Too Many Requests`: `this lease already has <N> tunnels open` | The lease already has `forward.maxPerLease` tunnels open (default 2). | Stop another `seiji forward` on the same lease, or raise `forward.maxPerLease`. |
+| `404 Not Found`: `no active lease "<lease id>" for you`, `lease <lease id> is still booting`, `lease <lease id> is ending` | The lease is not yours, has ended, is still booting, or is being released. | Check the id with `budget_status`. Wait for `acquire_device` to return. |
+| `401 Unauthorized`: `missing, invalid or disabled bearer token` | The stored token is wrong, rotated, or the user is disabled. | See [Tool calls get 401](#tool-calls-get-401), then `seiji login --url <server>` again. |
+
+### `seiji forward` cannot pick a lease
+
+| Message | Fix |
+|---|---|
+| `you hold no ready device; acquire one first (acquire_device, or n in Tern)` | Acquire a device and wait until it is `ready`, then run `seiji forward` again. |
+| `you hold <N> devices; pick one with --lease (<lease ids>)` | Pass one of the listed ids: `seiji forward 8081 --lease l_…`. |
+
+### `nothing answers on localhost:<PORT>`
+
+**Sign:** `seiji forward` prints `seiji forward: nothing answers on localhost:<PORT> (<cause>)`. The app shows that it cannot reach the bundler.
+
+**Cause:** The device opened a connection through the tunnel, and nothing listens on that port on your Mac. Seiji closes the device's connection. The tunnel stays open.
+
+**Fix:** Start Metro (`npx expo start` or `npx react-native start`) or your dev server, on the port you gave `seiji forward`. Then reload the app.
+
+### The app still loads from `localhost:8081`
+
+**Sign:** The tunnel is open, but the app cannot load its bundle from `localhost:8081`.
+
+**Cause:** On the Seiji host, `localhost:8081` is the host, not your Mac. The app must use the device address that `seiji forward` printed.
+
+| App | Fix |
+|---|---|
+| React Native debug build | Run `seiji forward 8081 --react-native <bundle id>`. It sets `RCT_jsLocation` and relaunches the app, which reads it at launch ([apps.md](apps.md#react-native-without-expo)). |
+| Expo Go or an Expo development build | Open the printed URL: `seiji forward 8081 --expo-go`, or `--dev-client <scheme>` ([apps.md](apps.md#expo-go)). |
+| React Native on Android | Set the device address in the dev menu (**Settings → Debug server host & port**). `--react-native` is iOS only ([apps.md](apps.md#android)). |
+
+The port on the host is new for each tunnel. After you start `seiji forward` again, point the app at the new address.
+
+### The tunnel closed
+
+**Sign:** `seiji forward` prints `the tunnel closed (the lease ended, or the server stopped)` and exits.
+
+**Cause:** The lease ended (released, `max_lease_duration`, `budget_exhausted`, `user_disabled`), or the server stopped. An open tunnel keeps the lease from idling, but not past `maxLeaseMinutes`.
+
+**Fix:** Acquire a device, install the app again, and start `seiji forward` again. If the tunnel closes while the lease is still active, check that the TLS proxy passes WebSocket upgrades and does not cut long-lived connections ([Long tool calls fail at the proxy](#long-tool-calls-fail-at-the-proxy)).
 
 ## Leftover devices after a crash
 

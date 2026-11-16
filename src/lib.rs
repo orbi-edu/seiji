@@ -4,6 +4,7 @@ pub mod config;
 pub mod devices;
 pub mod evidence;
 pub mod exec;
+pub mod forward;
 pub mod http;
 pub mod ios;
 pub mod maestro;

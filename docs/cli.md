@@ -1,6 +1,6 @@
 # `seiji` (command line)
 
-`seiji` is one binary. It runs the MCP server, manages users, prints usage, creates tenant accounts, checks the host, and holds the root helpers that the daemon reaches through sudo. On a developer's Mac, the same binary is the client that signs in to a server for the Tern plugin (`seiji login`, `seiji logout`, `seiji token print`). This document lists every command and flag, the account that must run each one, and what each prints. [install.md](install.md) shows the commands in order on a new host. [configuration.md](configuration.md) is the reference of the config file they read.
+`seiji` is one binary. It runs the MCP server, manages users, prints usage, creates tenant accounts, checks the host, and holds the root helpers that the daemon reaches through sudo. On a developer's Mac, the same binary is the client that signs in to a server for the Tern plugin (`seiji login`, `seiji logout`, `seiji token print`) and opens a tunnel to your dev server (`seiji forward`). This document lists every command and flag, the account that must run each one, and what each prints. [install.md](install.md) shows the commands in order on a new host. [configuration.md](configuration.md) is the reference of the config file they read.
 
 ## Contents
 
@@ -14,13 +14,14 @@
 - [`seiji login`](#seiji-login)
 - [`seiji logout`](#seiji-logout)
 - [`seiji token print`](#seiji-token-print)
+- [`seiji forward`](#seiji-forward)
 - [Exit codes and errors](#exit-codes-and-errors)
 - [Root helpers (internal)](#root-helpers-internal)
 
 ## Conventions
 
 - `--config PATH` (`-c PATH`) selects the config file. It is a global flag, so it may come before or after the subcommand: `seiji user add alice -c /path/seiji.json` and `seiji user -c /path/seiji.json add alice` are the same. The default is `/usr/local/etc/seiji/seiji.json`, or `$SEIJI_CONFIG` when it is set. `sudo` drops `SEIJI_CONFIG`, so pass `-c` with `sudo` when the file is somewhere else.
-- The root helpers (`exec-as`, `exec-drop`, `kill-as`) take no `--config` and never read the config. The client commands (`login`, `logout`, `token print`) do not read it either.
+- The root helpers (`exec-as`, `exec-drop`, `kill-as`) take no `--config` and never read the config. The client commands (`login`, `logout`, `token print`, `forward`) do not read it either.
 - User names have 1 to 32 characters of `[a-z0-9-]`. Other names fail with `user names must be 1-32 chars of [a-z0-9-]`.
 - `seiji --help` and `seiji <command> --help` print the usage. `seiji --version` prints `seiji <version>`.
 
@@ -33,7 +34,7 @@
 | `seiji doctor` | daemon account: `sudo -u seiji seiji doctor …` | It uses the same data directory, runner and sudo chain as the daemon. |
 | `seiji tenant provision` | root: `sudo seiji tenant provision …` | It creates macOS accounts and groups. |
 | `seiji exec-as`, `seiji exec-drop`, `seiji kill-as` | root, reached only by the daemon through sudo | Internal. See [Root helpers](#root-helpers-internal). |
-| `seiji login`, `seiji logout`, `seiji token print` | yourself, on a developer's Mac, not on the server | Client commands. They use your login keychain and your `~/Library/Application Support/seiji/`. |
+| `seiji login`, `seiji logout`, `seiji token print`, `seiji forward` | yourself, on a developer's Mac, not on the server | Client commands. They use your login keychain and your `~/Library/Application Support/seiji/`. |
 | `seiji --help`, `seiji --version` | any account | They read nothing. |
 
 The examples below use `sudo -u seiji` as on a host. In local development (shared mode) you run everything as yourself ([install.md](install.md#15-local-development-shared-mode)).
@@ -52,7 +53,7 @@ Runs the MCP server. In order, it:
 4. Starts the reaper (every 15 s). It releases leases, deletes builds older than `appRetentionHours`, and deletes runs that ended more than `evidence.retentionHours` ago.
 5. Binds `listen.host:listen.port` and logs `seiji listening on http://<host>:<port>/mcp`.
 
-Routes: `/mcp` (Streamable HTTP MCP, bearer token), `POST /v1/apps` (build upload, bearer token), `GET /v1/runs/{run_id}/files/{*path}`, `GET /v1/runs/{run_id}/evidence.zip` and `GET /v1/runs/{run_id}/report.md` (run evidence, bearer token, only the token's own runs), `GET /v1/me`, `POST /v1/leases/{lease_id}/viewer` and `GET /v1/leases/{lease_id}/screenshot.jpg` (bearer token, only the token's own leases), the viewer routes under `/view/` (viewer session cookie), and `GET /healthz` (no token, answers `ok`). [mcp.md](mcp.md) documents them.
+Routes: `/mcp` (Streamable HTTP MCP, bearer token), `POST /v1/apps` (build upload, bearer token), `GET /v1/runs/{run_id}/files/{*path}`, `GET /v1/runs/{run_id}/evidence.zip` and `GET /v1/runs/{run_id}/report.md` (run evidence, bearer token, only the token's own runs), `GET /v1/me`, `POST /v1/leases/{lease_id}/viewer`, `GET /v1/leases/{lease_id}/screenshot.jpg` and the `seiji forward` WebSocket `GET /v1/leases/{lease_id}/forward` (bearer token, only the token's own leases), the viewer routes under `/view/` (viewer session cookie), and `GET /healthz` (no token, answers `ok`). [mcp.md](mcp.md) documents them.
 
 On `SIGTERM` or `SIGINT` it stops the reaper and new MCP requests, logs `shutting down: releasing devices`, and releases every lease at once with `server_shutdown`. Releasing cancels running runs, which end with the status `cancelled` and keep their evidence, so open requests end quickly; then it waits for them and exits 0. The launchd plist gives it 120 s (`ExitTimeOut`) for this. If launchd kills the process first, the next start ends the leases with `server_restart` and marks the runs `error`.
 
@@ -239,6 +240,51 @@ When you are not signed in, it fails with ``You are not signed in. Run `seiji lo
 ```
 
 The token is a secret: do not paste the output into logs or chats.
+
+## `seiji forward`
+
+```sh
+seiji forward [PORT] [--lease ID] [--expo-go | --dev-client SCHEME | --react-native [BUNDLE_ID]]
+```
+
+A client command. Run it on a developer's Mac while you hold a device. It opens a tunnel, so the device on the Seiji host reaches `localhost:PORT` on your Mac: Metro, or any other dev server. [apps.md](apps.md#run-your-dev-server-with-seiji-forward) shows how to use it with Expo and React Native.
+
+| Option | Default | What it does |
+|---|---|---|
+| `PORT` | `8081` | The port on your Mac. The tunnel dials only this port, on `127.0.0.1`, then on `::1`. |
+| `--lease ID` | your only ready lease | The lease whose device gets the tunnel. Needed when you hold two or more devices. |
+| `--expo-go` | off | Then calls `open_url` with `exp://<device address>`, which opens the project in Expo Go. |
+| `--dev-client SCHEME` | off | Then calls `open_url` with `<SCHEME>://expo-development-client/?url=<http://device address, percent-encoded>`, which opens the project in your Expo development build. |
+| `--react-native [BUNDLE_ID]` | off | Then calls `configure_device` with `react_native_bundler: {bundle_id, location: <device address>}` and `launch_app` with `restart: true`, so a React Native debug build loads its bundle through the tunnel. Without `BUNDLE_ID`: the app installed last on the lease. iOS only. |
+
+`--expo-go`, `--dev-client` and `--react-native` exclude each other. In order, it:
+
+1. Reads the credential like `seiji token print`: the keychain, or `SEIJI_URL` and `SEIJI_TOKEN`.
+2. Without `--lease`, calls `budget_status` and takes your only lease with the status `ready`.
+3. Opens a WebSocket to `GET /v1/leases/{lease_id}/forward` ([mcp.md](mcp.md#get-v1leaseslease_idforward)): `wss://` for an `https://` server, `ws://` for `http://`.
+4. Prints the device address: the address at which the device reaches your port. It is `127.0.0.1:<port>` on an iOS simulator and `10.0.2.2:<port>` on an Android emulator. The port on the host is new for each tunnel.
+5. With an option that points the app, calls the tools and prints `opened <url>` or `set RCT_jsLocation to <device address> and relaunched the app`. If a call fails, it prints `seiji forward: could not point the app: <cause>` and keeps the tunnel open.
+6. Carries every connection that the device makes to the device address to `localhost:PORT`, until Ctrl-C.
+
+```text
+Forwarding l_4cfb333bdd6b: the device reaches localhost:8081 at 127.0.0.1:52314
+  Expo Go:      exp://127.0.0.1:52314
+  Dev build:    <scheme>://expo-development-client/?url=http%3A%2F%2F127.0.0.1%3A52314
+  React Native: seiji forward 8081 --react-native [BUNDLE_ID]
+Ctrl-C stops.
+```
+
+Ctrl-C closes the tunnel and exits 0. When the server closes it, `seiji forward` prints `the tunnel closed (the lease ended, or the server stopped)` and exits 0. While the tunnel is open, the server counts it as activity on the lease every 60 s, so the lease is not released for idling. `maxLeaseMinutes` still applies.
+
+| Message | Cause |
+|---|---|
+| ``You are not signed in. Run `seiji login --url <server>`.`` | No credential. Run `seiji login`. |
+| `you hold no ready device; acquire one first (acquire_device, or n in Tern)` | No `--lease`, and you hold no `ready` lease. |
+| `you hold <N> devices; pick one with --lease (<lease ids>)` | No `--lease`, and you hold two or more `ready` leases. |
+| `the server refused the tunnel (<status>): <message>` | The server refused the WebSocket: `403` `forwarding is off on this server` (`forward.enabled` is `false`), `404` with a [lease error](mcp.md#lease-errors), `429` `this lease already has <N> tunnels open` (`forward.maxPerLease`), or `401` for a refused token. |
+| `seiji forward: nothing answers on localhost:<PORT> (<cause>)` | The device opened a connection, and nothing listens on `PORT` on your Mac. The device's connection is closed and the tunnel stays open. Start your dev server. |
+
+[troubleshooting.md](troubleshooting.md#tunnels) lists the fixes. [security.md](security.md#tunnels-seiji-forward) explains what the tunnel can reach.
 
 ## Exit codes and errors
 

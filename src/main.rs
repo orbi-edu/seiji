@@ -78,6 +78,8 @@ enum Cmd {
         #[command(subcommand)]
         cmd: TokenCmd,
     },
+    /// Client: let your device reach a port on this machine (Metro, a dev server) until Ctrl-C.
+    Forward(ForwardCli),
     /// [root helper] Run a command as a tenant account inside its launchd domain.
     #[command(hide = true)]
     ExecAs(ExecArgsCli),
@@ -95,6 +97,26 @@ enum TokenCmd {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(Args)]
+struct ForwardCli {
+    /// The local port the device should reach (Metro's is 8081).
+    #[arg(default_value_t = 8081)]
+    port: u16,
+    /// The lease; the only device you hold by default.
+    #[arg(long)]
+    lease: Option<String>,
+    /// Then open the tunnel in Expo Go (`exp://…`).
+    #[arg(long, group = "point")]
+    expo_go: bool,
+    /// Then open the tunnel in an Expo development build with this URL scheme.
+    #[arg(long, value_name = "SCHEME", group = "point")]
+    dev_client: Option<String>,
+    /// Then point a React Native debug build at the tunnel (`RCT_jsLocation`) and relaunch it;
+    /// the app installed last when no bundle id is given.
+    #[arg(long, value_name = "BUNDLE_ID", num_args = 0..=1, default_missing_value = "", group = "point")]
+    react_native: Option<String>,
 }
 
 #[derive(Args)]
@@ -229,6 +251,17 @@ fn main() -> Result<()> {
         Cmd::Login { url } => runtime()?.block_on(seiji::client::login(&url)),
         Cmd::Logout => seiji::client::logout(),
         Cmd::Token { cmd: TokenCmd::Print { json } } => seiji::client::token_print(json),
+        Cmd::Forward(f) => {
+            use seiji::client::Point;
+            let point = if f.expo_go {
+                Some(Point::ExpoGo)
+            } else if let Some(scheme) = f.dev_client {
+                Some(Point::DevClient(scheme))
+            } else {
+                f.react_native.map(|b| Point::ReactNative(Some(b).filter(|b| !b.is_empty())))
+            };
+            runtime()?.block_on(seiji::client::forward(f.port, f.lease, point))
+        }
     }
 }
 

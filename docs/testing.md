@@ -63,6 +63,7 @@ CI (`.github/workflows/ci.yml`) runs on `macos-15` with `RUSTFLAGS=-D warnings`.
 | `tests/e2e.rs` | Leases, budgets, uploads, the reaper and `run_flow`. Real HTTP server, real MCP client, real SQLite and real `Pool` |
 | `tests/runs.rs` | Recorded runs (`run_actions`, `run_xctest`), evidence files and hashes, the HTTP downloads, the evidence quota and retention, and the native device tools |
 | `tests/viewer.rs` | The viewer: viewer links and tickets, the session cookie, the page's CSP, the shared stream, input, and `share_screen` |
+| `tests/forward.rs` | `seiji forward`: the tunnel end to end over a real WebSocket, its refusals, and the real CLI pointing the app at the tunnel |
 | `tests/tern.rs` | The Tern plugin in a headless Tern (`tern serve`), with the real `seiji` CLI. Skips when `tern` is not on `PATH` |
 | `src/actions.rs` | Unit tests of selectors, `render_tree` and action validation |
 | `src/ios.rs` | Unit tests of the AXe command builders, the AXe error parser and the log predicate |
@@ -110,6 +111,17 @@ Each test acquires an iOS device for a new user. The first three open viewer lin
 | `viewers_share_one_stream_until_the_lease_ends` | With `viewer.maxViewersPerLease: 2`, the stream is `multipart/x-mixed-replace; boundary=seijiframe`, and its first part is a `Content-Type: image/jpeg` frame. A second viewer streams too; a third gets `429`. The device layer started one stream for all viewers (`streams_started` is 1). After `release_device`, the stream ends and `info` gets `410` |
 | `input_maps_to_points_and_respects_view_only_and_runs` | A tap at `0.5, 0.5` reaches the device as `tap 201,437` on the fake's 402×874 screen. A tap with `hold: 0.8` is a long press. `type`, `key` and `button` inputs give `204`. A tap at `x: 2` gets `400`. Input without `X-Seiji-View` gets `400`. A view-only session gets `403`. While a `run_actions` call holds the device, input gets `409` and `info` shows `busy: true`; after the run, input works again |
 | `agents_share_a_view_only_link` | `share_screen` with no arguments returns `control: false`, and its link opens with `303` |
+
+### `tests/forward.rs`
+
+Each test acquires an iOS device for a new user. A local echo server on `127.0.0.1` stands in for Metro.
+
+| Test | What it checks |
+|---|---|
+| `the_device_reaches_a_local_port_until_the_lease_ends` | The device address starts with `127.0.0.1:`. Three connections at once through the tunnel, one of them 300 KB (larger than a frame), each get back their own bytes. After `release_device`, the client returns within 5 s and the port on the host is closed |
+| `a_connection_closes_when_nothing_listens_locally` | With nothing listening on the local port, a connection to the device address is closed (it reads 0 bytes), and the tunnel stays up until the client stops it |
+| `tunnels_are_refused_for_other_leases_past_the_limit_and_when_off` | Bob's token on Ana's lease gets `404`. With `forward.maxPerLease: 1`, a second tunnel on the same lease gets `429` with `1 tunnels`. With `forward.enabled: false`, a tunnel gets `403` |
+| `the_cli_finds_the_lease_and_points_the_app_at_the_tunnel` | The real `seiji forward` CLI with `SEIJI_URL` and `SEIJI_TOKEN`, and no `--lease`, finds the one lease. `--expo-go` opens `exp://127.0.0.1:<port>` and prints `opened exp://127.0.0.1:`. `--dev-client myapp` opens `myapp://expo-development-client/?url=http%3A%2F%2F127.0.0.1%3A<port>`. `--react-native com.example.demo` sets `react_native_bundler` for `com.example.demo` before `launch_app`, and prints `set RCT_jsLocation to 127.0.0.1:`. Each run exits 0 after `SIGINT` |
 
 ### `tests/tern.rs`
 
@@ -223,6 +235,7 @@ The tests must be fast and deterministic, and they must run on any Mac. A real d
 | `HostDevices`: `simctl`, `emulator`, `adb`, `sips` screenshots, `INSTALL_SCRIPT` and the Android install | `seiji doctor`, the smoke test |
 | AXe against a real simulator: taps, typing, gestures, `describe-ui`, the JSON envelope of a real AXe version (only the argument lists and the error parser are unit-tested) | `seiji doctor` (`describe-ui`), the smoke test |
 | The viewer stream on a real simulator: `axe stream-video` and its raw framing (checked against AXe's source only), and viewer input through real AXe | Not verified yet. `seiji doctor` does not test streaming yet |
+| `seiji forward` against a real simulator: `RCT_jsLocation` through `simctl spawn … defaults write`, Metro and Fast Refresh through the tunnel, Expo Go's archive in `INSTALL_SCRIPT`, and the tunnel on Android | Not verified yet. The tunnel itself is tested end to end |
 | AXe and `recordVideo` as a tenant account through `exec-as`. Not verified on a real host yet | `seiji doctor` with a tenant account |
 | `recordVideo` stopped with SIGINT (`Runner::interrupt`) giving a playable `video.mp4`, and `log stream` | `seiji doctor` (3 s capture), the smoke test |
 | `XCTEST_SCRIPT`: `xcodebuild test-without-building`, `xcresulttool`, and the exact JSON shape of `xcresulttool get test-results tests` (the parser is tolerant, and the unit test uses a hand-written shape) | The smoke test |

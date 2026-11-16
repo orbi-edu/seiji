@@ -202,6 +202,12 @@ pub fn device_op(udid: &str, op: &DeviceOp) -> Result<CmdSpec> {
             }
             s
         }
+        DeviceOp::Bundler { bundle_id, location: Some(loc) } => {
+            simctl(["spawn", udid, "defaults", "write", bundle_id, "RCT_jsLocation", "-string", loc])
+        }
+        DeviceOp::Bundler { bundle_id, location: None } => {
+            simctl(["spawn", udid, "defaults", "delete", bundle_id, "RCT_jsLocation"])
+        }
     })
 }
 
@@ -215,6 +221,8 @@ case "$1" in
   *) echo "iOS apps must be a .zip or .tar.gz containing a simulator .app bundle" >&2; exit 2 ;;
 esac
 app=$(/usr/bin/find x -maxdepth 3 -type d -name '*.app' | head -n 1)
+# Some archives (Expo Go's simulator build) hold the bundle's contents, not the bundle.
+if [ -z "$app" ] && [ -f x/Info.plist ]; then mv x unpacked.app; app=unpacked.app; fi
 [ -n "$app" ] || { echo "no .app bundle inside the archive" >&2; exit 2; }
 /usr/bin/xcrun simctl install "$2" "$app"
 plist="$app/Info.plist"

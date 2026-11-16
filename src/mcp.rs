@@ -120,6 +120,15 @@ pub struct Permission {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct Bundler {
+    /// Defaults to the app installed last on this lease.
+    pub bundle_id: Option<String>,
+    /// `host:port` of the Metro bundler as the simulator sees it, e.g. the address
+    /// `seiji forward` prints (`127.0.0.1:52314`). Omit to go back to the app's default.
+    pub location: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ConfigureArgs {
     pub lease_id: Option<String>,
     /// Fixed status bar values; `clear_status_bar` removes them.
@@ -134,6 +143,9 @@ pub struct ConfigureArgs {
     /// Grant, revoke or reset privacy permissions (no system prompt appears for granted ones).
     #[serde(default)]
     pub permissions: Vec<Permission>,
+    /// React Native debug builds: where the app loads its JavaScript bundle from (the
+    /// `RCT_jsLocation` default). Relaunch the app afterwards.
+    pub react_native_bundler: Option<Bundler>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -273,6 +285,15 @@ fn caller(ctx: &RequestContext<RoleServer>) -> Result<User, McpError> {
 
 fn fail(e: anyhow::Error) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(format!("{e:#}"))])
+}
+
+/// `host:port` with a plain host name or address and a port 1-65535.
+fn valid_host_port(s: &str) -> bool {
+    let Some((host, port)) = s.rsplit_once(':') else { return false };
+    !host.is_empty()
+        && host.len() <= 253
+        && host.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+        && port.parse::<u16>().is_ok_and(|p| p > 0)
 }
 
 fn json(value: &impl serde::Serialize) -> CallToolResult {
@@ -456,7 +477,7 @@ impl SeijiMcp {
     }
 
     #[tool(
-        description = "iOS: prepare the simulator natively (simctl): fixed status bar, light/dark appearance, simulated location, privacy permissions. Applied in that order."
+        description = "iOS: prepare the simulator natively (simctl): fixed status bar, light/dark appearance, simulated location, privacy permissions, the React Native bundler location (RCT_jsLocation; relaunch the app after). Applied in that order."
     )]
     async fn configure_device(
         &self,
@@ -495,6 +516,15 @@ impl SeijiMcp {
             for p in args.permissions {
                 let bundle_id = self.pool.app_or_default(&user, lease, p.bundle_id)?;
                 ops.push(DeviceOp::Privacy { action: p.action, service: p.service, bundle_id });
+            }
+            if let Some(b) = args.react_native_bundler {
+                if let Some(loc) = &b.location
+                    && !valid_host_port(loc)
+                {
+                    anyhow::bail!("react_native_bundler.location must be host:port, e.g. 127.0.0.1:52314");
+                }
+                let bundle_id = self.pool.app_or_default(&user, lease, b.bundle_id)?;
+                ops.push(DeviceOp::Bundler { bundle_id, location: b.location });
             }
             if ops.is_empty() {
                 anyhow::bail!("nothing to configure");

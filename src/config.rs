@@ -268,6 +268,23 @@ impl Default for Viewer {
     }
 }
 
+/// `seiji forward`: tunnels from a lease's host loopback to a port on the developer's machine
+/// (a Metro bundler, for one).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields, default)]
+pub struct Forward {
+    /// Off: `/v1/leases/{id}/forward` answers 403.
+    pub enabled: bool,
+    /// Open tunnels per lease.
+    pub max_per_lease: usize,
+}
+
+impl Default for Forward {
+    fn default() -> Self {
+        Self { enabled: true, max_per_lease: 2 }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Config {
@@ -296,6 +313,8 @@ pub struct Config {
     pub xctest: Xctest,
     #[serde(default)]
     pub viewer: Viewer,
+    #[serde(default)]
+    pub forward: Forward,
     #[serde(default = "default_max_upload")]
     pub max_upload_bytes: u64,
     /// Uploaded and downloaded builds are deleted this long after they arrive.
@@ -392,6 +411,9 @@ impl Config {
             || v.session_hours < 1
         {
             bail!("viewer: fps 1-30, scale 0.1-1, quality 1-100, maxViewersPerLease and sessionHours must be > 0");
+        }
+        if config.forward.max_per_lease == 0 {
+            bail!("forward.maxPerLease must be > 0");
         }
         if let Some(url) = &config.listen.public_url
             && !(url.starts_with("https://") || url.starts_with("http://"))

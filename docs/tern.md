@@ -82,7 +82,7 @@ This example walks through a typical session. You boot an iPhone, try the sign-i
 
 **1. Open the panel.** Press ⌃⌥D, or run **Seiji: Devices** from the palette. The head shows your minutes this month.
 
-**2. Boot a device.** Press `n` and pick `iphone-16`. The row counts the seconds while it boots (30-90 s). When it says `ready`, install your app the usual way, for example by asking your agent to call `install_app`.
+**2. Boot a device.** Press `n` and pick `iphone-16`. The row counts the seconds while it boots (30-90 s). When it says `ready`, install your app the usual way, for example by asking your agent to call `install_app`, or run your dev server through `seiji forward` ([apps.md](apps.md)).
 
 **3. Look at it.** Press `s`. A screenshot appears in the device card.
 

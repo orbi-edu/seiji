@@ -211,6 +211,11 @@ pub enum DeviceOp {
         last_seconds: u64,
         predicate: Option<String>,
     },
+    /// React Native's `RCT_jsLocation` default for `bundle_id`; `None` deletes it.
+    Bundler {
+        bundle_id: String,
+        location: Option<String>,
+    },
 }
 
 impl DeviceOp {
@@ -226,6 +231,7 @@ impl DeviceOp {
             DeviceOp::Privacy { .. } => "permissions",
             DeviceOp::Push { .. } => "push_notification",
             DeviceOp::LogShow { .. } => "get_logs",
+            DeviceOp::Bundler { .. } => "react_native_bundler",
         }
     }
 }

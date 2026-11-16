@@ -1,6 +1,6 @@
 # Security model
 
-This document describes the trust boundaries of Seiji, the path of each credential, the invariants of the root helpers, the file and network exposure, the risks of Maestro flows, XCTest bundles and builds, the handling of recorded evidence, the viewer, and the known limits. To report a vulnerability, follow [SECURITY.md](../SECURITY.md).
+This document describes the trust boundaries of Seiji, the path of each credential, the invariants of the root helpers, the file and network exposure, the risks of Maestro flows, XCTest bundles and builds, the handling of recorded evidence, the viewer, the tunnels of `seiji forward`, and the known limits. To report a vulnerability, follow [SECURITY.md](../SECURITY.md).
 
 ## Contents
 
@@ -15,6 +15,7 @@ This document describes the trust boundaries of Seiji, the path of each credenti
 - [Android and the shared adb server](#android-and-the-shared-adb-server)
 - [Uploads and downloads](#uploads-and-downloads)
 - [The viewer](#the-viewer)
+- [Tunnels (`seiji forward`)](#tunnels-seiji-forward)
 - [Known limits](#known-limits)
 - [Operator checklist](#operator-checklist)
 
@@ -152,7 +153,7 @@ Builds are copied in through stdin. Under `os_user` the daemon cannot write into
 - `GET /healthz` needs no token and returns `ok`.
 - A tool call holds its HTTP request open for its whole length: up to `evidence.maxRunSeconds` plus the evidence collection for `run_actions`, `xctest.timeoutSeconds` for `run_xctest`, `maestro.flowTimeoutSeconds` for `run_flow`. Set the proxy's read timeout above them.
 - Outbound connections: build downloads (`install_app` with `url`), and `https://api.copilot.mobile.dev/v2/bot/maestro-cheat-sheet` at the first `cheat_sheet` call of the process.
-- Driver ports, emulator console ports and the adb server are TCP ports on the host. Seiji does not authenticate them. Any local process can connect to them.
+- Driver ports, emulator console ports, the adb server and open tunnels are TCP ports on the host. Seiji does not authenticate them. Any local process can connect to them.
 
 ## Maestro flows
 
@@ -308,6 +309,34 @@ No inline script runs, and no other site can frame the page.
 - **A person with control acts as the user.** Taps and typing reach the user's device and app like the agent's own steps. They are not recorded as a run. Share view-only links unless the person must drive.
 - **The stream is the screen.** Whatever the simulator shows, passwords in plain fields included, reaches every viewer.
 
+## Tunnels (`seiji forward`)
+
+`seiji forward` lets a lease's device reach a port on the developer's machine, such as Metro on `8081`. The client opens a WebSocket to `GET /v1/leases/{lease_id}/forward` with its bearer token. The server listens on a new port on `127.0.0.1` and carries each connection to it over the WebSocket. Its code is in `src/forward.rs`. [apps.md](apps.md#how-the-tunnel-works) shows the flow, [mcp.md](mcp.md#get-v1leaseslease_idforward) the route and the frames, [configuration.md](configuration.md#forward) the keys.
+
+### What the tunnel can reach
+
+| Side | Reach |
+|---|---|
+| Developer's machine | Only the one port given to `seiji forward`, on `127.0.0.1`, then `::1`. The server sends connection ids and bytes, never an address or a port, so it cannot reach any other port of the machine or its network. |
+| Seiji host | A port on `127.0.0.1` that the OS picks. Nothing is bound on another interface. On macOS, the loopback is shared by every account on the host, so any local process can connect to the port. |
+| Admission | The bearer token of the lease's owner. The lease must be the caller's and `ready`. At most `forward.maxPerLease` tunnels per lease (default 2). |
+| Lifetime | Until the client closes, the WebSocket breaks, the lease ends or the server stops. The tunnel's cancellation is a child of the lease's, so a release closes its port. |
+
+### The shared loopback
+
+Seiji does not filter connections to a tunnel's port by account. While a tunnel is open, any local process on the host that finds the port can connect to it: another tenant's agent, a test, or an app in another tenant's simulator. That process then talks to the developer's dev server as the device would. It can load the JavaScript bundle and anything else the dev server serves. Under `os_user` isolation too, the tenant accounts share this loopback.
+
+Mitigations:
+
+- A tunnel exists only while `seiji forward` runs. Stop it when you are done.
+- The port is a new ephemeral port for each tunnel, chosen by the OS, so it is not fixed or known in advance. A local process can still scan for it.
+- Serve nothing secret from a dev server that you forward.
+- An operator turns tunnels off with `forward.enabled: false`. The route then answers `403`.
+
+### Activity
+
+An open tunnel restarts its lease's idle timer every 60 s, so the lease is not released for idling while the tunnel is open. `maxLeaseMinutes` and the budget still apply, and the reaper ends the lease, and with it the tunnel, as usual.
+
 ## Known limits
 
 - **`os_user` is not tested on a real host.** It runs `simctl` for a tenant account that never logged in to the GUI, through `launchctl asuser`. Run `seiji doctor <user>` for each user. The fallback is `isolation.mode: "shared"`, where separation between users is enforced only by Seiji.
@@ -325,6 +354,7 @@ No inline script runs, and no other site can frame the page.
 - **No token expiry, roles or rate limits.** Evidence links need the token too (see [`publicUrl` links](#publicurl-links)).
 - **Viewer link and sessions.** A viewer link opens for anyone in its first 60 s. A session lives up to `viewer.sessionHours` unless its lease ends first, and has no other revocation than disabling the user. Without an `https://` `publicUrl` the cookie is not `Secure`. The viewer works on iOS only. See [The viewer](#the-viewer).
 - **Viewer streaming is not verified on a real simulator.** The `axe stream-video` flags and its raw framing were checked against AXe's source only. `seiji doctor` does not test streaming yet.
+- **Tunnels use the shared loopback.** Any local process can connect to an open tunnel's port on the host while it is open, and so reach the developer's dev server. See [Tunnels (`seiji forward`)](#tunnels-seiji-forward).
 - **No audit log.** The `leases` table records who held which device and when, and the `runs` table records each run until retention. The log at `/usr/local/var/log/seiji.log` (from the launchd plist) records lease, release and run events.
 
 ## Operator checklist
@@ -368,7 +398,8 @@ No inline script runs, and no other site can frame the page.
 11. Install AXe as an admin (`brew install cameroncooke/axe/axe`). Check that `axe.bin` (default `/opt/homebrew/bin/axe`), `maestro.bin` and their directories are not writable by `seiji` or a tenant account. After each Xcode or AXe update, run `seiji doctor <user>` again before users run tests.
 12. Plan the disk for builds (`maxBuildsPerUser` × `maxUploadBytes`) and evidence (`evidence.maxBytesPerUser`) for every seat, and watch the free space.
 13. Leave out Android, or set `capacity.android` to `0`, if users must not reach each other's emulators.
-14. When a token leaks, run `seiji user rotate-token`. To stop a user at once, run `seiji user disable`.
-15. Back up `<dataDir>/seiji.db`. It holds the users, the token hashes, the usage ledger and the run index. The evidence itself is in `<dataDir>/runs`.
+14. Set `forward.enabled` to `false` if tenants must not share the host's loopback: an open tunnel's port is open to every local account ([Tunnels](#tunnels-seiji-forward)).
+15. When a token leaks, run `seiji user rotate-token`. To stop a user at once, run `seiji user disable`.
+16. Back up `<dataDir>/seiji.db`. It holds the users, the token hashes, the usage ledger and the run index. The evidence itself is in `<dataDir>/runs`.
 
 [install.md](install.md) gives the full setup. [troubleshooting.md](troubleshooting.md) covers `seiji doctor` failures.

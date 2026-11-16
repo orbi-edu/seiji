@@ -51,11 +51,12 @@ flowchart LR
 
 | Component | Job | Code |
 |---|---|---|
-| HTTP server | An axum router. `GET /healthz` is open. `/mcp`, `POST /v1/apps`, the evidence downloads (`GET /v1/runs/{run_id}/files/{*path}`, `/evidence.zip`, `/report.md`), `GET /v1/me`, `POST /v1/leases/{lease_id}/viewer` and `GET /v1/leases/{lease_id}/screenshot.jpg` sit behind the auth middleware. The viewer routes (`/view/…`) check a session cookie instead. | `src/http.rs` |
+| HTTP server | An axum router. `GET /healthz` is open. `/mcp`, `POST /v1/apps`, the evidence downloads (`GET /v1/runs/{run_id}/files/{*path}`, `/evidence.zip`, `/report.md`), `GET /v1/me`, `POST /v1/leases/{lease_id}/viewer`, `GET /v1/leases/{lease_id}/screenshot.jpg` and the WebSocket `GET /v1/leases/{lease_id}/forward` sit behind the auth middleware. The viewer routes (`/view/…`) check a session cookie instead. | `src/http.rs` |
 | Auth middleware | Reads `Authorization: Bearer <token>`, looks up the SHA-256 of the token, refuses a missing, unknown or disabled token with `401`, and puts the user into the request as `AuthedUser`. | `src/http.rs` |
 | MCP service | rmcp `StreamableHttpService` with `NeverSessionManager`, legacy session mode off and `json_response` on: every POST is handled on its own and gets a plain JSON response. It checks the `Host` header against `listen.allowedHosts`. A factory builds one `SeijiMcp` for each request. | `src/http.rs`, `src/mcp.rs` |
 | `SeijiMcp` | The 23 tools and the server instructions. Reads the caller from `AuthedUser` and turns each `Pool` result into a tool result. Caches the Maestro cheat sheet for the process. | `src/mcp.rs` |
 | Viewer | Viewer links, tickets and viewer sessions (in memory), the `/view/…` routes, one shared AXe `stream-video` process per watched lease fanned out to every viewer through a watch channel, and input mapped to AXe taps, swipes, typing, keys and buttons under the lease's op lock. The page (`index.html`, `viewer.js`, `viewer.css`) is embedded in the binary. | `src/viewer.rs`, `src/viewer/` |
+| Tunnel | `seiji forward`: admits a tunnel for the caller's `ready` lease (`forward.enabled`, `forward.maxPerLease`), listens on a new port on `127.0.0.1`, and carries each connection to it over the WebSocket in OPEN, DATA and CLOSE frames. Touches the lease every 60 s and closes with it. The client end dials only its one local port. | `src/forward.rs` |
 | `Pool` | Admission, acquire and release, lease operations under the op lock, budget and models views, downloads, the reaper, recovery and shutdown. Holds the admission lock and the in-memory runtime of each lease (op lock, cancellation token, installed app). | `src/pool.rs` |
 | Runs | The `Pool` methods for runs: `record` and `record_locked` (quota, run dirs, captures, engine, crash collection, failure screenshot, copy, manifest), the engines `actions`, `flow` and `xctest`, the device tools (`device_op`, `logs`), and `list_runs`, `run_manifest`, `run_file`, `run_url`. | `src/runs.rs` |
 | Actions | The `run_actions` step model: the `Action` enum and its arguments, `Selector`, validation limits, `execute` (the step loop), `render_tree` (the one-line-per-node tree of `inspect_screen` and failure trees) and `redacted`. | `src/actions.rs` |
@@ -66,8 +67,8 @@ flowchart LR
 | `HostDevices` | The `Devices` trait on the host: `simctl` for iOS, `emulator` and `adb` for Android, `sips` for screenshots, app install (returns `InstalledApp`), orphan cleanup. For iOS also `ui` and `describe_ui` (AXe), `save_screenshot`, `start_capture` and `stop_capture` (video and log), `device_op`, `run_xctest` and `collect_crashes`; on Android these fail with "... supports iOS simulators only for now". Keeps the emulator and capture processes. | `src/devices.rs` |
 | `Maestro` | Builds `maestro --device <id> --driver-host-port <port> test` and `hierarchy` calls. Optional: only with `maestro` in the config. | `src/maestro.rs` |
 | Root helpers | `seiji exec-as`, `seiji exec-drop`, `seiji kill-as`: hidden subcommands that run as root through sudo and never read the config. `seiji tenant provision` creates tenant accounts; an admin runs it with sudo. | `src/tenant.rs`, `src/main.rs` |
-| CLI | `serve`, `user`, `usage`, `tenant provision`, `doctor`, and the client commands `login`, `logout` and `token print`. See [cli.md](cli.md). | `src/main.rs` |
-| Client | `seiji login`, `seiji logout` and `seiji token print` on a developer's Mac: checks a token with `GET /v1/me`, keeps it in the macOS login keychain, and hands it to the Tern plugin. | `src/client.rs` |
+| CLI | `serve`, `user`, `usage`, `tenant provision`, `doctor`, and the client commands `login`, `logout`, `token print` and `forward`. See [cli.md](cli.md). | `src/main.rs` |
+| Client | `seiji login`, `seiji logout`, `seiji token print` and `seiji forward` on a developer's Mac: checks a token with `GET /v1/me`, keeps it in the macOS login keychain, and hands it to the Tern plugin. `seiji forward` picks the lease with `budget_status`, opens the tunnel, and points the app at it with `open_url`, or `configure_device` and `launch_app`. | `src/client.rs` |
 | Tern plugin | A Tern panel with your budget, devices and runs. It opens a device's viewer in Tern's browser beside the panel, boots and releases devices, and reads the credential with `seiji token print --json`. See [tern.md](tern.md). | `tern-plugin/` |
 
 ## Deployment on one EC2 Mac
@@ -130,6 +131,8 @@ flowchart TB
 6. The response is one JSON body. A tool call keeps the HTTP request open until it ends: up to `evidence.maxRunSeconds` (default 1800) plus the evidence collection for `run_actions`, `xctest.timeoutSeconds` (default 3600) for `run_xctest`, `maestro.flowTimeoutSeconds` (default 600) for `run_flow`, and up to the boot timeout for `acquire_device`. Set the read timeout of the proxy above these values.
 
 `POST /v1/apps` and the `GET /v1/runs/{run_id}/...` downloads take steps 1 and 2, then stream the body. [mcp.md](mcp.md) gives the interface.
+
+`GET /v1/leases/{lease_id}/forward` takes steps 1 and 2, then upgrades to a WebSocket that stays open as a tunnel for `seiji forward`. It takes no op lock. [apps.md](apps.md#how-the-tunnel-works) shows how the tunnel carries a connection, and [security.md](security.md#tunnels-seiji-forward) what it can reach.
 
 ## Acquire sequence
 

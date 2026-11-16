@@ -1,6 +1,6 @@
 # MCP interface
 
-This document is the reference for the interface that agents use. It covers the MCP endpoint, the 23 tools with their arguments, results and errors, the steps of `run_actions`, the HTTP API for builds, evidence and viewer links, the viewer routes, the client setup for Claude Code, Cursor and Codex, and short guides to actions, XCTest bundles and Maestro flows. For the terms, read [glossary.md](glossary.md). For the rules behind budgets and leases, read [concepts.md](concepts.md).
+This document is the reference for the interface that agents use. It covers the MCP endpoint, the 23 tools with their arguments, results and errors, the steps of `run_actions`, the HTTP API for builds, evidence, viewer links and tunnels, the viewer routes, the client setup for Claude Code, Cursor and Codex, and short guides to actions, XCTest bundles and Maestro flows. For the terms, read [glossary.md](glossary.md). For the rules behind budgets and leases, read [concepts.md](concepts.md).
 
 ## Contents
 
@@ -116,6 +116,8 @@ The idle timer (`idleMinutes`) starts when the device is ready. It restarts at t
 | `list_runs`, `get_run`, `get_run_artifact`, `export_evidence` | No | — | No |
 | `cheat_sheet` | No | — | No |
 
+An open tunnel ([`GET /v1/leases/{lease_id}/forward`](#get-v1leaseslease_idforward)) restarts the idle timer of its lease every 60 s.
+
 ### Lease errors
 
 Every tool that needs a lease shares these errors. `release_device` can return the first three, and the two tenant account errors at the end.
@@ -136,7 +138,7 @@ Every tool that needs a lease shares these errors. `release_device` can return t
 
 ### iOS-only tools
 
-`uninstall_app`, `launch_app`, `terminate_app`, `open_url`, `configure_device`, `push_notification`, `get_logs`, `run_actions` and `run_xctest` work on iOS simulators only. On an Android lease they fail with `<name> supports iOS simulators only for now`. `<name>` is the operation or tool name: `uninstall_app`, `launch_app`, `terminate_app`, `open_url`, `status_bar`, `appearance`, `location`, `permissions`, `push_notification`, `get_logs`, `run_actions` or `run_xctest`. `configure_device` puts the operation name in front, for example `status_bar: status_bar supports iOS simulators only for now`.
+`uninstall_app`, `launch_app`, `terminate_app`, `open_url`, `configure_device`, `push_notification`, `get_logs`, `run_actions` and `run_xctest` work on iOS simulators only. On an Android lease they fail with `<name> supports iOS simulators only for now`. `<name>` is the operation or tool name: `uninstall_app`, `launch_app`, `terminate_app`, `open_url`, `status_bar`, `appearance`, `location`, `permissions`, `react_native_bundler`, `push_notification`, `get_logs`, `run_actions` or `run_xctest`. `configure_device` puts the operation name in front, for example `status_bar: status_bar supports iOS simulators only for now`.
 
 `share_screen` works on iOS simulators only too. On an Android lease it fails with `the screen viewer supports iOS simulators only for now`.
 
@@ -343,7 +345,7 @@ Installs an app on your device from an uploaded build (`app_id`) or from an `htt
 |---|---|---|---|
 | `lease_id` | string | No | Lease from `acquire_device`; optional when you hold exactly one device |
 | `app_id` | string | One of `app_id` and `url` | `app_id` returned by `POST /v1/apps` |
-| `url` | string | One of `app_id` and `url` | https URL of the build (iOS: .zip/.tar.gz of a simulator .app; Android: .apk) |
+| `url` | string | One of `app_id` and `url` | https URL of the build (iOS: .zip/.tar.gz of a simulator .app, or of the contents of one; Android: .apk) |
 
 **What happens:**
 
@@ -379,7 +381,7 @@ Installs an app on your device from an uploaded build (`app_id`) or from an `htt
 | A request error that names the timeout | The download took more than 600 seconds |
 | `download exceeds <maxUploadBytes> bytes` | The download is larger than `maxUploadBytes` |
 | `installing app exited 2: iOS apps must be a .zip or .tar.gz containing a simulator .app bundle` | iOS, and the file name does not end with `.zip`, `.tar.gz` or `.tgz` |
-| `installing app exited 2: no .app bundle inside the archive` | iOS, and the archive has no `.app` directory within three levels |
+| `installing app exited 2: no .app bundle inside the archive` | iOS, and the archive has no `.app` directory within three levels and no `Info.plist` at its top |
 | `installing app exited <n>: <output>` | iOS extraction, `simctl install` or `PlistBuddy` failed. A device build (not a simulator build) fails here |
 | `Android apps must be an .apk` | Android, and the file name does not end with `.apk` |
 | `adb install exited <n>: <output>` | `adb install` failed |
@@ -513,7 +515,7 @@ opened myapp://orders/42
 
 ### `configure_device`
 
-iOS: prepares the simulator natively with `simctl`, for clean and comparable screenshots. It applies a fixed status bar, the light or dark appearance, a simulated location and privacy permissions, in this order.
+iOS: prepares the simulator natively with `simctl`, for clean and comparable screenshots. It applies a fixed status bar, the light or dark appearance, a simulated location, privacy permissions and the React Native bundler location, in this order.
 
 **Arguments:**
 
@@ -526,6 +528,7 @@ iOS: prepares the simulator natively with `simctl`, for clean and comparable scr
 | `location` | object | No | `{"latitude": <number>, "longitude": <number>}`: the simulated GPS position. `clear_location` removes it |
 | `clear_location` | boolean | No | Remove the simulated location. Default false |
 | `permissions` | array of objects | No | Grant, revoke or reset privacy permissions. No system prompt appears for granted ones. Default `[]` |
+| `react_native_bundler` | object | No | React Native debug builds: where the app loads its JavaScript bundle from (the `RCT_jsLocation` default). Relaunch the app afterwards (see below) |
 
 `status_bar` fields (unknown fields are a schema error):
 
@@ -545,6 +548,15 @@ iOS: prepares the simulator natively with `simctl`, for clean and comparable scr
 | `service` | string | Yes | `all`, `calendar`, `contacts-limited`, `contacts`, `location`, `location-always`, `photos-add`, `photos`, `media-library`, `microphone`, `motion`, `reminders` or `siri` |
 | `bundle_id` | string | No | Defaults to the app installed last on this lease |
 
+`react_native_bundler` fields:
+
+| Field | Type | Required | Meaning |
+|---|---|---|---|
+| `bundle_id` | string | No | Defaults to the app installed last on this lease |
+| `location` | string | No | `host:port` of the bundler as the simulator sees it, for example the device address that [`seiji forward`](cli.md#seiji-forward) prints (`127.0.0.1:52314`). The host has letters, digits, `.` and `-`; the port is 1-65535. Leave it out to go back to the app's default |
+
+The app reads `RCT_jsLocation` when it starts. Call [`launch_app`](#launch_app) afterwards (`restart` defaults to true). `seiji forward --react-native` does both ([apps.md](apps.md#react-native-without-expo)).
+
 **What happens:** Seiji checks every value first. Then it runs one `simctl` command for each operation, in this order:
 
 | Order | Operation name | Command |
@@ -555,10 +567,11 @@ iOS: prepares the simulator natively with `simctl`, for clean and comparable scr
 | 4 | `location` | `simctl location <udid> clear` (`clear_location`) |
 | 5 | `location` | `simctl location <udid> set <latitude>,<longitude>` |
 | 6 | `permissions` | `simctl privacy <udid> <action> <service> <bundle id>`, once for each item |
+| 7 | `react_native_bundler` | `simctl spawn <udid> defaults write <bundle id> RCT_jsLocation -string <location>`, or `simctl spawn <udid> defaults delete <bundle id> RCT_jsLocation` without `location` |
 
 A failed operation stops the call. The operations before it stay applied.
 
-**Result:** one text block, `applied: <operation names>`, for example `applied: status_bar, appearance, location, permissions`.
+**Result:** one text block, `applied: <operation names>`, for example `applied: status_bar, appearance, location, permissions` or `applied: react_native_bundler`.
 
 **Errors:**
 
@@ -566,10 +579,11 @@ A failed operation stops the call. The operations before it stay applied.
 |---|---|
 | `nothing to configure` | No field asks for a change |
 | `status_bar: battery_level 0-100, wifi_bars 0-3, cellular_bars 0-4, time 1-32 chars` | A `status_bar` value is out of range |
+| `react_native_bundler.location must be host:port, e.g. 127.0.0.1:52314` | `location` is not `host:port` |
 | `location: latitude -90..90, longitude -180..180` | A coordinate is out of range |
 | `<operation>: simctl <operation> exited <n>: <output>` | A `simctl` command failed, for example `permissions: simctl permissions exited 1: …` |
 | `<operation>: <operation> supports iOS simulators only for now` | An Android lease |
-| The [default app](#the-default-app) errors | A permission without `bundle_id`, and no installed app |
+| The [default app](#the-default-app) errors | A permission or `react_native_bundler` without `bundle_id`, and no installed app |
 | [Lease errors](#lease-errors) | The lease could not be used |
 
 **Example:**
@@ -1477,6 +1491,7 @@ These routes exist besides `/mcp`. Error bodies of `/v1/apps`, `/v1/runs/…` an
 | `GET /v1/me` | Bearer token | `200` `{"user", "quota"}` |
 | `POST /v1/leases/{lease_id}/viewer` | Bearer token | `200`, a viewer link `{"url", "expires_in", "control", "lease_id"}` |
 | `GET /v1/leases/{lease_id}/screenshot.jpg` | Bearer token | `200`, the screen now as JPEG |
+| `GET /v1/leases/{lease_id}/forward` | Bearer token | `101`, a WebSocket that carries a tunnel for `seiji forward` |
 | `/view/…` | Viewer session cookie | The viewer (see [Viewer routes](#viewer-routes)) |
 
 ### `GET /healthz`
@@ -1526,12 +1541,12 @@ The upload accepts any file. `install_app` and `run_xctest` check the format.
 
 | Use | File name ends with | Contents | Command |
 |---|---|---|---|
-| iOS app | `.zip` | A simulator `.app` bundle, at most three directory levels deep | `ditto -x -k`, then `xcrun simctl install` |
+| iOS app | `.zip` | A simulator `.app` bundle, at most three directory levels deep, or the contents of one: an `Info.plist` at the top of the archive and no `.app` directory | `ditto -x -k`, then `xcrun simctl install` |
 | iOS app | `.tar.gz` or `.tgz` | The same | `tar -xzf`, then `xcrun simctl install` |
 | Android app | `.apk` | An APK | `adb install -r -g` (replace an installed app, grant runtime permissions) |
 | XCTest bundle | `.zip`, `.tar.gz` or `.tgz` | The `build-for-testing` Products folder, with a `.xctestrun` file at most four levels deep | `xcodebuild test-without-building` (see [`run_xctest`](#run_xctest)) |
 
-If an archive has more than one `.app`, Seiji installs the first one that `find` returns. The name check rejects an `.ipa` and an `.aab`. A device build inside a `.zip` fails at `simctl install`.
+If an archive has more than one `.app`, Seiji installs the first one that `find` returns. An archive without a `.app` directory but with an `Info.plist` at its top is installed as one bundle. Expo Go's simulator build (`https://github.com/expo/expo-go-releases/releases/download/Expo-Go-<version>/Expo-Go-<version>.tar.gz`, about 156 MB) has this shape ([apps.md](apps.md#expo-go)). The name check rejects an `.ipa` and an `.aab`. A device build inside a `.zip` fails at `simctl install`.
 
 #### Examples
 
@@ -1642,6 +1657,41 @@ Returns the screen now as a JPEG, the same image as [`take_screenshot`](#take_sc
 ```sh
 curl -s -H "Authorization: Bearer $SEIJI_TOKEN" -o screen.jpg https://seiji.example.com/v1/leases/l_3f9c2a7b1e04/screenshot.jpg
 ```
+
+### `GET /v1/leases/{lease_id}/forward`
+
+The server end of [`seiji forward`](cli.md#seiji-forward): a tunnel from a port on the lease's host to a port on the client's machine. The request is a WebSocket upgrade with the bearer token. A TLS proxy in front must pass WebSocket upgrades. [apps.md](apps.md#how-the-tunnel-works) shows the flow, and [security.md](security.md#tunnels-seiji-forward) what the tunnel can reach.
+
+Seiji checks these before the upgrade:
+
+| Status | Body | Cause |
+|---|---|---|
+| `101` | The WebSocket | The tunnel is open |
+| `401` | `missing, invalid or disabled bearer token` | See [Authentication](#authentication) |
+| `403` | `{"error": "forwarding is off on this server"}` | `forward.enabled` is `false` ([configuration.md](configuration.md#forward)) |
+| `404` | `{"error": "<text>"}` | The [lease errors](#lease-errors): the lease is not yours, has ended or is still booting. Also `lease <lease id> is ending` |
+| `429` | `{"error": "this lease already has <maxPerLease> tunnels open"}` | The lease already has `forward.maxPerLease` tunnels open (default 2) |
+| `500` | `{"error": "binding a loopback port: <cause>"}` | No port could be bound |
+
+After the upgrade, Seiji listens on a new port on `127.0.0.1` that the OS picks. Its first message is a text message, the hello:
+
+```json
+{"lease_id": "l_4cfb333bdd6b", "platform": "ios", "port": 52314, "device_address": "127.0.0.1:52314"}
+```
+
+`device_address` is where the device reaches the port: `127.0.0.1:<port>` on an iOS simulator, which shares the host's network, and `10.0.2.2:<port>` on an Android emulator, whose alias for the host's loopback is `10.0.2.2`.
+
+Every TCP connection to the port is carried over the WebSocket in binary messages (frames):
+
+| Bytes | Field |
+|---|---|
+| 1 | Kind: `1` OPEN (server to client: a new connection), `2` DATA (either way: bytes of the connection), `3` CLOSE (either way: that side stopped sending) |
+| 4 | Connection id, a big-endian `u32`, chosen by the server |
+| Rest | Payload: the bytes for DATA, empty for OPEN and CLOSE |
+
+A DATA frame carries at most 64 KiB. Both sides queue at most 64 frames, so a slow side slows the tunnel. When the client cannot connect to its local port, it sends CLOSE for that id, and the device sees its connection close.
+
+The tunnel ends when the client closes the WebSocket, the WebSocket breaks, the lease ends, or the server stops. Then the port closes. While it is open, the lease's idle timer restarts every 60 s. The tunnel takes no operation lock, so it runs beside tool calls and runs.
 
 ## Viewer routes
 

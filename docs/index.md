@@ -16,7 +16,7 @@ Use this map to find the document for your task.
 |---|---|
 | [install.md](install.md) | Install Seiji on an EC2 Mac or another Mac: accounts, sudoers, launchd, TLS, agents. |
 | [configuration.md](configuration.md) | Look up every key of `seiji.json` and the contents of the data directory. |
-| [cli.md](cli.md) | Use the `seiji` command: users, usage, tenant accounts, `doctor`, and the client commands `login`, `logout` and `token print`. |
+| [cli.md](cli.md) | Use the `seiji` command: users, usage, tenant accounts, `doctor`, and the client commands `login`, `logout`, `token print` and `forward`. |
 | [security.md](security.md) | Understand the trust boundaries, the root helpers, the file permissions and the known limits. |
 | [troubleshooting.md](troubleshooting.md) | Find the cause and the fix of a problem. |
 
@@ -25,6 +25,7 @@ Use this map to find the document for your task.
 | Document | Read it to |
 |---|---|
 | [mcp.md](mcp.md) | Call the MCP tools and the HTTP API, set up an agent, and write flows. |
+| [apps.md](apps.md) | Test your app on a Seiji device: install a build, or run Metro or another dev server through `seiji forward`. |
 | [tern.md](tern.md) | Watch and drive your simulators in Tern: install the plugin, sign in, use the panel and the viewer. |
 
 ## Reference and development

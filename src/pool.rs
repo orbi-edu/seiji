@@ -45,6 +45,8 @@ pub struct Pool {
     pub(crate) evidence_reserved: StdMutex<HashMap<i64, u64>>,
     /// Live screen viewer tickets, sessions and streams.
     pub(crate) viewers: crate::viewer::Viewers,
+    /// Open `seiji forward` tunnels per lease.
+    pub(crate) forwards: crate::forward::Forwards,
 }
 
 #[derive(Debug, Serialize)]
@@ -150,6 +152,7 @@ impl Pool {
             runtime: StdMutex::new(HashMap::new()),
             evidence_reserved: StdMutex::new(HashMap::new()),
             viewers: Default::default(),
+            forwards: Default::default(),
         }
     }
 

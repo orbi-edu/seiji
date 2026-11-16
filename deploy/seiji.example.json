@@ -62,6 +62,10 @@
     "maxViewersPerLease": 4,
     "sessionHours": 12
   },
+  "forward": {
+    "enabled": true,
+    "maxPerLease": 2
+  },
   "maestro": {
     "bin": "/opt/maestro/bin/maestro",
     "javaHome": "/opt/homebrew/opt/openjdk@17",

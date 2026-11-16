@@ -20,6 +20,7 @@ Seiji reads one JSON file, `seiji.json`. This document is the reference for ever
 - [`evidence`](#evidence)
 - [`xctest`](#xctest)
 - [`viewer`](#viewer)
+- [`forward`](#forward)
 - [`maxUploadBytes`](#maxuploadbytes)
 - [`appRetentionHours`](#appretentionhours)
 - [`maxBuildsPerUser`](#maxbuildsperuser)
@@ -57,6 +58,7 @@ Seiji reads one JSON file, `seiji.json`. This document is the reference for ever
 | `evidence.retentionHours`, `evidence.maxRunSeconds`, `evidence.maxSteps`, `evidence.maxRunBytes` and `evidence.maxBytesPerUser` are above 0 | `evidence.retentionHours, maxRunSeconds, maxSteps, maxRunBytes and maxBytesPerUser must be > 0` |
 | `axe.stepTimeoutSeconds` and `xctest.timeoutSeconds` are above 0 | `axe.stepTimeoutSeconds and xctest.timeoutSeconds must be > 0` |
 | `viewer.fps` is within 1–30, `viewer.scale` within 0.1–1, `viewer.quality` within 1–100, and `viewer.maxViewersPerLease` and `viewer.sessionHours` are above 0 | `viewer: fps 1-30, scale 0.1-1, quality 1-100, maxViewersPerLease and sessionHours must be > 0` |
+| `forward.maxPerLease` is above 0 | `forward.maxPerLease must be > 0` |
 | `listen.publicUrl`, when set, starts with `https://` or `http://` | `listen.publicUrl must start with https:// or http://` |
 
 Then a relative `dataDir` becomes absolute (see [`dataDir`](#datadir)).
@@ -255,6 +257,17 @@ Optional section. The viewer shows a lease's screen live in a browser or in Tern
 
 Seiji runs one AXe process for each watched lease, however many viewers watch it: `<axe.bin> stream-video --udid=<udid> --format=raw --fps=<fps> --quality=<quality> --scale=<scale>`, through `Runner` as the user's account. It starts with the first viewer and stops when the last one leaves or the lease ends. Higher `fps`, `scale` and `quality` cost more CPU and bandwidth for each watched lease.
 
+## `forward`
+
+Optional section. `seiji forward` opens a tunnel from a lease's host to a port on the developer's machine, so the device reaches Metro or another dev server there ([apps.md](apps.md#run-your-dev-server-with-seiji-forward)). The route is `GET /v1/leases/{lease_id}/forward` ([mcp.md](mcp.md#get-v1leaseslease_idforward)).
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `forward.enabled` | boolean | `true` | Offers tunnels. When `false`, the route answers `403` with `forwarding is off on this server`. Turn it off when tenants must not share the host's loopback ([security.md](security.md#tunnels-seiji-forward)). |
+| `forward.maxPerLease` | integer | `2` | Tunnels open on one lease at the same time. One more gets `429` with `this lease already has <maxPerLease> tunnels open`. Above 0. |
+
+Each tunnel listens on a new port on `127.0.0.1`, which the OS picks. It ends when the client closes it, the lease ends or the daemon stops. While it is open, it counts as activity on the lease every 60 s.
+
 ## `maxUploadBytes`
 
 | Key | Type | Default | Meaning |
@@ -349,6 +362,10 @@ This is [`deploy/seiji.example.json`](../deploy/seiji.example.json): ten seats, 
     "quality": 70,
     "maxViewersPerLease": 4,
     "sessionHours": 12
+  },
+  "forward": {
+    "enabled": true,
+    "maxPerLease": 2
   },
   "maestro": {
     "bin": "/opt/maestro/bin/maestro",

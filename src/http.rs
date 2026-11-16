@@ -245,6 +245,56 @@ async fn lease_screenshot(
     }
 }
 
+/// `GET /v1/leases/{lease_id}/forward` (WebSocket): the server end of `seiji forward`.
+async fn forward(
+    State(pool): State<Arc<Pool>>,
+    Extension(AuthedUser(user)): Extension<AuthedUser>,
+    UrlPath(lease_id): UrlPath<String>,
+    ws: axum::extract::ws::WebSocketUpgrade,
+) -> Response {
+    use crate::forward::{ForwardError, Wire};
+    use axum::extract::ws::Message;
+    let tunnel = match pool.open_forward(&user, &lease_id).await {
+        Ok(t) => t,
+        Err(ForwardError::Disabled) => return bad(StatusCode::FORBIDDEN, "forwarding is off on this server"),
+        Err(ForwardError::NotFound(e)) => return bad(StatusCode::NOT_FOUND, format!("{e:#}")),
+        Err(ForwardError::Full(n)) => {
+            return bad(StatusCode::TOO_MANY_REQUESTS, format!("this lease already has {n} tunnels open"));
+        }
+        Err(ForwardError::Internal(e)) => return bad(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+    };
+    ws.on_upgrade(move |socket| async move {
+        let (mut sink, stream) = socket.split();
+        let (wire, mut outgoing) = tokio::sync::mpsc::channel::<Wire>(64);
+        let writer = tokio::spawn(async move {
+            use futures_util::SinkExt;
+            while let Some(w) = outgoing.recv().await {
+                let msg = match w {
+                    Wire::Text(t) => Message::Text(t.into()),
+                    Wire::Binary(b) => Message::Binary(b.into()),
+                    Wire::Closed => {
+                        let _ = sink.send(Message::Close(None)).await;
+                        break;
+                    }
+                };
+                if sink.send(msg).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let incoming = stream.filter_map(|m| async move {
+            match m {
+                Ok(Message::Binary(b)) => Some(Wire::Binary(b.to_vec())),
+                Ok(Message::Text(t)) => Some(Wire::Text(t.to_string())),
+                Ok(Message::Close(_)) | Err(_) => Some(Wire::Closed),
+                Ok(_) => None,
+            }
+        });
+        crate::forward::serve(pool, tunnel, wire, Box::pin(incoming)).await;
+        let _ = writer.await;
+    })
+}
+
 pub fn router(pool: Arc<Pool>, shutdown: CancellationToken) -> Router {
     let cheat_sheet = Arc::new(OnceCell::new());
     let factory_pool = pool.clone();
@@ -267,6 +317,7 @@ pub fn router(pool: Arc<Pool>, shutdown: CancellationToken) -> Router {
         .route("/v1/me", get(me))
         .route("/v1/leases/{lease_id}/viewer", post(viewer_link))
         .route("/v1/leases/{lease_id}/screenshot.jpg", get(lease_screenshot))
+        .route("/v1/leases/{lease_id}/forward", get(forward))
         .layer(middleware::from_fn_with_state(pool.clone(), auth));
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
