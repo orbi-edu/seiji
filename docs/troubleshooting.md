@@ -553,7 +553,7 @@ When the plugin says you are not signed in, `seiji token print` found no credent
 | Status and message | Cause | Fix |
 |---|---|---|
 | `403 Forbidden`: `forwarding is off on this server` | The operator set `forward.enabled` to `false` ([configuration.md](configuration.md#forward)). | Install a build instead ([apps.md](apps.md#install-a-build)), or ask the operator. |
-| `429 Too Many Requests`: `this lease already has <N> tunnels open` | The lease already has `forward.maxPerLease` tunnels open (default 2). | Stop another `seiji forward` on the same lease, or raise `forward.maxPerLease`. |
+| `429 Too Many Requests`: `this lease already has <N> tunnels open` | The lease already has `forward.maxPerLease` tunnels open (default 4). | Stop another `seiji forward` on the same lease, or raise `forward.maxPerLease`. |
 | `404 Not Found`: `no active lease "<lease id>" for you`, `lease <lease id> is still booting`, `lease <lease id> is ending` | The lease is not yours, has ended, is still booting, or is being released. | Check the id with `budget_status`. Wait for `acquire_device` to return. |
 | `401 Unauthorized`: `missing, invalid or disabled bearer token` | The stored token is wrong, rotated, or the user is disabled. | See [Tool calls get 401](#tool-calls-get-401), then `seiji login --url <server>` again. |
 

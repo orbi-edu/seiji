@@ -264,7 +264,7 @@ Optional section. `seiji forward` opens a tunnel from a lease's host to a port o
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `forward.enabled` | boolean | `true` | Offers tunnels. When `false`, the route answers `403` with `forwarding is off on this server`. Turn it off when tenants must not share the host's loopback ([security.md](security.md#tunnels-seiji-forward)). |
-| `forward.maxPerLease` | integer | `2` | Tunnels open on one lease at the same time. One more gets `429` with `this lease already has <maxPerLease> tunnels open`. Above 0. |
+| `forward.maxPerLease` | integer | `4` | Tunnels open on one lease at the same time, for example one for each app's Metro. One more gets `429` with `this lease already has <maxPerLease> tunnels open`. Above 0. |
 
 Each tunnel listens on a new port on `127.0.0.1`, which the OS picks. It ends when the client closes it, the lease ends or the daemon stops. While it is open, it counts as activity on the lease every 60 s.
 
@@ -365,7 +365,7 @@ This is [`deploy/seiji.example.json`](../deploy/seiji.example.json): ten seats, 
   },
   "forward": {
     "enabled": true,
-    "maxPerLease": 2
+    "maxPerLease": 4
   },
   "maestro": {
     "bin": "/opt/maestro/bin/maestro",

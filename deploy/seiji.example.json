@@ -64,7 +64,7 @@
   },
   "forward": {
     "enabled": true,
-    "maxPerLease": 2
+    "maxPerLease": 4
   },
   "maestro": {
     "bin": "/opt/maestro/bin/maestro",

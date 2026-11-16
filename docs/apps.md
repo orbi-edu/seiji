@@ -11,6 +11,7 @@ This guide shows how to get your app onto a Seiji device. There are two ways. In
 - [Expo development build](#expo-development-build)
 - [React Native without Expo](#react-native-without-expo)
 - [Android](#android)
+- [Several apps at once](#several-apps-at-once)
 - [Other dev servers](#other-dev-servers)
 - [How the tunnel works](#how-the-tunnel-works)
 - [Limits](#limits)
@@ -123,9 +124,27 @@ That calls `configure_device` with `react_native_bundler: {bundle_id, location}`
 
 An Android emulator reaches the host's loopback at `10.0.2.2`, so `seiji forward` prints `10.0.2.2:<port>`. `--expo-go` and `--dev-client` work the same way. For a React Native debug build, set the bundler in the app's dev menu (**Settings → Debug server host & port**) to the printed address; `--react-native` is iOS only.
 
+## Several apps at once
+
+Every `seiji forward` is its own tunnel, with its own port on the host and its own device address. Give each app its own Metro port on your machine, and one `seiji forward` for each, in separate terminals:
+
+```sh
+# terminal 1: the shop app
+cd shop  && npx expo start --port 8081
+seiji forward 8081 --react-native com.example.shop
+
+# terminal 2: the admin app
+cd admin && npx expo start --port 8082
+seiji forward 8082 --react-native com.example.admin
+```
+
+Pass the bundle id (or the dev build's scheme) to each one: without it, `--react-native` points the app installed last. `RCT_jsLocation` is a default of each app, so each app keeps its own address. Expo Go shows one project at a time; `--expo-go` switches it to the project of that tunnel.
+
+A lease takes `forward.maxPerLease` tunnels at once (4 by default). Two people never share a tunnel: each tunnel belongs to one lease, and each lease to one person.
+
 ## Other dev servers
 
-The tunnel carries any TCP: a web app on `:3000`, a mock API on `:4000`. Run `seiji forward 3000` and use the printed address in the app or in `open_url`. A lease takes `forward.maxPerLease` tunnels at once (2 by default).
+The tunnel carries any TCP: a web app on `:3000`, a mock API on `:4000`. Run `seiji forward 3000` and use the printed address in the app or in `open_url`. These count toward `forward.maxPerLease` too.
 
 ## How the tunnel works
 

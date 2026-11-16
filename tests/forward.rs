@@ -28,6 +28,25 @@ async fn echo_server() -> u16 {
     port
 }
 
+/// A stand-in for one app's Metro: answers every connection with its name, then the bytes.
+async fn named_server(name: &'static str) -> u16 {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let (mut s, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut got = Vec::new();
+                let _ = s.read_to_end(&mut got).await;
+                let _ = s.write_all(format!("{name}:").as_bytes()).await;
+                let _ = s.write_all(&got).await;
+                let _ = s.shutdown().await;
+            });
+        }
+    });
+    port
+}
+
 /// A free local port with nothing listening on it.
 async fn dead_port() -> u16 {
     TcpListener::bind(("127.0.0.1", 0)).await.unwrap().local_addr().unwrap().port()
@@ -159,6 +178,37 @@ async fn cli_forward(env: &Env, token: &str, args: &[&str], wait_for: impl Fn(&[
     child.stdout.take().unwrap().read_to_string(&mut out).await.unwrap();
     assert!(tokio::time::timeout(Duration::from_secs(5), child.wait()).await.unwrap().unwrap().success());
     out
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn each_app_gets_its_own_tunnel_to_its_own_metro() {
+    let env = setup(2).await;
+    let (token, lease) = device(&env, "ana").await;
+    let (shop, admin) = (named_server("shop").await, named_server("admin").await);
+    let (a, _stop_a, _ta) = tunnel(&env, &token, &lease, shop).await;
+    let (b, _stop_b, _tb) = tunnel(&env, &token, &lease, admin).await;
+    assert_ne!(a, b, "two tunnels, two device addresses");
+    let (from_a, from_b) = tokio::join!(round_trip(&a, b"/index.bundle"), round_trip(&b, b"/index.bundle"));
+    assert_eq!(from_a, b"shop:/index.bundle");
+    assert_eq!(from_b, b"admin:/index.bundle");
+
+    // Each React Native app is pointed at its own tunnel.
+    let (p_shop, p_admin) = (shop.to_string(), admin.to_string());
+    let shop_args = [p_shop.as_str(), "--react-native", "com.example.shop"];
+    let admin_args = [p_admin.as_str(), "--react-native", "com.example.admin"];
+    let launched = |bundle: &'static str| {
+        move |log: &[String]| log.iter().any(|l| l.starts_with(&format!("op launch_app {bundle}")))
+    };
+    tokio::join!(
+        cli_forward(&env, &token, &shop_args, launched("com.example.shop")),
+        cli_forward(&env, &token, &admin_args, launched("com.example.admin")),
+    );
+    let location = |bundle: &str| {
+        let log = env.fake.log();
+        let line = log.iter().find(|l| l.contains("react_native_bundler") && l.contains(bundle)).cloned().unwrap();
+        line.split("127.0.0.1:").nth(1).unwrap().chars().take_while(char::is_ascii_digit).collect::<String>()
+    };
+    assert_ne!(location("com.example.shop"), location("com.example.admin"), "{:?}", env.fake.log());
 }
 
 #[tokio::test(flavor = "multi_thread")]

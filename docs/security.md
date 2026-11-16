@@ -319,7 +319,7 @@ No inline script runs, and no other site can frame the page.
 |---|---|
 | Developer's machine | Only the one port given to `seiji forward`, on `127.0.0.1`, then `::1`. The server sends connection ids and bytes, never an address or a port, so it cannot reach any other port of the machine or its network. |
 | Seiji host | A port on `127.0.0.1` that the OS picks. Nothing is bound on another interface. On macOS, the loopback is shared by every account on the host, so any local process can connect to the port. |
-| Admission | The bearer token of the lease's owner. The lease must be the caller's and `ready`. At most `forward.maxPerLease` tunnels per lease (default 2). |
+| Admission | The bearer token of the lease's owner. The lease must be the caller's and `ready`. At most `forward.maxPerLease` tunnels per lease (default 4). Each tunnel has its own port and its own WebSocket; a tunnel belongs to one lease, and a lease to one user. |
 | Lifetime | Until the client closes, the WebSocket breaks, the lease ends or the server stops. The tunnel's cancellation is a child of the lease's, so a release closes its port. |
 
 ### The shared loopback

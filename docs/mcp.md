@@ -1670,7 +1670,7 @@ Seiji checks these before the upgrade:
 | `401` | `missing, invalid or disabled bearer token` | See [Authentication](#authentication) |
 | `403` | `{"error": "forwarding is off on this server"}` | `forward.enabled` is `false` ([configuration.md](configuration.md#forward)) |
 | `404` | `{"error": "<text>"}` | The [lease errors](#lease-errors): the lease is not yours, has ended or is still booting. Also `lease <lease id> is ending` |
-| `429` | `{"error": "this lease already has <maxPerLease> tunnels open"}` | The lease already has `forward.maxPerLease` tunnels open (default 2) |
+| `429` | `{"error": "this lease already has <maxPerLease> tunnels open"}` | The lease already has `forward.maxPerLease` tunnels open (default 4) |
 | `500` | `{"error": "binding a loopback port: <cause>"}` | No port could be bound |
 
 After the upgrade, Seiji listens on a new port on `127.0.0.1` that the OS picks. Its first message is a text message, the hello:

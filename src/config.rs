@@ -281,7 +281,7 @@ pub struct Forward {
 
 impl Default for Forward {
     fn default() -> Self {
-        Self { enabled: true, max_per_lease: 2 }
+        Self { enabled: true, max_per_lease: 4 }
     }
 }
 
