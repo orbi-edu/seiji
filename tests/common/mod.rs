@@ -40,6 +40,8 @@ pub struct FakeDevices {
     pub fail_boot: AtomicBool,
     /// Boot blocks until the lease is released.
     pub hang_boot: AtomicBool,
+    /// Notified (with a stored permit) when `boot()` enters the `hang_boot` wait.
+    pub boot_entered: tokio::sync::Notify,
     /// Every input and operation, in order, e.g. `tap label=Sign In`, `type ana`, `op launch_app com.example.demo`.
     pub log: Mutex<Vec<String>>,
     pub signed_in: AtomicBool,
@@ -67,6 +69,7 @@ impl Devices for FakeDevices {
     }
     async fn boot(&self, _ctx: &DeviceCtx, cancel: &CancellationToken) -> Result<()> {
         if self.hang_boot.load(Ordering::SeqCst) {
+            self.boot_entered.notify_one();
             cancel.cancelled().await;
             bail!("cancelled");
         }

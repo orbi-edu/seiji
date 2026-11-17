@@ -149,9 +149,9 @@ An SQLite error that says the database is read-only has the same cause as `Opera
 
 **Sign:** `acquire_device`, `run_actions`, `run_flow`, `run_xctest` or `install_app` fails after a fixed time (often 60 s) with a gateway error, while the daemon log shows the operation finishing (for a run, `run recorded`).
 
-**Cause:** Seiji answers each tool call with one JSON response when the work is done. A boot takes 30 to 90 s or more, an install up to 600 s, a `run_actions` run up to `evidence.maxRunSeconds` (1800 s by default), a flow up to `maestro.flowTimeoutSeconds` (600 s), a `run_xctest` up to `xctest.timeoutSeconds` (3600 s). Every run then stops its captures and copies its evidence. A proxy or load balancer with a shorter read or idle timeout cuts the call. nginx's `proxy_read_timeout` and an AWS ALB's idle timeout are 60 s by default. Caddy's `reverse_proxy` has no response timeout by default.
+**Cause:** Seiji streams each tool call response as SSE with keepalive comments every 15 s. If the proxy's idle read timeout is below 15 s, it cuts the connection between two keepalives. This is rare: most proxies default to 60 s or more. Caddy's `reverse_proxy` has no response timeout by default.
 
-**Fix:** Set the proxy's timeout above the longest of `evidence.maxRunSeconds`, `maestro.flowTimeoutSeconds` and `xctest.timeoutSeconds`, with a few minutes to spare. A run that the proxy cut still finishes and is recorded: find it with `list_runs`.
+**Fix:** Set the proxy's idle or read timeout above 15 s. nginx: `proxy_read_timeout 60s;` (the default). AWS ALB: idle timeout 60 s (the default). If the proxy cut a run, the run still finishes and is recorded: find it with `list_runs`.
 
 ## `acquire_device` is refused
 

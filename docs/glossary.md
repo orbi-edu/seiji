@@ -39,7 +39,7 @@ All Seiji documents use these terms with these meanings only. [concepts.md](conc
 | **Selector** | The fields (`id`, `label`, `value`, `contains`, `element_type`) that name an element in the accessibility tree for `tap`, `wait_for`, the assertions and `scroll` `until`. |
 | **simctl** | `xcrun simctl`, the Xcode command that creates, boots, captures and deletes iOS simulators. |
 | **Step** | One action of `run_actions` (for example `tap` or `wait_for`), or one Maestro command or test case of a run, recorded with its status, timing, error and files. |
-| **Streamable HTTP** | The MCP transport over plain HTTP `POST`; Seiji serves it at `/mcp` without sessions and with JSON responses. |
+| **Streamable HTTP** | The MCP transport over plain HTTP `POST`; Seiji serves it at `/mcp` without sessions, with SSE responses and 15 s keepalive comments. |
 | **Tenant account** | The macOS account of a user under `os_user` isolation, named `<isolation.userPrefix><user>` (default `seiji-alice`), member of the fixed group `seiji-tenants`. |
 | **Tern plugin** | `tern-plugin/`: a [Tern](https://tern.sh) panel with a user's budget, devices and runs that opens the viewer beside it; it reads the token with `seiji token print --json` ([tern.md](tern.md)). |
 | **Ticket** | The single-use, 64-hex secret in a viewer link; it lives 60 s, in memory only, and `GET /view/open/<ticket>` trades it for a viewer session. |

@@ -2,7 +2,7 @@
 name = "seiji"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 description = "Self-hosted, budgeted iOS simulator and Android emulator pool for AI agents, served over MCP and driven by Maestro"
 license = "MIT"
 repository = "https://github.com/wiljafor1/seiji"

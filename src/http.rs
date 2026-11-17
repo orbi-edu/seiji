@@ -1,7 +1,9 @@
-//! HTTP surface: `/mcp` (Streamable HTTP MCP), `POST /v1/apps` (build upload), run evidence
-//! downloads under `/v1/runs/{run_id}/`, and `/healthz`.
+//! HTTP surface: `/mcp` (Streamable HTTP MCP with SSE responses and 15 s keepalives),
+//! `POST /v1/apps` (build upload), run evidence downloads under `/v1/runs/{run_id}/`,
+//! and `/healthz`.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
     Json, Router,
@@ -302,8 +304,9 @@ pub fn router(pool: Arc<Pool>, shutdown: CancellationToken) -> Router {
         move || Ok(SeijiMcp::new(factory_pool.clone(), cheat_sheet.clone())),
         Arc::new(NeverSessionManager::default()),
         StreamableHttpServerConfig::default()
+            .with_sse_keep_alive(Some(Duration::from_secs(15)))
             .with_legacy_session_mode(false)
-            .with_json_response(true)
+            .with_json_response(false)
             .with_allowed_hosts(pool.config.listen.allowed_hosts.clone())
             .with_cancellation_token(shutdown),
     );

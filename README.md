@@ -58,7 +58,7 @@ Shared mode runs everything as your own account. Use it to try Seiji on a laptop
 
 > **Warning:** In shared mode, everything a run executes runs as your account and can read your files. Use `os_user` isolation on a shared host. See [docs/security.md](docs/security.md).
 
-You need macOS with Xcode and an iOS simulator runtime, Rust 1.88 or later, and AXe (`brew install cameroncooke/axe/axe`). Maestro is optional.
+You need macOS with Xcode and an iOS simulator runtime, Rust 1.89 or later, and AXe (`brew install cameroncooke/axe/axe`). Maestro is optional.
 
 1. Get the code:
    ```sh

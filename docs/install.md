@@ -32,7 +32,7 @@ This document tells you how to install Seiji on one Mac, an AWS EC2 Mac host for
 | AXe | For iOS screen input and the accessibility tree. `brew install cameroncooke/axe/axe`, at `/opt/homebrew/bin/axe`, readable and runnable by every account. |
 | Java 17 | Only for Maestro. Homebrew's `openjdk@17` is used below. |
 | Maestro CLI | Optional: only for `run_flow` and `inspect_screen` on Android. Under `/opt/maestro`, readable by every account. |
-| Rust (1.88 or later) | To build Seiji. |
+| Rust (1.89 or later) | To build Seiji. |
 | Android SDK, emulator and AVDs | Only for Android. Under `/opt/android-sdk` and `/opt/android-avd`. |
 | A DNS name and a TLS proxy | Agents connect over HTTPS. Caddy is used below. |
 | Outbound HTTPS | For `cheat_sheet` and for `install_app` with a URL. |
@@ -414,7 +414,7 @@ Seiji serves plain HTTP. Put a TLS proxy in front and keep port 4780 closed to t
 Notes:
 
 - Seiji caps uploads itself at `maxUploadBytes` ([configuration.md](configuration.md#maxuploadbytes)), so the proxy needs no body limit.
-- Each tool call returns one JSON response when its work is done: a boot takes 30 to 90 s or more, a `run_actions` run up to `evidence.maxRunSeconds` (1800 s), a `run_flow` up to `maestro.flowTimeoutSeconds` (600 s), a `run_xctest` up to `xctest.timeoutSeconds` (3600 s), and every run then spends some time copying its evidence. Caddy has no response timeout by default. With another proxy, set its read or idle timeout above the longest of these.
+- Each tool call response is an SSE stream (`text/event-stream`) with keepalive comments every 15 s. The proxy needs only an idle read timeout above 15 s, not above the absolute operation time. Caddy has no response timeout by default. With another proxy (nginx, an ALB), set its idle or read timeout above 15 s.
 - Run evidence is served at `/v1/runs/<run id>/…` on the same host and needs the same `Authorization` header. A video or an `evidence.zip` can be large; Caddy streams it with no size limit.
 
 ## 12. Connect agents
