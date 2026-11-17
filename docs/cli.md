@@ -139,11 +139,11 @@ sudo seiji tenant provision [-c PATH] <name>
 Only for `os_user` isolation. Creates or repairs the tenant account `<isolation.userPrefix><name>`:
 
 1. Creates the group `seiji-tenants` if it does not exist (`dseditgroup`).
-2. Creates the account with `dscl` if it does not exist: uid one above the highest existing uid (at least 600), primary group 20 (`staff`), home `/Users/<account>`, shell `/usr/bin/false`, no password (`Password *`), so nobody can log in as it. Then adds it to `seiji-tenants`.
-3. Hides it from the login window (`IsHidden 1`), creates its home and sets the home to mode `700`.
+2. Creates the account with `dscl` if it does not exist: uid one above the highest existing uid (at least 600), primary group 20 (`staff`), home `/Users/<account>` and shell `/usr/bin/false`. Then adds it to `seiji-tenants`.
+3. Disables authentication (`AuthenticationAuthority ;DisabledUser;`), hides it from the login window (`IsHidden 1`), creates its home and sets the home to mode `700`.
 4. Checks the result with the same rules as the root helpers: the account exists, has uid 501 or more, is in `seiji-tenants` and is not in `admin`.
 
-Running it again on a tenant account is safe; it repairs the hidden flag, the home and its mode. It refuses an existing account that is not already a tenant account (not in `seiji-tenants`, an admin, or a uid below 501): `"<account>" already exists and is not a Seiji tenant account; refusing to change it`. Without root it fails with `must run as root (through sudo)`.
+Running it again on a tenant account is safe; it repairs the disabled authentication authority, the hidden flag, the home and its mode. It refuses an existing account that is not already a tenant account (not in `seiji-tenants`, an admin, or a uid below 501): `"<account>" already exists and is not a Seiji tenant account; refusing to change it`. Without root it fails with `must run as root (through sudo)`.
 
 ```text
 macOS account seiji-alice ready (uid 601, home /Users/seiji-alice)
