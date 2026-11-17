@@ -1,9 +1,11 @@
 --!strict
 -- Talks to the Seiji server with tern.fetch: MCP `tools/call` (JSON-RPC over Streamable HTTP,
--- stateless) for what agents can do too, REST for the viewer link, screenshots and evidence.
--- The token stays in this table's memory; it never reaches a block's args or `save()`.
+-- stateless, JSON or SSE) for what agents can do too, REST for the viewer link, screenshots
+-- and evidence. The token stays in this table's memory; it never reaches a block's args or
+-- `save()`.
 
 local cli = require("./cli")
+local sse = require("./sse")
 
 local M = {}
 
@@ -114,21 +116,38 @@ function M.request(c: Client, method: string, path: string, opts: { [string]: an
 end
 
 -- Calls MCP tool `name`; `cb(value, err)` with the tool's text decoded as JSON when it is JSON.
+-- Handles both application/json and text/event-stream responses.
 function M.tool(c: Client, name: string, args: { [string]: any }?, timeout_ms: number?, cb: (value: any, err: cli.CliError?) -> ())
 	c.seq += 1
+	local id = c.seq
 	local params: { [string]: any } = { name = name }
 	if args and next(args) ~= nil then
 		params.arguments = args
 	end
 	M.request(c, "POST", "/mcp", {
-		body = { jsonrpc = "2.0", id = c.seq, method = "tools/call", params = params },
+		body = { jsonrpc = "2.0", id = id, method = "tools/call", params = params },
 		accept = "application/json, text/event-stream",
 		headers = { ["MCP-Protocol-Version"] = PROTOCOL },
 		timeout_ms = timeout_ms,
-	}, function(doc, err)
+		raw = true,
+	}, function(body, err)
 		if err then
 			cb(nil, err)
 			return
+		end
+		if type(body) ~= "string" then
+			cb(nil, { code = "bad_response", message = "" })
+			return
+		end
+		-- Try JSON first (application/json), then SSE (text/event-stream).
+		local ok, doc = pcall(tern.json.decode, body :: string)
+		if not ok then
+			local sse_doc, sse_err = sse.parse(body :: string, id)
+			if sse_err then
+				cb(nil, { code = "bad_response", message = sse_err })
+				return
+			end
+			doc = sse_doc
 		end
 		if type(doc) ~= "table" then
 			cb(nil, { code = "bad_response", message = "" })
@@ -145,8 +164,8 @@ function M.tool(c: Client, name: string, args: { [string]: any }?, timeout_ms: n
 			cb(nil, { code = "tool", message = text })
 			return
 		end
-		local ok, value = pcall(tern.json.decode, text)
-		cb(if ok then value else text, nil)
+		local parsed_ok, value = pcall(tern.json.decode, text)
+		cb(if parsed_ok then value else text, nil)
 	end)
 end
 

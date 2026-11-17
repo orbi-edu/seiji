@@ -25,7 +25,7 @@ This document is the reference for the interface that agents use. It covers the 
 |---|---|
 | URL | `POST /mcp` on `listen.host`:`listen.port` (default `127.0.0.1:4780`). Put a TLS proxy in front for remote agents (see [install.md](install.md)) |
 | Transport | MCP Streamable HTTP, stateless. The server issues no `Mcp-Session-Id`. Each POST is independent, so a `tools/call` works without an `initialize` first |
-| Response | `Content-Type: application/json`, one JSON-RPC message for each POST. The server opens no SSE stream |
+| Response | `Content-Type: text/event-stream` with `Cache-Control: no-cache` and `X-Accel-Buffering: no`. The HTTP headers arrive at once and the server sends SSE keepalive comments every 15 s while the tool runs. The JSON-RPC message arrives as a `data:` event. Clients must parse SSE, ignore comments and extract the `data:` line that carries their JSON-RPC `id` |
 | Other methods | `GET /mcp` and `DELETE /mcp` return `405 Method Not Allowed` with `Allow: POST` |
 | `Content-Type` | Must be `application/json`. Else `415` `Unsupported Media Type: Content-Type must be application/json` |
 | `Accept` | Must list both `application/json` and `text/event-stream`. Else `406` `Not Acceptable: Client must accept both application/json and text/event-stream` |

@@ -151,7 +151,7 @@ Builds are copied in through stdin. Under `os_user` the daemon cannot write into
 - Put TLS in front: Caddy, nginx, an ALB or Tailscale. Seiji has no TLS.
 - `listen.allowedHosts` is a DNS-rebinding guard. The MCP service accepts only requests whose `Host` header is in the list (default `localhost`, `127.0.0.1`). Add your public hostname. The check covers `/mcp` only; `POST /v1/apps` and `GET /v1/runs/...` need the token in any case.
 - `GET /healthz` needs no token and returns `ok`.
-- A tool call holds its HTTP request open for its whole length: up to `evidence.maxRunSeconds` plus the evidence collection for `run_actions`, `xctest.timeoutSeconds` for `run_xctest`, `maestro.flowTimeoutSeconds` for `run_flow`. Set the proxy's read timeout above them.
+- A tool call holds its HTTP request open for its whole length. The response is an SSE stream with keepalive comments every 15 s, so the proxy needs only an idle read timeout above 15 s. The absolute operation time does not matter for timeouts.
 - Outbound connections: build downloads (`install_app` with `url`), and `https://api.copilot.mobile.dev/v2/bot/maestro-cheat-sheet` at the first `cheat_sheet` call of the process.
 - Driver ports, emulator console ports, the adb server and open tunnels are TCP ports on the host. Seiji does not authenticate them. Any local process can connect to them.
 
@@ -390,7 +390,7 @@ An open tunnel restarts its lease's idle timer every 60 s, so the lease is not r
    sudo -u seiji sh -c 'cd /usr/local/var/seiji && chmod 700 apps runs && chmod 600 seiji.db*'
    ```
 
-6. Bind `listen.host` to `127.0.0.1`, put a TLS proxy in front, and add the public hostname to `listen.allowedHosts`. Set `listen.publicUrl` to the proxy's `https://` URL, so that the viewer cookie is `Secure`. Set the proxy's read timeout above `evidence.maxRunSeconds`, `xctest.timeoutSeconds` and `maestro.flowTimeoutSeconds`.
+6. Bind `listen.host` to `127.0.0.1`, put a TLS proxy in front, and add the public hostname to `listen.allowedHosts`. Set `listen.publicUrl` to the proxy's `https://` URL, so that the viewer cookie is `Secure`. The MCP endpoint sends SSE keepalive comments every 15 s, so the proxy's idle read timeout must be above 15 s (most proxies default higher).
 7. In the EC2 security group, open only the proxy's HTTPS port, and SSH from the admins' addresses.
 8. Give the instance no IAM role with permissions, or turn off the instance metadata service.
 9. Tell users not to put secrets in `run_flow` `env`, `launch_app` `arguments` or selectors, to mark passwords with `secret: true` in `type` steps, and that the video, screenshots and `app.log` are not redacted. Tell them that a viewer link works for anyone who opens it first within 60 s, and to share view-only links unless the other person must drive.

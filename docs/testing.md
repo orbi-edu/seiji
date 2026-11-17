@@ -15,7 +15,7 @@ This document tells you how to run the checks, what the tests in `tests/` and th
 
 ## Run the checks
 
-You need macOS and Rust 1.88 or later. Seiji builds only on macOS: the root helpers use the Darwin signatures of `getgrouplist` and `initgroups`. The tests need no simulator, no Xcode, no AXe, no Maestro and no network. They use the macOS tools `sips` (image previews) and `ditto` (`evidence.zip`), which every Mac has. `tests/tern.rs` also needs `tern` on `PATH`; without it, the test prints `skipped: tern is not on PATH` and passes.
+You need macOS and Rust 1.89 or later. Seiji builds only on macOS: the root helpers use the Darwin signatures of `getgrouplist` and `initgroups`. The tests need no simulator, no Xcode, no AXe, no Maestro and no network. They use the macOS tools `sips` (image previews) and `ditto` (`evidence.zip`), which every Mac has. `tests/tern.rs` also needs `tern` on `PATH`; without it, the test prints `skipped: tern is not on PATH` and passes.
 
 1. Run all tests:
 
@@ -86,6 +86,7 @@ Each test starts its own server on `127.0.0.1` and a free port, with a temporary
 | `uploads_respect_size_and_count_limits` | A 17-byte upload gets `413` and leaves nothing in the user's build directory. An empty upload gets `400`. Two small uploads get `200`. The third gets `429`, and the body contains `the limit is 2` |
 | `reaper_ends_leases_of_disabled_users_and_overlong_leases` | Alice is disabled while she holds a lease. Bob's lease is 31 minutes old (limit 30) and was used a minute ago. One reaper pass ends Alice's lease as `user_disabled` and Bob's as `max_lease_duration`. `release_device` on Bob's ended lease then fails with `no active lease` |
 | `releasing_during_boot_is_billed_and_destroys_the_device` | With `hang_boot` set, `Pool::acquire` blocks in the boot. `Pool::release` with `released` returns `true`. `acquire` then fails with `released while the device booted`. The lease ends as `released`, is billable (`billable = 1`), and its device is destroyed exactly once |
+| `sse_streams_headers_and_keepalive_before_tool_completes` | With `hang_boot` set, a raw `POST /mcp` with `MCP-Protocol-Version: 2025-11-25` for `acquire_device` returns HTTP `200` with `Content-Type: text/event-stream`, `Cache-Control: no-cache` and `X-Accel-Buffering: no` at once. `boot_entered` confirms the boot is active. At least one SSE keepalive comment (`:`) arrives before the tool completes. After `Pool::release` unblocks the boot, the `data:` event carries a JSON-RPC result with `isError` and `released while the device booted`. The matching lease is destroyed and ended as `released`. All phases have bounded timeouts |
 
 ### `tests/runs.rs`
 
@@ -187,7 +188,7 @@ The helpers:
 | Method | Fake behavior |
 |---|---|
 | `create` | Makes the lease dir, counts the call in `created`, returns the device id `FAKE-<lease id>` |
-| `boot` | Succeeds. Fails with `runtime missing` when `fail_boot` is set. Blocks until the lease is released, then fails, when `hang_boot` is set |
+| `boot` | Succeeds. Fails with `runtime missing` when `fail_boot` is set. Blocks until the lease is released, then fails, when `hang_boot` is set; notifies `boot_entered` before blocking |
 | `destroy` | Records the lease id in `destroyed` |
 | `install` | Records `<filename>:<file contents>` in `installed`. Returns `bundle_id: "com.example.demo"`, `executable: "Demo"`, `version: "1.2.3"` |
 | `screenshot` | Returns four bytes: an empty JPEG (`FF D8 FF D9`) |

@@ -4,6 +4,7 @@
 //! current server URL and user name live in `~/Library/Application Support/seiji/client.json`.
 //! Tern's plugin reads the credential through `seiji token print --json`, never from a file.
 
+use std::borrow::Cow;
 use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
 
@@ -148,6 +149,69 @@ pub fn token_print(json: bool) -> Result<()> {
     Ok(())
 }
 
+/// Extracts the JSON-RPC response matching `id` from an SSE event stream body.
+/// Ignores comments, priming events, notifications and unrelated ids.  Rejects
+/// malformed JSON events and streams not terminated by a blank line.
+fn extract_sse_response(body: &[u8], id: &serde_json::Value) -> Result<serde_json::Value> {
+    let text = std::str::from_utf8(body).context("SSE response is not UTF-8")?;
+    let bytes = text.as_bytes();
+    let mut data: Cow<'_, str> = Cow::Borrowed("");
+    let mut has_data = false;
+    let mut pos = 0;
+    while pos < bytes.len() {
+        // Scan to end-of-line content (stops at CR or LF).
+        let start = pos;
+        while pos < bytes.len() && bytes[pos] != b'\r' && bytes[pos] != b'\n' {
+            pos += 1;
+        }
+        let line = &text[start..pos];
+        // Consume the line ending: CR, LF, or CRLF.
+        if pos < bytes.len() && bytes[pos] == b'\r' {
+            pos += 1;
+        }
+        if pos < bytes.len() && bytes[pos] == b'\n' {
+            pos += 1;
+        }
+        if line.is_empty() {
+            // Blank line: SSE event boundary.
+            if has_data {
+                if data.trim().is_empty() {
+                    // Priming event (empty data); skip.
+                } else {
+                    let doc: serde_json::Value = serde_json::from_str(&data).context("malformed JSON in SSE event")?;
+                    // Accept only JSON-RPC responses (result or error), not server requests.
+                    if doc.get("id") == Some(id)
+                        && doc.get("method").is_none()
+                        && (doc.get("result").is_some() || doc.get("error").is_some())
+                    {
+                        return Ok(doc);
+                    }
+                }
+                data = Cow::Borrowed("");
+                has_data = false;
+            }
+        } else if line.starts_with(':') {
+            // SSE comment (keep-alive heartbeat); skip.
+        } else if let Some(value) = line.strip_prefix("data:") {
+            let value = value.strip_prefix(' ').unwrap_or(value);
+            if has_data {
+                // Multiline data: allocate only here.
+                let buf = data.to_mut();
+                buf.push('\n');
+                buf.push_str(value);
+            } else {
+                data = Cow::Borrowed(value);
+                has_data = true;
+            }
+        }
+        // event:, id:, retry: fields are not needed; skip.
+    }
+    if has_data {
+        bail!("SSE stream truncated: event not terminated by a blank line");
+    }
+    bail!("no JSON-RPC response with the expected id in the SSE stream");
+}
+
 /// Calls MCP tool `name` and returns its text, decoded as JSON when it is JSON.
 async fn tool(c: &Credential, name: &str, args: serde_json::Value) -> Result<serde_json::Value> {
     let body = serde_json::json!({
@@ -169,7 +233,14 @@ async fn tool(c: &Credential, name: &str, args: serde_json::Value) -> Result<ser
     if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
         bail!("the server refused the token; run `seiji login --url {}`", c.url);
     }
-    let doc: serde_json::Value = serde_json::from_slice(&resp.error_for_status()?.bytes().await?)?;
+    let is_sse = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.starts_with("text/event-stream"));
+    let bytes = resp.error_for_status()?.bytes().await?;
+    let doc =
+        if is_sse { extract_sse_response(&bytes, &serde_json::json!(1))? } else { serde_json::from_slice(&bytes)? };
     if let Some(e) = doc.get("error") {
         bail!("{name}: {}", e["message"].as_str().unwrap_or("MCP error"));
     }
@@ -288,4 +359,55 @@ pub async fn forward(port: u16, lease: Option<String>, point: Option<Point>) -> 
         println!("the tunnel closed (the lease ended, or the server stopped)");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Mixed CRLF/CR/LF, comments, priming, notification, wrong id, server request with
+    /// our id, and a multiline matching result: everything a real stream can contain.
+    #[test]
+    fn sse_extracts_result_through_noise_and_mixed_line_endings() {
+        let body = concat!(
+            "retry: 3000\r\ndata: \r\n\r\n", // priming (CRLF)
+            ": keep-alive\r\r",              // comment (bare CR)
+            "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\n\n",
+            "data: {\"jsonrpc\":\"2.0\",\"id\":99,\"result\":{}}\n\n",
+            "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"sampling/createMessage\"}\n\n",
+            "data:{\"jsonrpc\":\"2.0\",\r\ndata: \"id\":1,\"result\":{\"found\":true}}\r\n\r\n",
+        );
+        let doc = extract_sse_response(body.as_bytes(), &json!(1)).unwrap();
+        assert_eq!(doc["result"]["found"], true);
+    }
+
+    #[test]
+    fn sse_extracts_error_response() {
+        let body = b"data: {\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32600,\"message\":\"bad\"}}\n\n";
+        let doc = extract_sse_response(body, &json!(1)).unwrap();
+        assert_eq!(doc["error"]["message"], "bad");
+    }
+
+    #[test]
+    fn sse_rejects_malformed_json_event() {
+        let body = b"data: {not valid json}\n\n";
+        let err = extract_sse_response(body, &json!(1)).unwrap_err();
+        assert!(err.to_string().contains("malformed"), "{err}");
+    }
+
+    #[test]
+    fn sse_rejects_truncated_stream() {
+        // Data line present but no terminating blank line.
+        let body = b": keep-alive\n\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}";
+        let err = extract_sse_response(body, &json!(1)).unwrap_err();
+        assert!(err.to_string().contains("truncated"), "{err}");
+    }
+
+    #[test]
+    fn sse_fails_when_no_response_matches() {
+        let body = b"data: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{}}\n\n";
+        let err = extract_sse_response(body, &json!(1)).unwrap_err();
+        assert!(err.to_string().contains("no JSON-RPC response"), "{err}");
+    }
 }

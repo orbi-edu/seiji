@@ -6,6 +6,7 @@
 
 local cli = require("./lib/cli")
 local fmt = require("./lib/fmt")
+local sse = require("./lib/sse")
 
 local APP = "seiji.app"
 local POLL_MS = 15000
@@ -203,7 +204,11 @@ local function status_poll()
 			return
 		end
 		local ok, b = pcall(function()
-			local doc = tern.json.decode(r.body)
+			-- Try JSON first (application/json), then SSE (text/event-stream).
+			local json_ok, doc = pcall(tern.json.decode, r.body)
+			if not json_ok then
+				doc = sse.parse(r.body, 1)
+			end
 			return tern.json.decode(doc.result.content[1].text)
 		end)
 		if not ok or type(b) ~= "table" then

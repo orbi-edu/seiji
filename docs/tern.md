@@ -186,3 +186,5 @@ sequenceDiagram
 ```
 
 The token never reaches the browser. The panel uses it to ask for a one-time ticket; the browser trades the ticket for a session cookie scoped to that session's path. Every request checks the session, the user and the lease. For the full model, read [security.md](security.md#the-viewer). For the endpoints, read [mcp.md](mcp.md). For the settings, read [configuration.md](configuration.md#viewer).
+
+The plugin's MCP tool calls (acquire, release, budget, runs, models) work with both `application/json` and `text/event-stream` responses, so the plugin is compatible with servers that stream MCP over SSE.

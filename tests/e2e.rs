@@ -306,3 +306,113 @@ async fn releasing_during_boot_is_billed_and_destroys_the_device() {
     let billable: i64 = conn.query_row("SELECT billable FROM leases WHERE id = ?1", [&id], |r| r.get(0)).unwrap();
     assert_eq!(billable, 1);
 }
+
+#[tokio::test]
+async fn sse_streams_headers_and_keepalive_before_tool_completes() {
+    use std::time::Duration;
+
+    let env = setup(2).await;
+    let token = add_user(&env, "alice", QUOTA);
+    env.fake.hang_boot.store(true, Ordering::SeqCst);
+
+    let http = reqwest::Client::new();
+    let body = json!({
+        "jsonrpc": "2.0", "id": 1,
+        "method": "tools/call",
+        "params": {"name": "acquire_device", "arguments": {"platform": "ios"}}
+    });
+
+    // Send the request. The server returns SSE headers at once, before the boot completes.
+    let mut resp = tokio::time::timeout(Duration::from_secs(5), async {
+        http.post(format!("{}/mcp", env.url))
+            .bearer_auth(&token)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .header("MCP-Protocol-Version", "2025-11-25")
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+    })
+    .await
+    .expect("headers did not arrive within 5 s");
+
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers()["content-type"], "text/event-stream");
+    assert_eq!(resp.headers()["cache-control"], "no-cache");
+    assert_eq!(resp.headers()["x-accel-buffering"], "no");
+
+    // Confirm the boot is active before we start reading the stream.
+    tokio::time::timeout(Duration::from_secs(5), env.fake.boot_entered.notified())
+        .await
+        .expect("boot did not enter within 5 s");
+
+    // Read until at least one keepalive comment (`:`) arrives (15 s interval).
+    let mut buf = String::new();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            match resp.chunk().await.unwrap() {
+                Some(bytes) => {
+                    buf.push_str(&String::from_utf8_lossy(&bytes));
+                    if buf.lines().any(|l| l.starts_with(':')) {
+                        return;
+                    }
+                }
+                None => panic!("SSE stream ended before a keepalive comment"),
+            }
+        }
+    })
+    .await
+    .expect("no keepalive within 20 s");
+
+    // Release the lease now that the keepalive proves the stream is alive.
+    let lease_id = env
+        .pool
+        .store
+        .active_leases()
+        .unwrap()
+        .into_iter()
+        .find(|l| l.device_id.is_some())
+        .expect("no active lease with a device")
+        .id;
+    env.pool.release(&lease_id, "released").await.unwrap();
+
+    // Read the complete final SSE data event (JSON may span chunks).
+    let msg: Value = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(val) = sse_data_json(&buf) {
+                return val;
+            }
+            match resp.chunk().await.unwrap() {
+                Some(bytes) => buf.push_str(&String::from_utf8_lossy(&bytes)),
+                None => return sse_data_json(&buf).expect("stream ended without data event"),
+            }
+        }
+    })
+    .await
+    .expect("data event did not arrive within 10 s");
+
+    assert_eq!(msg["jsonrpc"], "2.0");
+    assert_eq!(msg["id"], 1);
+    assert_eq!(msg["result"]["isError"], true);
+    let content = msg["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(content.contains("released while the device booted"), "unexpected: {content}");
+
+    // The specific lease was destroyed and ended with the right reason.
+    let destroyed = env.fake.destroyed.lock().unwrap();
+    assert!(destroyed.contains(&lease_id), "lease {lease_id} not in destroyed: {destroyed:?}");
+    let ended = env.pool.store.lease(&lease_id).unwrap().unwrap();
+    assert_eq!(ended.end_reason.as_deref(), Some("released"));
+}
+
+/// Extracts the first complete JSON-RPC message from SSE `data:` lines in `buf`.
+fn sse_data_json(buf: &str) -> Option<Value> {
+    for line in buf.lines() {
+        if let Some(payload) = line.strip_prefix("data:")
+            && let Ok(val) = serde_json::from_str::<Value>(payload.trim())
+        {
+            return Some(val);
+        }
+    }
+    None
+}

@@ -276,6 +276,8 @@ Ctrl-C stops.
 
 Ctrl-C closes the tunnel and exits 0. When the server closes it, `seiji forward` prints `the tunnel closed (the lease ended, or the server stopped)` and exits 0. While the tunnel is open, the server counts it as activity on the lease every 60 s, so the lease is not released for idling. `maxLeaseMinutes` still applies.
 
+The MCP tool calls that `seiji forward` makes (steps 2 and 5) work with both JSON and SSE responses from the server, so the CLI is compatible with servers that stream MCP over `text/event-stream`.
+
 | Message | Cause |
 |---|---|
 | ``You are not signed in. Run `seiji login --url <server>`.`` | No credential. Run `seiji login`. |

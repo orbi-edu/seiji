@@ -40,6 +40,15 @@ struct Tern {
     _dir: tempfile::TempDir,
 }
 
+impl Drop for Tern {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!("\n── Tern log on failure ({}) ──", self.log.display());
+            eprintln!("{}", std::fs::read_to_string(&self.log).unwrap_or_else(|e| format!("(read error: {e})")));
+        }
+    }
+}
+
 impl Tern {
     async fn start(bin: PathBuf, env: &Env, token: &str) -> Self {
         // A short path: the control socket must fit in sockaddr_un.

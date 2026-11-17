@@ -12,7 +12,7 @@ accept.
 
 ## Set up
 
-You need Rust 1.88 or later and git. The test suite needs no simulator and no Xcode. To run
+You need Rust 1.89 or later and git. The test suite needs no simulator and no Xcode. To run
 Seiji against real devices, you also need macOS with Xcode, Java 17 and the Maestro CLI.
 
 ```sh
