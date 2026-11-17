@@ -564,9 +564,7 @@ impl Devices for HostDevices {
         let id = ctx.device_id()?;
         let png = ctx.dir().join("screen.png");
         let capture = match ctx.platform {
-            Platform::Ios => {
-                CmdSpec::new("/usr/bin/xcrun").args(["simctl", "io", id, "screenshot", "--type=png"]).arg(&png)
-            }
+            Platform::Ios => ios::screenshot(id, &png),
             Platform::Android => {
                 let adb = self.android()?.adb();
                 self.android_env(CmdSpec::sh(

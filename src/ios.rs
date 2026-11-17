@@ -135,11 +135,11 @@ pub fn axe_stream(cfg: &Axe, udid: &str, opts: &crate::devices::StreamOpts) -> C
 }
 
 pub fn screenshot(udid: &str, dest: &Path) -> CmdSpec {
-    simctl(["io", udid, "screenshot", "--type=png"]).arg(dest)
+    simctl(["io", udid, "screenshot", "--type=png", "--display=1"]).arg(dest)
 }
 
 pub fn record_video(udid: &str, dest: &Path) -> CmdSpec {
-    simctl(["io", udid, "recordVideo", "--codec=h264", "--force"]).arg(dest)
+    simctl(["io", udid, "recordVideo", "--codec=h264", "--force", "--display=1"]).arg(dest)
 }
 
 pub fn log_stream(udid: &str, predicate: &str) -> CmdSpec {
