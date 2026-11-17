@@ -249,13 +249,12 @@ pub fn provision(os_user: &str) -> Result<OsAccount> {
             // No password and no login shell: the account only owns processes and files.
             let uid = next_uid()?.to_string();
             let home = format!("/Users/{os_user}");
-            let attrs: [(&str, &str); 6] = [
+            let attrs: [(&str, &str); 5] = [
                 ("UniqueID", &uid),
                 ("PrimaryGroupID", "20"),
                 ("RealName", "Seiji tenant"),
                 ("NFSHomeDirectory", &home),
                 ("UserShell", "/usr/bin/false"),
-                ("Password", "*"),
             ];
             run("/usr/bin/dscl", &[".", "-create", &record])?;
             for (key, value) in attrs {
@@ -264,6 +263,8 @@ pub fn provision(os_user: &str) -> Result<OsAccount> {
             run("/usr/sbin/dseditgroup", &["-o", "edit", "-a", os_user, "-t", "user", TENANT_GROUP])?;
         }
     }
+    // Password is a protected attribute on current macOS. Disable authentication explicitly.
+    run("/usr/bin/dscl", &[".", "-create", &record, "AuthenticationAuthority", ";DisabledUser;"])?;
     run("/usr/bin/dscl", &[".", "-create", &record, "IsHidden", "1"])?;
     run("/usr/sbin/createhomedir", &["-c", "-u", os_user])?;
     let account = validate_tenant(os_user)?;

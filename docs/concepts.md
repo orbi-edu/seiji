@@ -33,7 +33,7 @@ A **user** is a Seiji account: a row in the `users` table with a name, a token a
 
 ## Tenant accounts
 
-With `isolation.mode: "os_user"`, each user has a **tenant account**: a macOS account named `<isolation.userPrefix><user>` (default `seiji-alice` for the user `alice`). `sudo seiji tenant provision <user>` creates it with `dscl`: hidden, not an admin, no password (`Password *`), the shell `/usr/bin/false`, primary group 20, a uid one above the highest existing uid (at least 600), and a private home (`chmod 700`). It then adds the account to the fixed group `seiji-tenants`. Nobody can log in as a tenant account. It only owns the user's simulators, emulators, Maestro processes and files.
+With `isolation.mode: "os_user"`, each user has a **tenant account**: a macOS account named `<isolation.userPrefix><user>` (default `seiji-alice` for the user `alice`). `sudo seiji tenant provision <user>` creates it with `dscl`: hidden, not an admin, authentication disabled (`AuthenticationAuthority ;DisabledUser;`), the shell `/usr/bin/false`, primary group 20, a uid one above the highest existing uid (at least 600), and a private home (`chmod 700`). It then adds the account to the fixed group `seiji-tenants`. Nobody can log in as a tenant account. It only owns the user's simulators, emulators, Maestro processes and files.
 
 `seiji tenant provision` run again for an existing tenant account repairs it. It refuses an existing account that is not a tenant account ("already exists and is not a Seiji tenant account; refusing to change it").
 

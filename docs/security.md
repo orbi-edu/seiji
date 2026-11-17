@@ -77,7 +77,7 @@ flowchart LR
 | Client token on a developer's Mac | `seiji login` stores it in the macOS login keychain: a generic password with service `seiji` and the server URL as account. `~/Library/Application Support/seiji/client.json` holds only `{url, user}`, no token. `seiji logout` deletes both. | `seiji token print`, the Tern plugin | `seiji token print` prints it on request. |
 | Viewer ticket | Server memory only. 64 hex characters, single use, valid 60 s. | `GET /view/open/{ticket}` | In the viewer link, once. |
 | Viewer session secret | Server memory: only its SHA-256. The browser keeps it in the `seiji_view` cookie. | every `/view/s/{sid}/...` request | Never; it is set as an `HttpOnly` cookie. |
-| Tenant account password | None. `seiji tenant provision` sets `Password *` and the shell `/usr/bin/false`, so nobody can log in as a tenant account. No password appears on any command line. | nobody | — |
+| Tenant account password | None is assigned. `seiji tenant provision` disables authentication with `AuthenticationAuthority ;DisabledUser;` and uses the shell `/usr/bin/false`. No password appears on any command line. | nobody | — |
 | TLS certificate and key | The TLS proxy. | the proxy | — |
 
 Tokens:
@@ -108,7 +108,7 @@ The root helpers are `seiji exec-as`, `seiji exec-drop` and `seiji kill-as`. The
 | `kill-as` refuses a pgid of 1 or less, drops to the tenant account, then calls `killpg`. | The kernel lets it reach only that account's processes. |
 | The binary is owned by root and not writable by `seiji` (`install -o root -g wheel -m 755`). `isolation.helper` names the same path as sudoers. | sudoers runs this file as root. If `seiji` could replace it, `seiji` would be root. |
 
-`seiji tenant provision` is the exception: an admin runs it with sudo, and it reads the config for `isolation.userPrefix`. It accepts only names of `[A-Za-z0-9_-]`. It creates the group if needed. For a new name, it creates the account with `dscl`: no password (`Password *`), the shell `/usr/bin/false`, the uid one above the highest existing uid (at least 600), primary group 20, and the home `/Users/<account>`, and adds it to `seiji-tenants`. It hides the account and sets the home to mode `700`. It refuses an existing account that is not already a tenant account ("already exists and is not a Seiji tenant account; refusing to change it"), so it never takes over a person's account.
+`seiji tenant provision` is the exception: an admin runs it with sudo, and it reads the config for `isolation.userPrefix`. It accepts only names of `[A-Za-z0-9_-]`. It creates the group if needed. For a new name, it creates the account with `dscl`: the shell `/usr/bin/false`, the uid one above the highest existing uid (at least 600), primary group 20, and the home `/Users/<account>`, and adds it to `seiji-tenants`. For both new and existing tenants, it disables authentication with `AuthenticationAuthority ;DisabledUser;`, hides the account and sets the home to mode `700`. It does not write the protected `Password` attribute, which current macOS rejects with `eDSPermissionError`. It refuses an existing account that is not already a tenant account ("already exists and is not a Seiji tenant account; refusing to change it"), so it never takes over a person's account.
 
 ## The daemon account
 
