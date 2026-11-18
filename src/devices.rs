@@ -452,9 +452,26 @@ impl Devices for HostDevices {
         match ctx.platform {
             Platform::Ios => {
                 let timeout = Duration::from_secs(self.config.ios.as_ref().map_or(180, |c| c.boot_timeout_seconds));
+                let deadline = Instant::now() + timeout;
                 let spec = CmdSpec::new("/usr/bin/xcrun").args(["simctl", "bootstatus", id, "-b"]);
                 self.runner.run(&ctx.account, spec, timeout, cancel).await?.check("simctl bootstatus")?;
-                Ok(())
+                loop {
+                    let remaining = deadline
+                        .checked_duration_since(Instant::now())
+                        .context("iOS simulator did not expose an accessibility tree before the boot deadline")?;
+                    let spec = ios::axe_describe(&self.config.axe, id);
+                    let out = self.runner.run(&ctx.account, spec, remaining.min(SHORT), cancel).await?;
+                    let tree = ios::parse_axe(&out, "describe-ui during boot")?;
+                    let elements = tree.as_array().context("AXe describe-ui returned a non-array result during boot")?;
+                    if !elements.is_empty() {
+                        return Ok(());
+                    }
+                    let delay = deadline.saturating_duration_since(Instant::now()).min(Duration::from_secs(1));
+                    tokio::select! {
+                        _ = cancel.cancelled() => bail!("cancelled"),
+                        _ = tokio::time::sleep(delay) => {}
+                    }
+                }
             }
             Platform::Android => {
                 let a = self.android()?;
