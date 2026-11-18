@@ -64,6 +64,9 @@ fn default_helper() -> PathBuf {
 pub struct Quota {
     /// Device-minutes per calendar month (UTC). Boot time counts: the device holds host resources while booting.
     pub monthly_minutes: i64,
+    /// When true, admission and the reaper skip the monthly budget check. Usage is still metered.
+    #[serde(default)]
+    pub monthly_unlimited: bool,
     /// Devices one user may hold at the same time.
     pub max_concurrent: i64,
     /// Hard cap on one lease's wall-clock length.
@@ -323,6 +326,9 @@ pub struct Config {
     /// Builds one user may keep at the same time; older ones expire with `appRetentionHours`.
     #[serde(default = "default_max_builds")]
     pub max_builds_per_user: i64,
+    /// User names allowed to call admin endpoints. Authority is config-only, never client-supplied.
+    #[serde(default)]
+    pub admin_users: Vec<String>,
 }
 
 fn default_listen() -> Listen {
@@ -419,6 +425,14 @@ impl Config {
             && !(url.starts_with("https://") || url.starts_with("http://"))
         {
             bail!("listen.publicUrl must start with https:// or http://");
+        }
+        for name in &config.admin_users {
+            if name.is_empty()
+                || name.len() > 32
+                || !name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+            {
+                bail!("adminUsers: {name:?} is not a valid user name (1-32 chars of [a-z0-9-])");
+            }
         }
         if config.data_dir.is_relative() {
             config.data_dir = base_dir.join(&config.data_dir);

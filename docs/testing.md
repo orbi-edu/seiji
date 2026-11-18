@@ -61,6 +61,7 @@ CI (`.github/workflows/ci.yml`) runs on `macos-15` with `RUSTFLAGS=-D warnings`.
 |---|---|
 | `tests/common/mod.rs` | The harness: `FakeDevices`, the stub `maestro`, `setup`, `setup_with` and the client helpers. It has no tests |
 | `tests/e2e.rs` | Leases, budgets, uploads, the reaper and `run_flow`. Real HTTP server, real MCP client, real SQLite and real `Pool` |
+| `tests/admin.rs` | Admin authorization (401/403), admin listing, admin PUT limits, `/v1/me` `is_admin`, unlimited budget admission and metering, zero-vs-unlimited, concurrency/capacity/time enforcement with unlimited budgets, CLI partial update preservation, and the SQLite migration |
 | `tests/runs.rs` | Recorded runs (`run_actions`, `run_xctest`), evidence files and hashes, the HTTP downloads, the evidence quota and retention, and the native device tools |
 | `tests/viewer.rs` | The viewer: viewer links and tickets, the session cookie, the page's CSP, the shared stream, input, and `share_screen` |
 | `tests/forward.rs` | `seiji forward`: the tunnel end to end over a real WebSocket, its refusals, and the real CLI pointing the app at the tunnel |
@@ -87,6 +88,26 @@ Each test starts its own server on `127.0.0.1` and a free port, with a temporary
 | `reaper_ends_leases_of_disabled_users_and_overlong_leases` | Alice is disabled while she holds a lease. Bob's lease is 31 minutes old (limit 30) and was used a minute ago. One reaper pass ends Alice's lease as `user_disabled` and Bob's as `max_lease_duration`. `release_device` on Bob's ended lease then fails with `no active lease` |
 | `releasing_during_boot_is_billed_and_destroys_the_device` | With `hang_boot` set, `Pool::acquire` blocks in the boot. `Pool::release` with `released` returns `true`. `acquire` then fails with `released while the device booted`. The lease ends as `released`, is billable (`billable = 1`), and its device is destroyed exactly once |
 | `sse_streams_headers_and_keepalive_before_tool_completes` | With `hang_boot` set, a raw `POST /mcp` with `MCP-Protocol-Version: 2025-11-25` for `acquire_device` returns HTTP `200` with `Content-Type: text/event-stream`, `Cache-Control: no-cache` and `X-Accel-Buffering: no` at once. `boot_entered` confirms the boot is active. At least one SSE keepalive comment (`:`) arrives before the tool completes. After `Pool::release` unblocks the boot, the `data:` event carries a JSON-RPC result with `isError` and `released while the device booted`. The matching lease is destroyed and ended as `released`. All phases have bounded timeouts |
+
+### `tests/admin.rs`
+
+Each test starts its own server on `127.0.0.1` and a free port. Tests that need an admin use `setup_with` with `adminUsers`.
+
+| Test | What it checks |
+|---|---|
+| `me_reflects_admin_status` | `GET /v1/me` returns `is_admin: true` for a user in `adminUsers` and `is_admin: false` for others. The quota includes `monthlyUnlimited` |
+| `admin_endpoints_deny_unauthenticated_and_non_admin` | No token gets `401` on both admin endpoints. A non-admin user gets `403`. An admin user gets `200` on the listing |
+| `admin_lists_users_with_capacity_and_usage` | The response contains all users with correct `monthly_minutes`, `monthly_unlimited`, `max_concurrent`, `max_lease_minutes`, `idle_minutes`, `used_minutes`, `active_devices`, `disabled` and `is_admin`. `capacity` and `in_use` match the server config |
+| `admin_updates_limits_and_persists` | A PUT changes `monthly_minutes`, `monthly_unlimited` and `max_concurrent`. The response carries the new values and preserves `max_lease_minutes` and `idle_minutes`. The database reflects the change |
+| `admin_update_rejects_bad_input_and_unknown_user` | Missing fields, negative `monthly_minutes`, zero `max_concurrent`, unknown fields and a nonexistent user id all return the correct 4xx status |
+| `unlimited_budget_admits_and_meters_usage` | A user with `monthly_minutes: 0, monthly_unlimited: true` acquires a device. The ledger bills 120 simulated seconds; `budget_status` retains the numeric budget and returns `monthly_unlimited: true` with `remaining_minutes: null` |
+| `zero_budget_without_unlimited_blocks_admission` | A user with `monthly_minutes: 0, monthly_unlimited: false` gets `monthly budget exhausted` |
+| `unlimited_preserves_concurrency_and_capacity` | An unlimited user still hits `your limit is 1` (concurrency) and `host is full` (capacity) |
+| `reaper_skips_budget_for_unlimited_but_enforces_lease_duration` | An unlimited lease older than `max_lease_minutes` is ended as `max_lease_duration`, not `budget_exhausted` |
+| `reaper_releases_idle_unlimited_leases` | An idle unlimited lease is ended as `idle` |
+| `cli_partial_set_preserves_budget_and_unlimited` | Writes a config file and uses the real `seiji user add` and `seiji user set` binaries. After an admin sets `monthly_minutes`, `monthly_unlimited` and `max_concurrent` through the store, `seiji user set alice --max-lease-minutes 60 --idle-minutes 15` preserves the other three values in the database |
+| `migration_preserves_tokens_history_and_survives_reopen` | A database created with the old schema (no `monthly_unlimited` column), a real token hash and a billed lease gains the column through `Store::open`. Token authentication finds the user, the lease and its usage survive, setting unlimited persists, and a second `Store::open` retains the updated state. New users can set `monthly_unlimited: true` |
+| `large_finite_budget_admits_without_overflow` | A user with `monthly_minutes: i64::MAX` acquires a device without i64 overflow in the budget comparison |
 
 ### `tests/runs.rs`
 
@@ -132,6 +153,8 @@ The test runs `tern serve` headless, with `tern-plugin/` as a fixture plugin. Th
 | Test | What it checks |
 |---|---|
 | `the_panel_opens_the_screen_beside_it_and_releases_the_device` | The devices panel lists the lease with `iphone-16` and `alice`. The status segment shows `Seiji` and `min left`. `o` opens a `/view/open/…` link in a browser pane beside the panel. `x` asks `Release iphone-16?`, and enter releases the lease: the panel shows `No devices` and the device was destroyed. Tern's log has no plugin errors |
+| `admin_sees_users_tab_edits_and_saves_limits` | An admin selects another user, edits concurrency and unlimited monthly budget through native controls, saves, and observes persisted quotas. The other user and finite session/idle limits remain unchanged |
+| `non_admin_does_not_see_users_tab_or_admin_data` | A normal user's tab navigation stays between Devices and Runs, without the Users tab or another user's data |
 
 ### Unit tests
 

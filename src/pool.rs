@@ -68,7 +68,9 @@ pub struct BudgetView {
     pub month: String,
     pub used_minutes: f64,
     pub monthly_minutes: i64,
-    pub remaining_minutes: f64,
+    pub monthly_unlimited: bool,
+    /// `None` (JSON null) when unlimited; finite remaining minutes otherwise.
+    pub remaining_minutes: Option<f64>,
     pub max_concurrent: i64,
     pub max_lease_minutes: i64,
     pub idle_minutes: i64,
@@ -89,6 +91,24 @@ pub struct ModelsView {
 pub enum AppSource {
     Uploaded(String),
     Url(String),
+}
+
+/// Outcome of an admin limits update.
+pub enum AdminLimitsOutcome {
+    /// Updated successfully; the refreshed user is returned.
+    Ok(User),
+    /// The caller's token was disabled or deleted while queued.
+    CallerGone,
+    /// The caller is not in `adminUsers`.
+    Forbidden,
+    /// The target user does not exist.
+    NotFound,
+}
+
+/// `true` when `used_seconds` exhausts a finite budget of `monthly_minutes`.
+/// Overflow-safe: compares seconds against minutes without multiplying.
+fn budget_exhausted(monthly_minutes: i64, used_seconds: i64) -> bool {
+    used_seconds >= monthly_minutes.saturating_mul(60)
 }
 
 fn status_str(s: LeaseStatus) -> &'static str {
@@ -209,7 +229,12 @@ impl Pool {
             month: month_label(t),
             used_minutes: (used * 10.0).round() / 10.0,
             monthly_minutes: user.quota.monthly_minutes,
-            remaining_minutes: ((user.quota.monthly_minutes as f64 - used).max(0.0) * 10.0).round() / 10.0,
+            monthly_unlimited: user.quota.monthly_unlimited,
+            remaining_minutes: if user.quota.monthly_unlimited {
+                None
+            } else {
+                Some(((user.quota.monthly_minutes as f64 - used).max(0.0) * 10.0).round() / 10.0)
+            },
             max_concurrent: user.quota.max_concurrent,
             max_lease_minutes: user.quota.max_lease_minutes,
             idle_minutes: user.quota.idle_minutes,
@@ -233,6 +258,31 @@ impl Pool {
             .collect())
     }
 
+    /// Updates admin-editable limits under the admission lock, re-checking the caller's identity
+    /// and admin authority at execution time.
+    pub async fn set_admin_limits(
+        &self,
+        caller_id: i64,
+        target_id: i64,
+        monthly_minutes: i64,
+        monthly_unlimited: bool,
+        max_concurrent: i64,
+    ) -> Result<AdminLimitsOutcome> {
+        let _guard = self.admission.lock().await;
+        // Re-check caller under the lock: they may have been disabled/deleted while queued.
+        let caller = match self.store.user_by_id(caller_id)? {
+            Some(u) if !u.disabled => u,
+            _ => return Ok(AdminLimitsOutcome::CallerGone),
+        };
+        if !self.config.admin_users.contains(&caller.name) {
+            return Ok(AdminLimitsOutcome::Forbidden);
+        }
+        if !self.store.set_admin_limits(target_id, monthly_minutes, monthly_unlimited, max_concurrent)? {
+            return Ok(AdminLimitsOutcome::NotFound);
+        }
+        Ok(AdminLimitsOutcome::Ok(self.store.user_by_id(target_id)?.context("user vanished after update")?))
+    }
+
     /// Admits, creates and boots a device. Admission is atomic; boot happens outside the lock.
     pub async fn acquire(&self, user: &User, platform: Platform, model: Option<String>) -> Result<LeaseView> {
         let model = match model {
@@ -253,7 +303,7 @@ impl Pool {
             let t = now();
             let (from, to) = month_window(t);
             let used = self.store.used_seconds(user.id, from, to, t)?;
-            if used >= user.quota.monthly_minutes * 60 {
+            if !user.quota.monthly_unlimited && budget_exhausted(user.quota.monthly_minutes, used) {
                 bail!(
                     "monthly budget exhausted: {:.1} of {} device-minutes used in {}",
                     used as f64 / 60.0,
@@ -606,7 +656,7 @@ impl Pool {
             let used = self.store.used_seconds(user.id, from, to, t)?;
             let reason = if user.disabled {
                 Some("user_disabled")
-            } else if used >= user.quota.monthly_minutes * 60 {
+            } else if !user.quota.monthly_unlimited && budget_exhausted(user.quota.monthly_minutes, used) {
                 Some("budget_exhausted")
             } else if t - lease.started_at >= user.quota.max_lease_minutes * 60 {
                 Some("max_lease_duration")

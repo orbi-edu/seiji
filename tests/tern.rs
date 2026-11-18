@@ -90,7 +90,7 @@ impl Tern {
         t.ctl(&["size", "1280 860"]).await;
         t.ctl(&["ready"]).await;
         t.ctl(&["plugins", "fixtures"]).await;
-        t.ctl(&["status-bar", "on"]).await;
+        t.ctl(&["widgets", "classic"]).await;
         t
     }
 
@@ -134,6 +134,20 @@ impl Tern {
         }
     }
 
+    async fn click_badge(&self, label: &str) {
+        let reply = self.ctl(&["tree", ".tn-pane.on .sf-main .sf-badge"]).await;
+        let node = reply["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|node| node["text"].as_str() == Some(label))
+            .unwrap_or_else(|| panic!("badge {label:?} not visible: {reply}"));
+        let rect = node["rect"].as_array().unwrap();
+        let x = rect[0].as_f64().unwrap() + rect[2].as_f64().unwrap() / 2.0;
+        let y = rect[1].as_f64().unwrap() + rect[3].as_f64().unwrap() / 2.0;
+        self.ctl(&["click", &format!("{x} {y}")]).await;
+    }
+
     async fn wait_text(&self, needle: &str, region: &str) -> String {
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
@@ -168,7 +182,7 @@ async fn the_panel_opens_the_screen_beside_it_and_releases_the_device() {
     t.ctl(&["plugins", "run", "plugin.seiji.devices"]).await;
     let main = t.wait_text(&lease_id, "sf-main").await;
     assert!(main.contains("iphone-16") && main.contains("alice"), "{main}");
-    t.wait_for("the status segment", ".sl-plugin", |s| s.contains("Seiji") && s.contains("min left")).await;
+    t.wait_for("the status widget", ".wg-status-text", |s| s.contains("Seiji") && s.contains("min left")).await;
 
     // `o` asks for a viewer link and opens it in Tern's browser beside the panel.
     t.ctl(&["key", "o"]).await;
@@ -182,6 +196,115 @@ async fn the_panel_opens_the_screen_beside_it_and_releases_the_device() {
     t.ctl(&["key", "enter"]).await;
     t.wait_text("No devices", "sf-main").await;
     assert_eq!(*env.fake.destroyed.lock().unwrap(), [lease_id]);
+
+    assert_eq!(t.plugin_errors(), Vec::<String>::new());
+    let _ = t.ctl(&["quit"]).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), t.child.wait()).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_sees_users_tab_edits_and_saves_limits() {
+    let Some(bin) = tern() else {
+        eprintln!("skipped: tern is not on PATH");
+        return;
+    };
+    let env = setup_with(2, json!({ "adminUsers": ["alice"] })).await;
+    let alice_token = add_user(&env, "alice", QUOTA);
+    let _bob_token = add_user(&env, "bob", QUOTA);
+
+    let mut t = Tern::start(bin.clone(), &env, &alice_token).await;
+    t.ctl(&["plugins", "run", "plugin.seiji.devices"]).await;
+    t.wait_text("alice", "sf-main").await;
+
+    // Navigate Devices → Runs → Users.
+    t.ctl(&["key", "tab"]).await;
+    // Wait for the Runs body to show (not just the tab label).
+    t.wait_text("No runs yet", "sf-main").await;
+    t.ctl(&["key", "tab"]).await;
+    // Wait for the user list to load (both user names, not just the nav label).
+    t.wait_for("user list loaded", ".tn-pane.on .sf-main .sf-item", |s| s.contains("alice") && s.contains("bob")).await;
+
+    // The detail card shows limits of the first selected user.
+    t.wait_for("user detail", ".tn-pane.on .sf-main .sf-kv", |s| {
+        s.contains("Session limit") && s.contains("Max devices")
+    })
+    .await;
+
+    // Select bob (↓), then edit.
+    t.ctl(&["key", "down"]).await;
+    t.wait_for("bob selected", ".tn-pane.on .sf-main .sf-card-head", |s| s.contains("bob")).await;
+    t.ctl(&["key", "e"]).await;
+    t.wait_text("Edit limits", "sf-main").await;
+
+    // Increase max concurrent: click the + stepper.
+    t.click_badge("+").await;
+    t.wait_for("concurrency incremented", ".tn-pane.on .sf-main .sf-text", |s| {
+        s.lines().any(|line| line.trim() == "2")
+    })
+    .await;
+
+    // Toggle unlimited.
+    t.click_badge("Unlimited monthly budget").await;
+    t.wait_text("preserved for switching back", "sf-main").await;
+
+    // Save.
+    t.ctl(&["key", "enter"]).await;
+    t.wait_text("Saved limits", "sf-dock").await;
+
+    // Verify DB: bob's quota changed, alice's unchanged.
+    let bob = env.pool.store.user_by_name("bob").unwrap().unwrap();
+    assert_eq!(bob.quota.max_concurrent, 2, "bob max_concurrent");
+    assert!(bob.quota.monthly_unlimited, "bob monthly_unlimited");
+    assert_eq!(bob.quota.monthly_minutes, QUOTA.monthly_minutes, "bob monthly_minutes preserved");
+    assert_eq!(bob.quota.max_lease_minutes, QUOTA.max_lease_minutes, "bob lease unchanged");
+    assert_eq!(bob.quota.idle_minutes, QUOTA.idle_minutes, "bob idle unchanged");
+    let alice = env.pool.store.user_by_name("alice").unwrap().unwrap();
+    assert_eq!(alice.quota.max_concurrent, QUOTA.max_concurrent, "alice unchanged");
+    assert!(!alice.quota.monthly_unlimited, "alice not unlimited");
+
+    // Cancel: start edit again, change something, then cancel. Verify no change.
+    t.ctl(&["key", "e"]).await;
+    t.wait_text("Edit limits", "sf-main").await;
+    t.click_badge("+").await;
+    t.ctl(&["key", "escape"]).await;
+    t.wait_for("edit dismissed after cancel", ".tn-pane.on .sf-main .sf-card-head", |s| !s.contains("Edit limits"))
+        .await;
+    assert_eq!(env.pool.store.user_by_name("bob").unwrap().unwrap().quota.max_concurrent, 2);
+
+    // Refresh preserves is_admin and re-fetches users list.
+    t.ctl(&["key", "r"]).await;
+    t.wait_for("users re-fetched", ".tn-pane.on .sf-main .sf-item", |s| s.contains("alice") && s.contains("bob")).await;
+
+    assert_eq!(t.plugin_errors(), Vec::<String>::new());
+    let _ = t.ctl(&["quit"]).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), t.child.wait()).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn non_admin_does_not_see_users_tab_or_admin_data() {
+    let Some(bin) = tern() else {
+        eprintln!("skipped: tern is not on PATH");
+        return;
+    };
+    let env = setup_with(2, json!({ "adminUsers": ["alice"] })).await;
+    let _alice_token = add_user(&env, "alice", QUOTA);
+    let bob_token = add_user(&env, "bob", QUOTA);
+
+    let mut t = Tern::start(bin, &env, &bob_token).await;
+    t.ctl(&["plugins", "run", "plugin.seiji.devices"]).await;
+    // Wait for the panel to fully load (budget strip appears).
+    t.wait_for("budget loaded", ".tn-pane.on .sf-main", |s| s.contains("bob") && s.contains("min")).await;
+
+    // The full main area should not contain a Users tab.
+    let main = t.text("sf-main").await;
+    assert!(!main.contains("Users"), "non-admin should not see Users tab: {main}");
+
+    // Tab cycles Devices → Runs → Devices (no Users).
+    t.ctl(&["key", "tab"]).await;
+    t.wait_text("No runs yet", "sf-main").await;
+    t.ctl(&["key", "tab"]).await;
+    // Back on Devices: assert the Devices body content, not just the tab label.
+    t.wait_text("No devices", "sf-main").await;
 
     assert_eq!(t.plugin_errors(), Vec::<String>::new());
     let _ = t.ctl(&["quit"]).await;

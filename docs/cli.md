@@ -53,7 +53,7 @@ Runs the MCP server. In order, it:
 4. Starts the reaper (every 15 s). It releases leases, deletes builds older than `appRetentionHours`, and deletes runs that ended more than `evidence.retentionHours` ago.
 5. Binds `listen.host:listen.port` and logs `seiji listening on http://<host>:<port>/mcp`.
 
-Routes: `/mcp` (Streamable HTTP MCP, bearer token), `POST /v1/apps` (build upload, bearer token), `GET /v1/runs/{run_id}/files/{*path}`, `GET /v1/runs/{run_id}/evidence.zip` and `GET /v1/runs/{run_id}/report.md` (run evidence, bearer token, only the token's own runs), `GET /v1/me`, `POST /v1/leases/{lease_id}/viewer`, `GET /v1/leases/{lease_id}/screenshot.jpg` and the `seiji forward` WebSocket `GET /v1/leases/{lease_id}/forward` (bearer token, only the token's own leases), the viewer routes under `/view/` (viewer session cookie), and `GET /healthz` (no token, answers `ok`). [mcp.md](mcp.md) documents them.
+Routes: `/mcp` (Streamable HTTP MCP, bearer token), `POST /v1/apps` (build upload, bearer token), `GET /v1/runs/{run_id}/files/{*path}`, `GET /v1/runs/{run_id}/evidence.zip` and `GET /v1/runs/{run_id}/report.md` (run evidence, bearer token, only the token's own runs), `GET /v1/me`, `GET /v1/admin/users` and `PUT /v1/admin/users/{id}/limits` (admin endpoints, bearer token, admin users only), `POST /v1/leases/{lease_id}/viewer`, `GET /v1/leases/{lease_id}/screenshot.jpg` and the `seiji forward` WebSocket `GET /v1/leases/{lease_id}/forward` (bearer token, only the token's own leases), the viewer routes under `/view/` (viewer session cookie), and `GET /healthz` (no token, answers `ok`). [mcp.md](mcp.md) documents them.
 
 On `SIGTERM` or `SIGINT` it stops the reaper and new MCP requests, logs `shutting down: releasing devices`, and releases every lease at once with `server_shutdown`. Releasing cancels running runs, which end with the status `cancelled` and keep their evidence, so open requests end quickly; then it waits for them and exits 0. The launchd plist gives it 120 s (`ExitTimeOut`) for this. If launchd kills the process first, the next start ends the leases with `server_restart` and marks the runs `error`.
 
@@ -77,12 +77,13 @@ Quota flags, for `add` and `set`:
 
 | Flag | Config key | Rule |
 |---|---|---|
-| `--monthly-minutes N` | `monthlyMinutes` | At least 0. `0` blocks every acquire. |
+| `--monthly-minutes N` | `monthlyMinutes` | At least 0. `0` blocks every acquire unless `--monthly-unlimited true`. |
+| `--monthly-unlimited BOOL` | `monthlyUnlimited` | `true` or `false`. When omitted, preserves the current value. |
 | `--max-concurrent N` | `maxConcurrent` | At least 1. |
 | `--max-lease-minutes N` | `maxLeaseMinutes` | At least 1. |
 | `--idle-minutes N` | `idleMinutes` | At least 1. |
 
-A value that breaks a rule fails with `quotas must be positive (monthly-minutes may be 0)`. A name that does not exist fails with `no user "<name>"`.
+A value that breaks a rule fails with `quotas must be positive (monthly-minutes may be 0)`. A name that does not exist fails with `no user "<name>"`. Omitting a flag preserves the user's current value, so `seiji user set alice --max-lease-minutes 60` changes only the lease limit and keeps the budget, concurrency and unlimited state.
 
 Output of `add`:
 
@@ -96,9 +97,9 @@ Tokens start with `sj_`. Seiji stores only their SHA-256 hash, so a lost token c
 Output of `list` (`os account` is `-` in shared mode):
 
 ```text
-name             os account             min/mo  conc lease-min   idle  status
-alice            seiji-alice              1200     2       120     15  active
-bob              seiji-bob                3000     1       120     15  disabled
+name             os account               min/mo  conc lease-min   idle  status
+alice            seiji-alice                1200     2        60     15  active
+bob              seiji-bob             unlimited     1        60     15  disabled
 seats: 2/10
 ```
 
