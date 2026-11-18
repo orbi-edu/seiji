@@ -14,3 +14,5 @@ pub mod runs;
 pub mod store;
 pub mod tenant;
 pub mod viewer;
+
+pub(crate) const USER_AGENT: &str = concat!("seiji/", env!("CARGO_PKG_VERSION"));

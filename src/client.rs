@@ -69,6 +69,7 @@ fn read_token() -> Result<String> {
 
 async fn whoami(url: &str, token: &str) -> Result<String> {
     let resp = reqwest::Client::builder()
+        .user_agent(reqwest::header::HeaderValue::from_static(crate::USER_AGENT))
         .timeout(std::time::Duration::from_secs(15))
         .build()?
         .get(format!("{url}/v1/me"))
@@ -219,6 +220,7 @@ async fn tool(c: &Credential, name: &str, args: serde_json::Value) -> Result<ser
         "params": { "name": name, "arguments": args },
     });
     let resp = reqwest::Client::builder()
+        .user_agent(reqwest::header::HeaderValue::from_static(crate::USER_AGENT))
         .timeout(std::time::Duration::from_secs(120))
         .build()?
         .post(format!("{}/mcp", c.url))

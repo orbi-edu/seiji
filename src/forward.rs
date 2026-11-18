@@ -286,6 +286,7 @@ pub async fn connect(
 
     let mut request = ws_url.into_client_request().context("invalid server URL")?;
     request.headers_mut().insert("authorization", HeaderValue::from_str(&format!("Bearer {token}")).context("token")?);
+    request.headers_mut().insert("user-agent", HeaderValue::from_static(crate::USER_AGENT));
     let (ws, _) = match tokio_tungstenite::connect_async(request).await {
         Ok(ok) => ok,
         Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => {
