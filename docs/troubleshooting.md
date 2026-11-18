@@ -483,7 +483,11 @@ Seiji replaces characters outside `[A-Za-z0-9._-]` in file names with `_` and re
 
 ## Screenshots
 
-Seiji captures a PNG (`xcrun simctl io <udid> screenshot --type=png`, or `adb exec-out screencap -p`) and converts it with `/usr/bin/sips -Z 2000 -s format jpeg -s formatOptions 85`. The longest side is at most 2000 px, because vision models reject larger images. The size and quality are fixed in the code; there is no config key.
+Seiji captures a PNG (`xcrun simctl io <udid> screenshot --type=png --display=1`, or `adb exec-out screencap -p`) and converts it with `/usr/bin/sips -Z 2000 -s format jpeg -s formatOptions 85`. The longest side is at most 2000 px, because vision models reject larger images. The size and quality are fixed in the code; there is no config key.
+
+iOS screenshots and `recordVideo` explicitly select primary display 1. A multi-display simulator such as iPhone Duo otherwise fails with `Cannot choose between 2 displays`. This applies to doctor, standalone screenshots and recorded runs.
+
+For iOS, Seiji waits for a nonempty AXe accessibility tree after `simctl bootstatus`, within the same configured boot timeout. A successful `bootstatus` exit alone does not mean the interface is ready; it can return while the display still shows the Apple logo. AXe errors and malformed responses fail boot rather than being treated as readiness. Doctor also rejects an empty tree before reporting success.
 
 | Message | Cause | Fix |
 |---|---|---|

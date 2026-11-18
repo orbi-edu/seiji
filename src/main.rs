@@ -485,7 +485,9 @@ async fn doctor(config: Config, name: &str, platform: Platform) -> Result<()> {
         if platform == Platform::Ios {
             step("accessibility tree (axe describe-ui)");
             let tree = devices.describe_ui(&ctx).await?;
-            println!("{} elements", seiji::actions::nodes(&tree).len());
+            let count = seiji::actions::nodes(&tree).len();
+            anyhow::ensure!(count > 0, "simulator returned an empty accessibility tree");
+            println!("{count} elements");
             step("video and log capture (3 s)");
             let dir = ctx.dir().join("doctor");
             let mkdir = CmdSpec::new("/bin/mkdir").arg("-p").arg(&dir);
