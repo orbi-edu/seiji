@@ -107,16 +107,19 @@ A **device** is an iOS simulator or an Android emulator. Seiji creates a fresh d
 
 ## Quotas and budget
 
-Each user has a **quota** of four values. `defaultQuota` in the config is the quota of a new user. `seiji user add` and `seiji user set` can change each value.
+Each user has a **quota** of five values. `defaultQuota` in the config is the quota of a new user. `seiji user add` and `seiji user set` can change each value. An admin can also change three of them through `PUT /v1/admin/users/{id}/limits`.
 
 | Quota key | Meaning | Enforced by |
 |---|---|---|
-| `monthlyMinutes` | The **budget**: device-minutes for each UTC calendar month. `0` blocks all devices. | admission and the reaper |
+| `monthlyMinutes` | The **budget**: device-minutes for each UTC calendar month. `0` blocks all devices unless `monthlyUnlimited` is true. | admission and the reaper |
+| `monthlyUnlimited` | When true, admission and the reaper skip the monthly budget check. Usage is still metered. | admission and the reaper |
 | `maxConcurrent` | Devices the user holds at the same time, iOS and Android together. | admission |
 | `maxLeaseMinutes` | The maximum wall-clock length of one lease, boot included. | the reaper |
 | `idleMinutes` | The time without a lease operation after which the reaper releases a `ready` lease. | the reaper |
 
 A change of quota takes effect at the next admission and the next reaper pass.
+
+While a user is unlimited, Seiji keeps the numeric `monthlyMinutes` in the database and continues metering the ledger. The operator can switch back to a finite budget at any time by setting `monthlyUnlimited` to false; the saved `monthlyMinutes` then applies again.
 
 ### Device-minutes
 
@@ -141,7 +144,8 @@ max(0, min(ended_at or now, to) − max(started_at, from))   seconds
 | Field | Value |
 |---|---|
 | `used_minutes` | used seconds ÷ 60, rounded to 0.1 |
-| `remaining_minutes` | `max(0, monthlyMinutes − used minutes)`, rounded to 0.1 |
+| `monthly_unlimited` | `true` when the user's budget is unlimited |
+| `remaining_minutes` | `max(0, monthlyMinutes − used minutes)`, rounded to 0.1. `null` when unlimited |
 | `estimated_cost_usd` | used minutes ÷ 60 × `costPerDeviceHourUsd`, rounded to 0.01. The field is absent when `costPerDeviceHourUsd` is not set. |
 | `month` | the current month as `YYYY-MM` (UTC) |
 
@@ -156,7 +160,7 @@ max(0, min(ended_at or now, to) − max(started_at, from))   seconds
 1. Resolve the model: the `model` argument, or the platform's `defaultModel`. Fail with `android is not available on this host` (or `ios ...`) when the platform is not configured, or `unknown ios model "x"; available: [...]` when the model is not in the config.
 2. Take the **admission lock**. The steps below run under it, so two calls cannot both take the last slot.
 3. Read the user again. Fail when the user is gone (`user no longer exists`) or disabled (`user "alice" is disabled`).
-4. Budget: fail when the used seconds of the month are at least `monthlyMinutes × 60` (`monthly budget exhausted: 1200.0 of 1200 device-minutes used in 2026-11`).
+4. Budget: skip when `monthlyUnlimited` is true. Otherwise, fail when the used seconds of the month are at least `monthlyMinutes × 60` (`monthly budget exhausted: 1200.0 of 1200 device-minutes used in 2026-11`).
 5. Concurrency: fail when the user's active leases (`booting` or `ready`, both platforms) are at least `maxConcurrent` (`you already hold 2 device(s), your limit is 2; release one first`).
 6. Capacity: fail when the platform's active leases are at least its capacity (`host is full: 12/12 ios devices in use; try again later`).
 7. Ports: pick a free TCP port on `127.0.0.1` that no active lease uses as the [driver port](#driver-ports). For Android, also pick the first even **console port** `p` in `android.consolePortRange` where `p` and `p + 1` are free and unused ("no free emulator console port in android.consolePortRange").
@@ -179,7 +183,7 @@ The **reaper** is a loop that runs every 15 s in `seiji serve`. Each pass:
 | Order | End reason | Condition | Applies to |
 |---|---|---|---|
 | 1 | `user_disabled` | the user is disabled | `booting` and `ready` |
-| 2 | `budget_exhausted` | the user's used seconds of the month ≥ `monthlyMinutes × 60` | `booting` and `ready` |
+| 2 | `budget_exhausted` | `monthlyUnlimited` is false and the user's used seconds of the month ≥ `monthlyMinutes × 60` | `booting` and `ready` |
 | 3 | `max_lease_duration` | now − `started_at` ≥ `maxLeaseMinutes × 60` | `booting` and `ready` |
 | 4 | `idle` | now − `last_activity_at` ≥ `idleMinutes × 60`, and no operation runs on the lease | `ready` only |
 

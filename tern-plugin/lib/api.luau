@@ -53,16 +53,17 @@ function M.authenticate(c: Client, done: () -> ())
 end
 
 local function http_error(status: number, body: string): cli.CliError
+	local code = if status == 403 then "forbidden" elseif status == 404 then "not_found" else "http"
 	local ok, doc = pcall(tern.json.decode, body)
 	if ok and type(doc) == "table" then
 		if type(doc.error) == "table" then
-			return { code = "http", message = tostring(doc.error.message or ("HTTP " .. status)) }
+			return { code = code, message = tostring(doc.error.message or ("HTTP " .. status)), status = status }
 		elseif type(doc.error) == "string" then
-			return { code = "http", message = doc.error }
+			return { code = code, message = doc.error, status = status }
 		end
 	end
 	local text = string.match(body or "", "^%s*(.-)%s*$") or ""
-	return { code = "http", message = if text ~= "" and #text < 300 then text else "HTTP " .. status }
+	return { code = code, message = if text ~= "" and #text < 300 then text else "HTTP " .. status, status = status }
 end
 
 -- `opts`: `body` (a table, sent as JSON), `raw` (hand back the body bytes), `timeout_ms`.
@@ -113,6 +114,21 @@ function M.request(c: Client, method: string, path: string, opts: { [string]: an
 		end
 		cb(doc, nil)
 	end)
+end
+
+-- `GET /v1/me`: the signed-in user's identity and admin flag.
+function M.me(c: Client, cb: (data: any, err: cli.CliError?) -> ())
+	M.request(c, "GET", "/v1/me", nil, cb)
+end
+
+-- `GET /v1/admin/users`: the full user list, host capacity and in-use counts. Admin only.
+function M.admin_users(c: Client, cb: (data: any, err: cli.CliError?) -> ())
+	M.request(c, "GET", "/v1/admin/users", nil, cb)
+end
+
+-- `PUT /v1/admin/users/{id}/limits`: update a user's editable limits. Admin only.
+function M.admin_update_user(c: Client, user_id: number, body: { [string]: any }, cb: (data: any, err: cli.CliError?) -> ())
+	M.request(c, "PUT", "/v1/admin/users/" .. tostring(user_id) .. "/limits", { body = body }, cb)
 end
 
 -- Calls MCP tool `name`; `cb(value, err)` with the tool's text decoded as JSON when it is JSON.

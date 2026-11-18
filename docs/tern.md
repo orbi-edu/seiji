@@ -12,6 +12,7 @@ This guide shows how to see and drive your Seiji simulators from [Tern](https://
 - [The panel](#the-panel)
 - [The screen](#the-screen)
 - [Links from agents](#links-from-agents)
+- [Users (admin)](#users-admin)
 - [Keys](#keys)
 - [Limits](#limits)
 - [How it works](#how-it-works)
@@ -21,8 +22,8 @@ This guide shows how to see and drive your Seiji simulators from [Tern](https://
 | Where | What |
 |---|---|
 | Palette | **Seiji: Devices** (⌃⌥D), **Seiji: Runs**, **Seiji: Sign in**, **Seiji: Sign out** |
-| Status line | `Seiji · 1 device · 42 min left`; amber under 25 % of your minutes, red under 10 %. A click opens the panel. |
-| Panel, head | Minutes used this month, minutes left, devices held, estimated cost. |
+| Status line | `Seiji · 1 device · 42 min left`; amber under 25 % of your minutes, red under 10 %. Shows `Unlimited` when the monthly budget is unlimited. A click opens the panel. |
+| Panel, head | Minutes used this month, minutes left (or **Unlimited**), devices held, estimated cost. |
 | Panel, Devices | Every device you hold. Open its screen, float it, take a screenshot, copy a view-only link, release it, or boot a new one. |
 | Panel, Runs | Your recorded runs, with the Markdown summary inline. Copy it for a pull request or download `evidence.zip`. |
 | Screen | The simulator, live, in Tern's browser. Click to tap, drag to swipe, type to type. |
@@ -41,20 +42,20 @@ You need Rust (`rustup`) and Tern desktop on your Mac. No clone is needed.
 **1. Install the `seiji` CLI.** It signs you in and keeps your token in the keychain. The plugin asks it for the token.
 
 ```sh
-cargo install --git https://github.com/wiljafor1/seiji
+cargo install --git https://github.com/orbi-edu/seiji
 seiji --version
 ```
 
 **2. Install the plugin.**
 
 ```sh
-tern plugin install github.com/wiljafor1/seiji/tern-plugin
+tern plugin install github.com/orbi-edu/seiji/tern-plugin
 tern plugin list            # seiji 0.1.0 Seiji — 1 blocks, 0 lenses, window  ready
 ```
 
 Tern loads it at once; no restart.
 
-**3. Let Tern find the CLI.** Tern started from the Dock may not have `~/.cargo/bin` on its PATH. When the panel says *The seiji CLI is missing*, point Tern at it and start Tern again:
+**3. Let Tern find the CLI.** The plugin checks `SEIJI_BIN`, then `$CARGO_HOME/bin/seiji` (or `~/.cargo/bin/seiji`), then `PATH`. Tern started from the Dock may not have `~/.cargo/bin` on its PATH; since Cargo installs to `~/.cargo/bin` by default, the plugin finds it there without extra setup. If it still says *The seiji CLI is missing*, set the path explicitly and start Tern again:
 
 ```sh
 launchctl setenv SEIJI_BIN "$HOME/.cargo/bin/seiji"
@@ -142,20 +143,40 @@ A view-only screen shows a **View only** badge and sends no input.
 
 An agent can call the MCP tool `share_screen` to give you a link to its simulator. The link is view-only unless the agent passes `control: true`. Click it in any Tern pane: the plugin opens it beside that pane. Alt-click floats it. Outside Tern, any browser opens it.
 
+## Users (admin)
+
+When the signed-in user is a Seiji admin (listed in `adminUsers` in [configuration.md](configuration.md)), the panel adds a **Users** tab beside Devices and Runs.
+
+The Users tab lists every Seiji user with their name, active devices, budget, admin and disabled state. Select a user to see their detail card: status, admin flag, used minutes, session and idle limits, and host capacity.
+
+Press `e` (or click **Edit**) to edit the selected user's limits:
+
+- **Max devices**: the number of devices this user may hold at once. Use the −/+ steppers; minimum 1. Lowering the limit blocks new acquisitions but does not evict already-held devices.
+- **Unlimited monthly budget**: a toggle. When on, the monthly budget is not enforced, but minutes continue to be metered. The saved numeric budget is preserved and shown read-only for switching back.
+- **Monthly minutes**: the numeric budget. Use the ±60 / ±600 steppers to adjust. Only editable when unlimited is off. Reducing the budget can end leases on the next reaper pass.
+
+Press `enter` (or click **Save**) to persist the changes, or `esc` (or click **Cancel**) to discard them. While saving, edits and cancel are locked. The plugin shows a validation error for invalid inputs and a server error when the save fails. A successful save re-fetches authoritative data from the server.
+
+Session duration and idle release are set by the operator through the CLI, not from the panel.
+
+Non-admin users do not see the Users tab or any admin data. The server enforces permission on every admin request regardless of what the UI shows.
+
 ## Keys
 
-| Key | Devices | Runs |
-|---|---|---|
-| tab | Go to Runs | Go to Devices |
-| ↑ ↓ | Select a device | Select a run |
-| o, enter | Open the screen | Copy the summary |
-| f | Float the screen | |
-| s | Screenshot | |
-| l | Copy a view-only link | |
-| x | Release (asks first) | |
-| d | | Download evidence |
-| n | New device | New device |
-| r | Refresh | Refresh |
+| Key | Devices | Runs | Users |
+|---|---|---|---|
+| tab | Go to Runs | Go to Users (admin) or Devices | Go to Devices |
+| ↑ ↓ | Select a device | Select a run | Select a user |
+| o, enter | Open the screen | Copy the summary | Edit / Save |
+| f | Float the screen | | |
+| s | Screenshot | | |
+| l | Copy a view-only link | | |
+| x | Release (asks first) | | |
+| d | | Download evidence | |
+| e | | | Edit user |
+| esc | | | Cancel edit |
+| n | New device | New device | |
+| r | Refresh | Refresh | Refresh |
 
 ## Limits
 

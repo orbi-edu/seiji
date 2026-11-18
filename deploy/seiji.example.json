@@ -12,9 +12,10 @@
   "defaultQuota": {
     "monthlyMinutes": 1200,
     "maxConcurrent": 2,
-    "maxLeaseMinutes": 120,
+    "maxLeaseMinutes": 60,
     "idleMinutes": 15
   },
+  "adminUsers": [],
   "isolation": {
     "mode": "os_user",
     "userPrefix": "seiji-",

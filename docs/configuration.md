@@ -12,6 +12,7 @@ Seiji reads one JSON file, `seiji.json`. This document is the reference for ever
 - [`costPerDeviceHourUsd`](#costperdevicehourusd)
 - [`capacity`](#capacity)
 - [`defaultQuota`](#defaultquota)
+- [`adminUsers`](#adminusers)
 - [`isolation`](#isolation)
 - [`ios`](#ios)
 - [`android`](#android)
@@ -60,6 +61,7 @@ Seiji reads one JSON file, `seiji.json`. This document is the reference for ever
 | `viewer.fps` is within 1–30, `viewer.scale` within 0.1–1, `viewer.quality` within 1–100, and `viewer.maxViewersPerLease` and `viewer.sessionHours` are above 0 | `viewer: fps 1-30, scale 0.1-1, quality 1-100, maxViewersPerLease and sessionHours must be > 0` |
 | `forward.maxPerLease` is above 0 | `forward.maxPerLease must be > 0` |
 | `listen.publicUrl`, when set, starts with `https://` or `http://` | `listen.publicUrl must start with https:// or http://` |
+| Every name in `adminUsers` is a valid user name (1–32 chars of `[a-z0-9-]`) | `adminUsers: "<name>" is not a valid user name (1-32 chars of [a-z0-9-])` |
 
 Then a relative `dataDir` becomes absolute (see [`dataDir`](#datadir)).
 
@@ -125,12 +127,23 @@ The quota that `seiji user add` gives a new user for each flag you omit. Changin
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `defaultQuota.monthlyMinutes` | integer | required | Device-minutes per UTC calendar month. Boot time counts. `0` blocks every `acquire_device`. |
+| `defaultQuota.monthlyMinutes` | integer | required | Device-minutes per UTC calendar month. Boot time counts. `0` blocks every `acquire_device` unless `monthlyUnlimited` is true. |
+| `defaultQuota.monthlyUnlimited` | boolean | `false` | When true, admission and the reaper skip the monthly budget check. Usage is still metered. |
 | `defaultQuota.maxConcurrent` | integer | required | Devices one user may hold at the same time. At least 1. |
 | `defaultQuota.maxLeaseMinutes` | integer | required | Longest wall-clock length of one lease, boot included. The reaper releases the lease with `max_lease_duration`. At least 1. |
 | `defaultQuota.idleMinutes` | integer | required | A `ready` lease with no tool call for this long is released with `idle`. The clock starts when the device becomes ready, then restarts at each tool call. A running operation is never idle. At least 1. |
 
-All four keys are required. `Config::parse` checks the same limits, so a bad `defaultQuota` stops every command at load time. [concepts.md](concepts.md) explains how Seiji counts device-minutes and applies each limit.
+`monthlyMinutes`, `maxConcurrent`, `maxLeaseMinutes` and `idleMinutes` are required. `monthlyUnlimited` defaults to `false`. `Config::parse` checks the same limits, so a bad `defaultQuota` stops every command at load time. [concepts.md](concepts.md) explains how Seiji counts device-minutes and applies each limit.
+
+## `adminUsers`
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `adminUsers` | list of strings | `[]` | User names allowed to call the admin endpoints (`GET /v1/admin/users`, `PUT /v1/admin/users/{id}/limits`). |
+
+Authority comes only from this operator-controlled config, never from client-supplied flags. User tokens and database rows are unchanged; an admin is still an unprivileged macOS tenant. A disabled admin cannot authenticate. Names must meet the user-name rules (1–32 chars of `[a-z0-9-]`), or `Config::parse` fails with `adminUsers: "<name>" is not a valid user name`.
+
+`GET /v1/me` includes `is_admin: true` for users in this list, so clients can show or hide the admin UI. The server enforces permission on every admin request regardless of the client.
 
 ## `isolation`
 
@@ -313,9 +326,10 @@ This is [`deploy/seiji.example.json`](../deploy/seiji.example.json): ten seats, 
   "defaultQuota": {
     "monthlyMinutes": 1200,
     "maxConcurrent": 2,
-    "maxLeaseMinutes": 120,
+    "maxLeaseMinutes": 60,
     "idleMinutes": 15
   },
+  "adminUsers": [],
   "isolation": {
     "mode": "os_user",
     "userPrefix": "seiji-",

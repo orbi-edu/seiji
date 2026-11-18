@@ -51,7 +51,7 @@ flowchart LR
 
 | Component | Job | Code |
 |---|---|---|
-| HTTP server | An axum router. `GET /healthz` is open. `/mcp`, `POST /v1/apps`, the evidence downloads (`GET /v1/runs/{run_id}/files/{*path}`, `/evidence.zip`, `/report.md`), `GET /v1/me`, `POST /v1/leases/{lease_id}/viewer`, `GET /v1/leases/{lease_id}/screenshot.jpg` and the WebSocket `GET /v1/leases/{lease_id}/forward` sit behind the auth middleware. The viewer routes (`/view/…`) check a session cookie instead. | `src/http.rs` |
+| HTTP server | An axum router. `GET /healthz` is open. `/mcp`, `POST /v1/apps`, the evidence downloads (`GET /v1/runs/{run_id}/files/{*path}`, `/evidence.zip`, `/report.md`), `GET /v1/me`, the admin endpoints (`GET /v1/admin/users`, `PUT /v1/admin/users/{id}/limits`), `POST /v1/leases/{lease_id}/viewer`, `GET /v1/leases/{lease_id}/screenshot.jpg` and the WebSocket `GET /v1/leases/{lease_id}/forward` sit behind the auth middleware. The admin endpoints also check `adminUsers` and return `403` for non-admin callers. The viewer routes (`/view/…`) check a session cookie instead. | `src/http.rs` |
 | Auth middleware | Reads `Authorization: Bearer <token>`, looks up the SHA-256 of the token, refuses a missing, unknown or disabled token with `401`, and puts the user into the request as `AuthedUser`. | `src/http.rs` |
 | MCP service | rmcp `StreamableHttpService` with `NeverSessionManager`, legacy session mode off and SSE responses with 15 s keepalive comments: every POST is handled on its own, the response starts as `text/event-stream` immediately and sends keepalive comments while the tool runs, so a TLS proxy never times out on idle reads. It checks the `Host` header against `listen.allowedHosts`. A factory builds one `SeijiMcp` for each request. | `src/http.rs`, `src/mcp.rs` |
 | `SeijiMcp` | The 23 tools and the server instructions. Reads the caller from `AuthedUser` and turns each `Pool` result into a tool result. Caches the Maestro cheat sheet for the process. | `src/mcp.rs` |
@@ -133,6 +133,8 @@ flowchart TB
 `POST /v1/apps` and the `GET /v1/runs/{run_id}/...` downloads take steps 1 and 2, then stream the body. [mcp.md](mcp.md) gives the interface.
 
 `GET /v1/leases/{lease_id}/forward` takes steps 1 and 2, then upgrades to a WebSocket that stays open as a tunnel for `seiji forward`. It takes no op lock. [apps.md](apps.md#how-the-tunnel-works) shows how the tunnel carries a connection, and [security.md](security.md#tunnels-seiji-forward) what it can reach.
+
+The admin endpoints (`GET /v1/admin/users`, `PUT /v1/admin/users/{id}/limits`) take steps 1 and 2, then check that the caller's name is in `adminUsers` (from the config, not the database). A non-admin caller gets `403`. The PUT also holds the admission lock so a concurrent `acquire_device` sees the new limits. [mcp.md](mcp.md#get-v1adminusers) gives the interface.
 
 ## Acquire sequence
 

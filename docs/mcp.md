@@ -174,8 +174,9 @@ Your device-minute budget for this month, your limits, and the devices you hold.
 | `user` | string | Your user name |
 | `month` | string | The current month, `YYYY-MM`, UTC |
 | `used_minutes` | number | Device-minutes of the month so far, active leases included, rounded to 0.1. A failed boot is not counted |
-| `monthly_minutes` | integer | Your budget (`monthlyMinutes`) |
-| `remaining_minutes` | number | `monthly_minutes` minus `used_minutes`, at least 0, rounded to 0.1 |
+| `monthly_minutes` | integer | Your budget (`monthlyMinutes`). The saved numeric value, regardless of whether the budget is unlimited |
+| `monthly_unlimited` | boolean | `true` when the budget is unlimited. When true, `remaining_minutes` is `null` |
+| `remaining_minutes` | number or null | `monthly_minutes` minus `used_minutes`, at least 0, rounded to 0.1. `null` when unlimited |
 | `max_concurrent` | integer | Devices you can hold at the same time (`maxConcurrent`) |
 | `max_lease_minutes` | integer | The longest lease (`maxLeaseMinutes`) |
 | `idle_minutes` | integer | A lease with no device call for this long is released (`idleMinutes`) |
@@ -194,9 +195,10 @@ Your device-minute budget for this month, your limits, and the devices you hold.
   "month": "2026-11",
   "used_minutes": 312.4,
   "monthly_minutes": 1200,
+  "monthly_unlimited": false,
   "remaining_minutes": 887.6,
   "max_concurrent": 2,
-  "max_lease_minutes": 120,
+  "max_lease_minutes": 60,
   "idle_minutes": 15,
   "estimated_cost_usd": 3.91,
   "active_leases": []
@@ -1488,7 +1490,9 @@ These routes exist besides `/mcp`. Error bodies of `/v1/apps`, `/v1/runs/…` an
 | `GET /v1/runs/{run_id}/files/{*path}` | Bearer token | `200`, one file of the run |
 | `GET /v1/runs/{run_id}/evidence.zip` | Bearer token | `200`, the whole run as a zip |
 | `GET /v1/runs/{run_id}/report.md` | Bearer token | `200`, the Markdown of `export_evidence` |
-| `GET /v1/me` | Bearer token | `200` `{"user", "quota"}` |
+| `GET /v1/me` | Bearer token | `200` `{"user", "quota", "is_admin"}` |
+| `GET /v1/admin/users` | Bearer token (admin) | `200` `{"users", "capacity", "in_use"}` |
+| `PUT /v1/admin/users/{id}/limits` | Bearer token (admin) | `200`, updated user entry |
 | `POST /v1/leases/{lease_id}/viewer` | Bearer token | `200`, a viewer link `{"url", "expires_in", "control", "lease_id"}` |
 | `GET /v1/leases/{lease_id}/screenshot.jpg` | Bearer token | `200`, the screen now as JPEG |
 | `GET /v1/leases/{lease_id}/forward` | Bearer token | `101`, a WebSocket that carries a tunnel for `seiji forward` |
@@ -1630,11 +1634,59 @@ Returns the Markdown of [`export_evidence`](#export_evidence) with `Content-Type
 
 ### `GET /v1/me`
 
-Returns the user that the token belongs to, and its quota. `seiji login` and the Tern plugin use it to check a token ([cli.md](cli.md#seiji-login)).
+Returns the user that the token belongs to, its quota and whether the user is an admin. `seiji login` and the Tern plugin use it to check a token ([cli.md](cli.md#seiji-login)).
 
 ```json
-{"user": "alice", "quota": {"monthlyMinutes": 1200, "maxConcurrent": 2, "maxLeaseMinutes": 120, "idleMinutes": 15}}
+{"user": "alice", "quota": {"monthlyMinutes": 1200, "monthlyUnlimited": false, "maxConcurrent": 2, "maxLeaseMinutes": 60, "idleMinutes": 15}, "is_admin": true}
 ```
+
+`is_admin` is `true` when the user's name is in `adminUsers` ([configuration.md](configuration.md#adminusers)). Clients use it to show or hide the admin UI; the server enforces permission on every admin request.
+
+### `GET /v1/admin/users`
+
+Lists all users with their quotas, current-month usage and active device count. Authenticated admin only.
+
+| Status | Body | Cause |
+|---|---|---|
+| `200` | `{"users": [...], "capacity": {"ios": N, "android": N}, "in_use": {"ios": N, "android": N}}` | Success |
+| `401` | plain text | Missing or invalid token |
+| `403` | `{"error": "admin access required"}` | The caller is not in `adminUsers` |
+
+Each entry in `users`:
+
+| Field | Type |
+|---|---|
+| `id` | integer |
+| `name` | string |
+| `disabled` | boolean |
+| `is_admin` | boolean |
+| `monthly_minutes` | integer |
+| `monthly_unlimited` | boolean |
+| `max_concurrent` | integer |
+| `max_lease_minutes` | integer |
+| `idle_minutes` | integer |
+| `used_minutes` | number (this month, rounded to 0.1) |
+| `active_devices` | integer |
+
+### `PUT /v1/admin/users/{id}/limits`
+
+Updates a user's admin-editable limits. Authenticated admin only. The request body has exactly three required fields:
+
+```json
+{"monthly_minutes": 9600, "monthly_unlimited": true, "max_concurrent": 2}
+```
+
+Unknown fields are rejected. `monthly_minutes` must be ≥ 0, `max_concurrent` must be ≥ 1. The update is serialized with admission, so a concurrent `acquire_device` sees the new limits.
+
+| Status | Body | Cause |
+|---|---|---|
+| `200` | Updated user entry (same shape as `users[]` above) | Success |
+| `400` | `{"error": "..."}` | Missing field, bad type, unknown field, or out-of-range value |
+| `401` | plain text | Missing or invalid token |
+| `403` | `{"error": "admin access required"}` | The caller is not in `adminUsers` |
+| `404` | `{"error": "user not found"}` | No user with that id |
+
+Lowering `max_concurrent` blocks new acquisitions but does not evict already-held devices. Reducing `monthly_minutes` can end leases on the next reaper pass. The response carries the updated `used_minutes` and `active_devices`.
 
 ### `POST /v1/leases/{lease_id}/viewer`
 

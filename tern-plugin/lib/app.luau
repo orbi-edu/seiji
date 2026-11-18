@@ -46,6 +46,7 @@ end
 -- ── reads ──────────────────────────────────────────────────────────────────
 
 local poll: (state: any) -> ()
+local read_admin_users: (state: any) -> ()
 
 local function read(state: any, name: string, tool: string, args: { [string]: any }?)
 	if state.inflight[name] then
@@ -132,6 +133,22 @@ local function load_report(state: any, run: any)
 	end)
 end
 
+-- Revoke admin: clear cached admin data, editing, and return to devices if on users view.
+local function clear_admin(state: any)
+	state.is_admin = false
+	state.data.admin_users = nil
+	state.data.capacity = nil
+	state.data.in_use = nil
+	state.errs.admin_users = nil
+	state.read_at.admin_users = nil
+	state.editing = nil
+	state.edit_error = nil
+	state.saving = false
+	if state.view == "users" then
+		state.view = "devices"
+	end
+end
+
 poll = function(state: any)
 	local api = state.api
 	if api.auth ~= "ok" then
@@ -148,6 +165,47 @@ poll = function(state: any)
 		end
 		return
 	end
+	-- Detect admin; re-check on every auth cycle (is_admin == nil).
+	if state.is_admin == nil and not state.inflight.me then
+		state.inflight.me = true
+		apimod.me(api, function(data, err)
+			state.inflight.me = nil
+			if state.stopped then
+				return
+			end
+			if err then
+				-- Transient error: leave nil so the next poll retries.
+				state.is_admin = nil
+				-- A non-admin on the users view gets bounced.
+				if state.view == "users" then
+					state.view = "devices"
+				end
+			elseif type(data) == "table" then
+				local was_admin = state.is_admin
+				state.is_admin = data.is_admin == true
+				if state.is_admin and state.pending_view == "users" then
+					state.view = "users"
+					state.pending_view = nil
+				end
+				if not state.is_admin then
+					state.pending_view = nil
+					if was_admin ~= false then
+						clear_admin(state)
+					end
+				end
+			else
+				state.is_admin = false
+				state.pending_view = nil
+				clear_admin(state)
+			end
+			state.cx:render()
+			-- Kick another poll to load data now that admin is known.
+			if state.is_admin ~= nil then
+				poll(state)
+			end
+		end)
+		return
+	end
 	read(state, "budget", "budget_status")
 	local last = state.read_at.runs
 	if state.view == "runs" or not last then
@@ -158,6 +216,141 @@ poll = function(state: any)
 	if state.view == "runs" then
 		load_report(state, current(state))
 	end
+	if state.view == "users" and state.is_admin then
+		local ulast = state.read_at.admin_users
+		if not ulast or tern.now() - ulast >= RUNS_MS then
+			read_admin_users(state)
+		end
+	end
+end
+
+read_admin_users = function(state: any)
+	if state.inflight.admin_users then
+		return
+	end
+	state.inflight.admin_users = true
+	apimod.admin_users(state.api, function(data, err)
+		state.inflight.admin_users = nil
+		if state.stopped then
+			return
+		end
+		state.read_at.admin_users = tern.now()
+		if err then
+			if err.code == "forbidden" then
+				clear_admin(state)
+				flash(state, "error", "You no longer have admin access.")
+			else
+				local text = cli.describe(err)
+				if state.errs.admin_users ~= text then
+					state.errs.admin_users = text
+				end
+			end
+			state.cx:render()
+			return
+		end
+		state.errs.admin_users = nil
+		if type(data) == "table" then
+			state.data.admin_users = data.users
+			state.data.capacity = data.capacity
+			state.data.in_use = data.in_use
+			state.cx:render()
+		end
+	end)
+end
+
+local function admin_users(state: any): { any }
+	local u = state.data.admin_users
+	return if type(u) == "table" then u else {}
+end
+
+M.admin_users = admin_users
+
+local function admin_current(state: any): any
+	local list = admin_users(state)
+	local u = find(list, "id", state.sel.users) or list[1]
+	state.sel.users = u and u.id
+	return u
+end
+
+M.admin_current = admin_current
+
+-- Start editing a user's limits: copy server values into a draft.
+local function start_edit(state: any, u: any)
+	if not u then
+		return
+	end
+	state.editing = {
+		user_id = u.id,
+		monthly_minutes = tostring(u.monthly_minutes or 0),
+		monthly_unlimited = u.monthly_unlimited == true,
+		max_concurrent = tostring(u.max_concurrent or 1),
+	}
+end
+
+-- Cancel editing.
+local function cancel_edit(state: any)
+	state.editing = nil
+	state.edit_error = nil
+end
+
+-- Save the edited limits to the server.
+local function save_edit(state: any)
+	local ed = state.editing
+	if not ed or state.saving then
+		return
+	end
+	local mins = tonumber(ed.monthly_minutes)
+	local conc = tonumber(ed.max_concurrent)
+	if not mins or mins < 0 or mins ~= math.floor(mins) then
+		state.edit_error = "Monthly minutes must be a non-negative integer."
+		state.cx:render()
+		return
+	end
+	if not conc or conc < 1 or conc ~= math.floor(conc) then
+		state.edit_error = "Max devices must be at least 1."
+		state.cx:render()
+		return
+	end
+	state.saving = true
+	state.edit_error = nil
+	apimod.admin_update_user(state.api, ed.user_id, {
+		monthly_minutes = mins,
+		monthly_unlimited = ed.monthly_unlimited,
+		max_concurrent = conc,
+	}, function(data, err)
+		state.saving = false
+		if state.stopped then
+			return
+		end
+		if err then
+			if err.code == "forbidden" then
+				clear_admin(state)
+				flash(state, "error", "You no longer have admin access.")
+			else
+				state.edit_error = cli.describe(err)
+			end
+			state.cx:render()
+			return
+		end
+		-- Success: merge the updated user into the list and leave edit mode.
+		if type(data) == "table" then
+			local list = admin_users(state)
+			for i, u in list do
+				if u.id == data.id then
+					list[i] = data
+					break
+				end
+			end
+		end
+		state.editing = nil
+		state.edit_error = nil
+		flash(state, "success", "Saved limits for user " .. tostring(ed.user_id) .. ".")
+		-- Re-fetch authoritative data.
+		state.read_at.admin_users = nil
+		read_admin_users(state)
+		state.cx:render()
+	end)
+	state.cx:render()
 end
 
 -- ── actions ────────────────────────────────────────────────────────────────
@@ -372,13 +565,20 @@ local function copy_summary(state: any, run: any)
 end
 
 local function set_view(state: any, view: string)
-	if view ~= "devices" and view ~= "runs" then
+	if view ~= "devices" and view ~= "runs" and view ~= "users" then
+		return
+	end
+	if view == "users" and not state.is_admin then
 		return
 	end
 	state.view = view
 	state.confirm = nil
+	cancel_edit(state)
 	if view == "runs" then
 		state.read_at.runs = nil
+	end
+	if view == "users" then
+		state.read_at.admin_users = nil
 	end
 	poll(state)
 end
@@ -387,11 +587,18 @@ local function move(state: any, step: number)
 	local list, field = devices(state), "lease_id"
 	if state.view == "runs" then
 		list, field = runs(state), "run_id"
+	elseif state.view == "users" then
+		list, field = admin_users(state), "id"
 	end
 	if #list == 0 then
 		return
 	end
-	local cur = current(state)
+	local cur
+	if state.view == "users" then
+		cur = admin_current(state)
+	else
+		cur = current(state)
+	end
 	local at = 1
 	for i, it in list do
 		if it == cur then
@@ -408,7 +615,12 @@ end
 local function on_action(state: any, act: string, value: string?)
 	local d = if state.view == "devices" then current(state) else nil
 	if act == "sel" and value then
-		state.sel[state.view] = value
+		if state.view == "users" then
+			-- Parse numeric id for users.
+			state.sel.users = tonumber(value)
+		else
+			state.sel[state.view] = value
+		end
 		if state.view == "runs" then
 			load_report(state, current(state))
 		end
@@ -418,6 +630,11 @@ local function on_action(state: any, act: string, value: string?)
 		state.read_at = {}
 		state.raw = {}
 		state.reports = {}
+		state.is_admin = nil
+		-- Don't cancel an in-flight save; cancel only an idle edit.
+		if not state.saving then
+			cancel_edit(state)
+		end
 		poll(state)
 	elseif act == "open" then
 		viewer(state, d, true, false)
@@ -460,7 +677,38 @@ local function on_action(state: any, act: string, value: string?)
 	elseif act == "w_reauth" then
 		state.api.creds, state.api.auth, state.api.auth_at = nil, "checking", -1e9
 		state.data, state.raw, state.read_at, state.reports, state.shots = {}, {}, {}, {}, {}
+		state.is_admin = nil
+		cancel_edit(state)
 		poll(state)
+	-- Admin Users actions
+	elseif act == "edit_user" then
+		if not state.saving then
+			local u = admin_current(state)
+			if u then
+				start_edit(state, u)
+			end
+		end
+	elseif act == "cancel_edit" then
+		if not state.saving then
+			cancel_edit(state)
+		end
+	elseif act == "save_edit" then
+		save_edit(state)
+	elseif act == "edit_field" and value then
+		-- Block field changes while a save is in flight.
+		if not state.saving then
+			local ok, fv = pcall(tern.json.decode, value)
+			if ok and type(fv) == "table" and state.editing then
+				if fv.field == "monthly_unlimited" then
+					state.editing.monthly_unlimited = fv.value == true
+				elseif fv.field == "monthly_minutes" then
+					state.editing.monthly_minutes = tostring(fv.value or "")
+				elseif fv.field == "max_concurrent" then
+					state.editing.max_concurrent = tostring(fv.value or "")
+				end
+				state.edit_error = nil
+			end
+		end
 	end
 end
 
@@ -490,14 +738,26 @@ local function key(state: any, k: Key, cx: any): boolean?
 		return false
 	end
 	if n == "tab" then
-		set_view(state, if state.view == "devices" then "runs" else "devices")
+		if state.is_admin then
+			local order = { "devices", "runs", "users" }
+			local idx = 1
+			for i, v in order do
+				if v == state.view then
+					idx = i
+					break
+				end
+			end
+			set_view(state, order[idx % #order + 1])
+		else
+			set_view(state, if state.view == "devices" then "runs" else "devices")
+		end
 	elseif n == "up" or n == "k" then
 		move(state, -1)
 	elseif n == "down" or n == "j" then
 		move(state, 1)
 	elseif n == "r" then
 		on_action(state, "refresh", nil)
-	elseif n == "n" then
+	elseif n == "n" and state.view ~= "users" then
 		on_action(state, "new", nil)
 	elseif state.view == "devices" and (n == "o" or n == "enter") then
 		on_action(state, "open", nil)
@@ -513,6 +773,16 @@ local function key(state: any, k: Key, cx: any): boolean?
 		on_action(state, "copy", nil)
 	elseif state.view == "runs" and n == "d" then
 		on_action(state, "evidence", nil)
+	elseif state.view == "users" and n == "e" then
+		on_action(state, "edit_user", nil)
+	elseif state.view == "users" and n == "escape" then
+		on_action(state, "cancel_edit", nil)
+	elseif state.view == "users" and (n == "enter") then
+		if state.editing then
+			on_action(state, "save_edit", nil)
+		else
+			on_action(state, "edit_user", nil)
+		end
 	else
 		return false
 	end
@@ -526,8 +796,10 @@ M.def = {
 		local state = {
 			cx = cx,
 			api = apimod.new(),
+			-- "users" is deferred: it needs /v1/me to confirm admin first.
 			view = if args[1] == "runs" or s.view == "runs" then "runs" else "devices",
-			sel = { devices = s.device, runs = s.run },
+			pending_view = if args[1] == "users" or s.view == "users" then "users" else nil,
+			sel = { devices = s.device, runs = s.run, users = s.user_id },
 			data = {},
 			raw = {},
 			errs = {},
@@ -541,6 +813,10 @@ M.def = {
 			confirm = nil,
 			updated = nil,
 			stopped = false,
+			is_admin = nil,
+			editing = nil,
+			edit_error = nil,
+			saving = false,
 		}
 		local function tick()
 			if state.stopped or not running(cx.pane) then
@@ -581,7 +857,7 @@ M.def = {
 		end
 	end,
 	save = function(state: any)
-		return { view = state.view, device = state.sel.devices, run = state.sel.runs }
+		return { view = state.view, device = state.sel.devices, run = state.sel.runs, user_id = state.sel.users }
 	end,
 }
 

@@ -4,12 +4,14 @@ All Seiji documents use these terms with these meanings only. [concepts.md](conc
 
 | Term | Meaning |
 |---|---|
+| **Admin** | A user whose name is in `adminUsers` in the config. Admins can list users and change budgets and concurrency through the admin HTTP endpoints. Authority comes only from the config, never from client-supplied flags. An admin is still an unprivileged macOS tenant. |
 | **adb** | The Android Debug Bridge (`<android.sdkRoot>/platform-tools/adb`); all emulators on the host share one adb server on port 5037, because Maestro hardcodes that port. |
 | **Admission** | The atomic check under the admission lock (budget, concurrency, capacity, ports) that creates a `booting` lease, or fails at once because Seiji has no queue. |
 | **Admission lock** | The in-process lock of `seiji serve` that makes admission atomic, so two calls cannot both take the last slot. |
 | **AVD** | An Android Virtual Device in `android.avdHome`; each Android model names one, and emulators start it with `-read-only` so all leases share it unchanged. |
 | **AXe** | The third-party CLI ([cameroncooke/AXe](https://github.com/cameroncooke/AXe), `axe.bin`) that taps, types, swipes and reads the accessibility tree of an iOS simulator through Apple's private accessibility and HID frameworks; `run_actions`, `inspect_screen` on iOS and the viewer use it. |
 | **Budget** | The monthly device-minutes of a user (`monthlyMinutes`), counted per UTC calendar month. |
+| **Budget (unlimited)** | When `monthlyUnlimited` is true, admission and the reaper skip the monthly budget check. The numeric `monthlyMinutes` is preserved for switching back, and usage is still metered. |
 | **Build** | An app file that a user uploaded (`POST /v1/apps`) or that Seiji downloaded (`install_app` with `url`), with the id `a_<12 hex>`, kept `appRetentionHours`, at most `maxBuildsPerUser` per user. |
 | **Capacity** | The host-wide limit of simultaneous devices for each platform (`capacity.ios`, `capacity.android`). |
 | **Capture** | A recording that runs for the whole of an iOS run: the screen video (`simctl io recordVideo`, stopped with SIGINT) or the unified-log stream into `app.log`. |
@@ -31,7 +33,7 @@ All Seiji documents use these terms with these meanings only. [concepts.md](conc
 | **Manifest** | `manifest.json` of a run (schema `seiji.run.v1`): status, verdict, device, app, input, step records, and every file with its size and SHA-256. |
 | **MCP** | The Model Context Protocol: the JSON-RPC protocol through which AI agents list and call Seiji's tools. |
 | **Op lock** | The lock of one lease that serializes its device operations (boot, install, device tools, screen reads, screenshots, runs, viewer input), so one device has at most one driver at a time. |
-| **Quota** | The four limits of a user: `monthlyMinutes`, `maxConcurrent`, `maxLeaseMinutes` and `idleMinutes`. |
+| **Quota** | The five limits of a user: `monthlyMinutes`, `monthlyUnlimited`, `maxConcurrent`, `maxLeaseMinutes` and `idleMinutes`. |
 | **Reaper** | The 15 s loop in `seiji serve` that releases leases (disabled user, budget, lease length, idle) and deletes expired builds and runs. |
 | **Root helpers** | `seiji exec-as`, `seiji exec-drop` and `seiji kill-as`, which run as root through sudo, never read the config, and act only as a tenant account; `seiji tenant provision` is run by an admin with sudo. |
 | **Run** | One recorded test on a lease's device, with the id `r_<12 hex>`, the kind `actions`, `flow` or `xctest`, and the status `running`, then `passed`, `failed`, `error` or `cancelled`. |

@@ -14,6 +14,14 @@ function M.bin(): string
 	if b and b ~= "" then
 		return b
 	end
+	local home = tern.getenv("HOME")
+	local cargo = tern.getenv("CARGO_HOME") or (home and home .. "/.cargo")
+	if cargo then
+		local installed = cargo .. "/bin/seiji"
+		if tern.fs.exists(installed) then
+			return installed
+		end
+	end
 	return "seiji"
 end
 
@@ -89,6 +97,8 @@ local KNOWN = {
 	unreachable = "Could not reach Seiji.",
 	bad_response = "Seiji sent a response Tern could not read.",
 	unauthorized = "The token was rejected (revoked, or the user is disabled). Sign in again.",
+	forbidden = "You do not have permission for this action.",
+	not_found = "The requested resource was not found.",
 }
 
 -- One line for a person. Tool and HTTP errors carry Seiji's own English message.
@@ -99,7 +109,7 @@ function M.describe(err: CliError?): string
 	if err.code == "cli_failed" and err.message ~= "" then
 		return "The seiji CLI failed: " .. err.message
 	end
-	if (err.code == "tool" or err.code == "http" or err.code == "unreachable") and err.message ~= "" then
+	if (err.code == "tool" or err.code == "http" or err.code == "forbidden" or err.code == "not_found" or err.code == "unreachable") and err.message ~= "" then
 		return (if err.code == "unreachable" then "Could not reach Seiji: " else "") .. err.message
 	end
 	return KNOWN[err.code] or (if err.message ~= "" then err.message else "Seiji failed (" .. tostring(err.code) .. ").")

@@ -1,6 +1,6 @@
 //! HTTP surface: `/mcp` (Streamable HTTP MCP with SSE responses and 15 s keepalives),
 //! `POST /v1/apps` (build upload), run evidence downloads under `/v1/runs/{run_id}/`,
-//! and `/healthz`.
+//! admin endpoints under `/v1/admin/`, and `/healthz`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,7 +12,7 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use futures_util::StreamExt;
 use rmcp::transport::streamable_http_server::{
@@ -23,8 +23,8 @@ use tokio::sync::OnceCell;
 use tokio_util::sync::CancellationToken;
 
 use crate::mcp::{AuthedUser, SeijiMcp};
-use crate::pool::{Pool, sanitize_filename};
-use crate::store::{App, User};
+use crate::pool::{AdminLimitsOutcome, Pool, sanitize_filename};
+use crate::store::{App, User, month_window, now};
 
 fn bearer(headers: &HeaderMap) -> Option<&str> {
     headers.get("authorization")?.to_str().ok()?.strip_prefix("Bearer ")
@@ -199,8 +199,129 @@ async fn run_report(
 }
 
 /// `GET /v1/me`: who the token belongs to, for clients that sign in (`seiji login`, Tern).
-async fn me(Extension(AuthedUser(user)): Extension<AuthedUser>) -> Response {
-    Json(serde_json::json!({ "user": user.name, "quota": user.quota })).into_response()
+async fn me(State(pool): State<Arc<Pool>>, Extension(AuthedUser(user)): Extension<AuthedUser>) -> Response {
+    let is_admin = pool.config.admin_users.contains(&user.name);
+    Json(serde_json::json!({ "user": user.name, "quota": user.quota, "is_admin": is_admin })).into_response()
+}
+
+/// A user entry for the admin endpoints.
+#[derive(serde::Serialize)]
+struct AdminUserEntry {
+    id: i64,
+    name: String,
+    disabled: bool,
+    is_admin: bool,
+    monthly_minutes: i64,
+    monthly_unlimited: bool,
+    max_concurrent: i64,
+    max_lease_minutes: i64,
+    idle_minutes: i64,
+    used_minutes: f64,
+    active_devices: usize,
+}
+
+fn admin_entry(user: &User, is_admin: bool, used_seconds: i64, active_devices: usize) -> AdminUserEntry {
+    AdminUserEntry {
+        id: user.id,
+        name: user.name.clone(),
+        disabled: user.disabled,
+        is_admin,
+        monthly_minutes: user.quota.monthly_minutes,
+        monthly_unlimited: user.quota.monthly_unlimited,
+        max_concurrent: user.quota.max_concurrent,
+        max_lease_minutes: user.quota.max_lease_minutes,
+        idle_minutes: user.quota.idle_minutes,
+        used_minutes: (used_seconds as f64 / 60.0 * 10.0).round() / 10.0,
+        active_devices,
+    }
+}
+
+/// `GET /v1/admin/users`: list all users with quotas, usage and active devices.
+async fn admin_users(State(pool): State<Arc<Pool>>, Extension(AuthedUser(caller)): Extension<AuthedUser>) -> Response {
+    if !pool.config.admin_users.contains(&caller.name) {
+        return bad(StatusCode::FORBIDDEN, "admin access required");
+    }
+    let users = match pool.store.users() {
+        Ok(u) => u,
+        Err(e) => return bad(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+    };
+    let active = match pool.store.active_leases() {
+        Ok(a) => a,
+        Err(e) => return bad(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+    };
+    let t = now();
+    let (from, to) = month_window(t);
+    let mut entries = Vec::with_capacity(users.len());
+    for u in &users {
+        let used_secs = match pool.store.used_seconds(u.id, from, to, t) {
+            Ok(s) => s,
+            Err(e) => return bad(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+        };
+        let active_devices = active.iter().filter(|l| l.user_id == u.id).count();
+        entries.push(admin_entry(u, pool.config.admin_users.contains(&u.name), used_secs, active_devices));
+    }
+    let ios_in_use = active.iter().filter(|l| l.platform == crate::config::Platform::Ios).count();
+    let android_in_use = active.iter().filter(|l| l.platform == crate::config::Platform::Android).count();
+    Json(serde_json::json!({
+        "users": entries,
+        "capacity": { "ios": pool.config.capacity.ios, "android": pool.config.capacity.android },
+        "in_use": { "ios": ios_in_use, "android": android_in_use },
+    }))
+    .into_response()
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdminLimitsBody {
+    monthly_minutes: i64,
+    monthly_unlimited: bool,
+    max_concurrent: i64,
+}
+
+/// `PUT /v1/admin/users/{id}/limits`: update a user's admin-editable limits.
+async fn admin_set_limits(
+    State(pool): State<Arc<Pool>>,
+    Extension(AuthedUser(caller)): Extension<AuthedUser>,
+    UrlPath(user_id): UrlPath<i64>,
+    body: axum::body::Bytes,
+) -> Response {
+    if !pool.config.admin_users.contains(&caller.name) {
+        return bad(StatusCode::FORBIDDEN, "admin access required");
+    }
+    let body: AdminLimitsBody = match serde_json::from_slice(&body) {
+        Ok(b) => b,
+        Err(e) => return bad(StatusCode::BAD_REQUEST, format!("invalid body: {e}")),
+    };
+    if body.monthly_minutes < 0 {
+        return bad(StatusCode::BAD_REQUEST, "monthly_minutes must be >= 0");
+    }
+    if body.max_concurrent < 1 {
+        return bad(StatusCode::BAD_REQUEST, "max_concurrent must be >= 1");
+    }
+    let outcome = match pool
+        .set_admin_limits(caller.id, user_id, body.monthly_minutes, body.monthly_unlimited, body.max_concurrent)
+        .await
+    {
+        Ok(o) => o,
+        Err(e) => return bad(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+    };
+    let user = match outcome {
+        AdminLimitsOutcome::Ok(u) => u,
+        AdminLimitsOutcome::CallerGone => return bad(StatusCode::UNAUTHORIZED, "caller no longer valid"),
+        AdminLimitsOutcome::Forbidden => return bad(StatusCode::FORBIDDEN, "admin access required"),
+        AdminLimitsOutcome::NotFound => return bad(StatusCode::NOT_FOUND, "user not found"),
+    };
+    let t = now();
+    let (from, to) = month_window(t);
+    let used_secs = match pool.store.used_seconds(user.id, from, to, t) {
+        Ok(s) => s,
+        Err(e) => return bad(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+    };
+    let active_devices = match pool.store.active_leases() {
+        Ok(a) => a.iter().filter(|l| l.user_id == user.id).count(),
+        Err(e) => return bad(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+    };
+    Json(admin_entry(&user, pool.config.admin_users.contains(&user.name), used_secs, active_devices)).into_response()
 }
 
 /// `POST /v1/leases/{lease_id}/viewer`: a one-time link to watch (and by default drive) the lease's
@@ -318,6 +439,8 @@ pub fn router(pool: Arc<Pool>, shutdown: CancellationToken) -> Router {
         .route("/v1/runs/{run_id}/evidence.zip", get(evidence_zip))
         .route("/v1/runs/{run_id}/report.md", get(run_report))
         .route("/v1/me", get(me))
+        .route("/v1/admin/users", get(admin_users))
+        .route("/v1/admin/users/{id}/limits", put(admin_set_limits))
         .route("/v1/leases/{lease_id}/viewer", post(viewer_link))
         .route("/v1/leases/{lease_id}/screenshot.jpg", get(lease_screenshot))
         .route("/v1/leases/{lease_id}/forward", get(forward))

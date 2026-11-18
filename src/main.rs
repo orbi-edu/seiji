@@ -143,6 +143,9 @@ struct QuotaFlags {
     /// Device-minutes per calendar month.
     #[arg(long)]
     monthly_minutes: Option<i64>,
+    /// Unlimited monthly budget (true or false). Omission preserves the current value.
+    #[arg(long)]
+    monthly_unlimited: Option<bool>,
     /// Devices held at the same time.
     #[arg(long)]
     max_concurrent: Option<i64>,
@@ -158,6 +161,7 @@ impl QuotaFlags {
     fn apply(&self, base: Quota) -> Result<Quota> {
         let q = Quota {
             monthly_minutes: self.monthly_minutes.unwrap_or(base.monthly_minutes),
+            monthly_unlimited: self.monthly_unlimited.unwrap_or(base.monthly_unlimited),
             max_concurrent: self.max_concurrent.unwrap_or(base.max_concurrent),
             max_lease_minutes: self.max_lease_minutes.unwrap_or(base.max_lease_minutes),
             idle_minutes: self.idle_minutes.unwrap_or(base.idle_minutes),
@@ -290,15 +294,20 @@ fn user_cmd(config: &Config, cmd: UserCmd) -> Result<()> {
         }
         UserCmd::List => {
             println!(
-                "{:<16} {:<20} {:>8} {:>5} {:>9} {:>6}  status",
+                "{:<16} {:<20} {:>10} {:>5} {:>9} {:>6}  status",
                 "name", "os account", "min/mo", "conc", "lease-min", "idle"
             );
             for u in store.users()? {
+                let budget = if u.quota.monthly_unlimited {
+                    "unlimited".to_string()
+                } else {
+                    u.quota.monthly_minutes.to_string()
+                };
                 println!(
-                    "{:<16} {:<20} {:>8} {:>5} {:>9} {:>6}  {}",
+                    "{:<16} {:<20} {:>10} {:>5} {:>9} {:>6}  {}",
                     u.name,
                     u.os_user.as_deref().unwrap_or("-"),
-                    u.quota.monthly_minutes,
+                    budget,
                     u.quota.max_concurrent,
                     u.quota.max_lease_minutes,
                     u.quota.idle_minutes,
@@ -344,21 +353,26 @@ fn usage(config: &Config, month: Option<&str>) -> Result<()> {
     };
     let rows = store.usage(from, to, t)?;
     println!("month {}", pool::month_label(from));
-    println!("{:<16} {:>10} {:>8} {:>6} {:>7}  est. USD", "user", "used min", "quota", "used%", "leases");
+    println!("{:<16} {:>10} {:>10} {:>6} {:>7}  est. USD", "user", "used min", "quota", "used%", "leases");
     let (mut total_min, mut total_usd) = (0.0, 0.0);
     for r in &rows {
         let used = r.used_seconds as f64 / 60.0;
-        let pct =
-            if r.user.quota.monthly_minutes > 0 { used / r.user.quota.monthly_minutes as f64 * 100.0 } else { 0.0 };
+        let (quota_str, pct_str) = if r.user.quota.monthly_unlimited {
+            ("unlimited".to_string(), "    -".to_string())
+        } else {
+            let pct =
+                if r.user.quota.monthly_minutes > 0 { used / r.user.quota.monthly_minutes as f64 * 100.0 } else { 0.0 };
+            (r.user.quota.monthly_minutes.to_string(), format!("{pct:>5.0}%"))
+        };
         let usd = config.cost_per_device_hour_usd.map(|rate| used / 60.0 * rate);
         total_min += used;
         total_usd += usd.unwrap_or(0.0);
         println!(
-            "{:<16} {:>10.1} {:>8} {:>5.0}% {:>7}  {}",
+            "{:<16} {:>10.1} {:>10} {} {:>7}  {}",
             r.user.name,
             used,
-            r.user.quota.monthly_minutes,
-            pct,
+            quota_str,
+            pct_str,
             r.leases,
             usd.map_or("-".into(), |u| format!("{u:.2}"))
         );

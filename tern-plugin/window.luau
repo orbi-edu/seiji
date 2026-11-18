@@ -216,14 +216,28 @@ local function status_poll()
 			return
 		end
 		local n = #(b.active_leases or {})
-		local left = b.remaining_minutes or 0
+		local unlimited = b.monthly_unlimited == true
+		local left = b.remaining_minutes
 		local quota = b.monthly_minutes or 0
-		local tone = if quota > 0 and left / quota < 0.1 then "error" elseif quota > 0 and left / quota < 0.25 then "warning" else "muted"
+		local tone
+		if unlimited then
+			tone = "muted"
+		elseif type(left) == "number" and quota > 0 and left / quota < 0.1 then
+			tone = "error"
+		elseif type(left) == "number" and quota > 0 and left / quota < 0.25 then
+			tone = "warning"
+		else
+			tone = "muted"
+		end
 		local parts = { "Seiji" }
 		if n > 0 then
 			table.insert(parts, fmt.plural(n, "device", "devices"))
 		end
-		table.insert(parts, fmt.num(left) .. " min left")
+		if unlimited then
+			table.insert(parts, "Unlimited")
+		else
+			table.insert(parts, fmt.num(left or 0) .. " min left")
+		end
 		publish({ text = table.concat(parts, " · "), icon = "monitor", tone = tone, command = "plugin.seiji.devices" })
 	end)
 end
@@ -262,7 +276,6 @@ tern.command({
 		open_app(cx, "runs")
 	end,
 })
-
 tern.command({
 	id = "signin",
 	title = "Seiji: Sign in",

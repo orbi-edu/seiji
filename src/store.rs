@@ -121,6 +121,7 @@ CREATE TABLE IF NOT EXISTS users (
   token_hash TEXT NOT NULL UNIQUE,
   os_user TEXT,
   monthly_minutes INTEGER NOT NULL,
+  monthly_unlimited INTEGER NOT NULL DEFAULT 0,
   max_concurrent INTEGER NOT NULL,
   max_lease_minutes INTEGER NOT NULL,
   idle_minutes INTEGER NOT NULL,
@@ -168,7 +169,8 @@ CREATE TABLE IF NOT EXISTS runs (
 CREATE INDEX IF NOT EXISTS runs_user ON runs(user_id, started_at);
 "#;
 
-const USER_COLS: &str = "id, name, os_user, monthly_minutes, max_concurrent, max_lease_minutes, idle_minutes, disabled";
+const USER_COLS: &str =
+    "id, name, os_user, monthly_minutes, monthly_unlimited, max_concurrent, max_lease_minutes, idle_minutes, disabled";
 const LEASE_COLS: &str = "id, user_id, platform, model, device_id, driver_port, console_port, status, started_at, last_activity_at, ended_at, end_reason";
 
 fn user_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<User> {
@@ -178,11 +180,12 @@ fn user_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<User> {
         os_user: r.get(2)?,
         quota: Quota {
             monthly_minutes: r.get(3)?,
-            max_concurrent: r.get(4)?,
-            max_lease_minutes: r.get(5)?,
-            idle_minutes: r.get(6)?,
+            monthly_unlimited: r.get::<_, i64>(4)? != 0,
+            max_concurrent: r.get(5)?,
+            max_lease_minutes: r.get(6)?,
+            idle_minutes: r.get(7)?,
         },
-        disabled: r.get::<_, i64>(7)? != 0,
+        disabled: r.get::<_, i64>(8)? != 0,
     })
 }
 
@@ -216,11 +219,22 @@ impl Store {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         }
-        let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
+        let mut conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch(SCHEMA)?;
+        // Serialize schema inspection and migration across concurrent CLI/server opens.
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let has_col: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('users') WHERE name = 'monthly_unlimited')",
+            [],
+            |r| r.get(0),
+        )?;
+        if !has_col {
+            tx.execute_batch("ALTER TABLE users ADD COLUMN monthly_unlimited INTEGER NOT NULL DEFAULT 0")?;
+        }
+        tx.commit()?;
         Ok(Self { conn: Mutex::new(conn) })
     }
 
@@ -239,13 +253,14 @@ impl Store {
         }
         let token = new_token();
         conn.execute(
-            "INSERT INTO users (name, token_hash, os_user, monthly_minutes, max_concurrent, max_lease_minutes, idle_minutes, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO users (name, token_hash, os_user, monthly_minutes, monthly_unlimited, max_concurrent, max_lease_minutes, idle_minutes, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 name,
                 hash_token(&token),
                 os_user,
                 quota.monthly_minutes,
+                quota.monthly_unlimited as i64,
                 quota.max_concurrent,
                 quota.max_lease_minutes,
                 quota.idle_minutes,
@@ -287,13 +302,28 @@ impl Store {
 
     pub fn set_quota(&self, name: &str, quota: Quota) -> Result<()> {
         let n = self.conn().execute(
-            "UPDATE users SET monthly_minutes = ?2, max_concurrent = ?3, max_lease_minutes = ?4, idle_minutes = ?5 WHERE name = ?1",
-            params![name, quota.monthly_minutes, quota.max_concurrent, quota.max_lease_minutes, quota.idle_minutes],
+            "UPDATE users SET monthly_minutes = ?2, monthly_unlimited = ?3, max_concurrent = ?4, max_lease_minutes = ?5, idle_minutes = ?6 WHERE name = ?1",
+            params![name, quota.monthly_minutes, quota.monthly_unlimited as i64, quota.max_concurrent, quota.max_lease_minutes, quota.idle_minutes],
         )?;
         if n == 0 {
             bail!("no user {name:?}");
         }
         Ok(())
+    }
+
+    /// Updates only the admin-editable limits (budget, unlimited flag, concurrency).
+    pub fn set_admin_limits(
+        &self,
+        id: i64,
+        monthly_minutes: i64,
+        monthly_unlimited: bool,
+        max_concurrent: i64,
+    ) -> Result<bool> {
+        let n = self.conn().execute(
+            "UPDATE users SET monthly_minutes = ?2, monthly_unlimited = ?3, max_concurrent = ?4 WHERE id = ?1",
+            params![id, monthly_minutes, monthly_unlimited as i64, max_concurrent],
+        )?;
+        Ok(n > 0)
     }
 
     pub fn set_disabled(&self, name: &str, disabled: bool) -> Result<()> {
