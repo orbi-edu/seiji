@@ -187,6 +187,7 @@ local function status_poll()
 		method = "POST",
 		headers = {
 			Authorization = "Bearer " .. creds.token,
+			["User-Agent"] = "seiji-tern/1",
 			["Content-Type"] = "application/json",
 			Accept = "application/json, text/event-stream",
 			["MCP-Protocol-Version"] = "2025-11-25",
