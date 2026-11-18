@@ -462,7 +462,8 @@ impl Devices for HostDevices {
                     let spec = ios::axe_describe(&self.config.axe, id);
                     let out = self.runner.run(&ctx.account, spec, remaining.min(SHORT), cancel).await?;
                     let tree = ios::parse_axe(&out, "describe-ui during boot")?;
-                    let elements = tree.as_array().context("AXe describe-ui returned a non-array result during boot")?;
+                    let elements =
+                        tree.as_array().context("AXe describe-ui returned a non-array result during boot")?;
                     if !elements.is_empty() {
                         return Ok(());
                     }
