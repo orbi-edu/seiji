@@ -461,11 +461,16 @@ impl Devices for HostDevices {
                         .context("iOS simulator did not expose an accessibility tree before the boot deadline")?;
                     let spec = ios::axe_describe(&self.config.axe, id);
                     let out = self.runner.run(&ctx.account, spec, remaining.min(SHORT), cancel).await?;
-                    let tree = ios::parse_axe(&out, "describe-ui during boot")?;
-                    let elements =
-                        tree.as_array().context("AXe describe-ui returned a non-array result during boot")?;
-                    if !elements.is_empty() {
-                        return Ok(());
+                    match ios::parse_axe(&out, "describe-ui during boot") {
+                        Ok(tree) => {
+                            let elements =
+                                tree.as_array().context("AXe describe-ui returned a non-array result during boot")?;
+                            if !elements.is_empty() {
+                                return Ok(());
+                            }
+                        }
+                        Err(error) if error.is::<ios::AutomationSessionPending>() => {}
+                        Err(error) => return Err(error),
                     }
                     let delay = deadline.saturating_duration_since(Instant::now()).min(Duration::from_secs(1));
                     tokio::select! {

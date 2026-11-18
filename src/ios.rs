@@ -11,6 +11,17 @@ use crate::config::Axe;
 use crate::devices::{DeviceOp, UiInput};
 use crate::exec::{CmdSpec, Output, tail};
 
+#[derive(Debug)]
+pub(crate) struct AutomationSessionPending(String);
+
+impl std::fmt::Display for AutomationSessionPending {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for AutomationSessionPending {}
+
 pub const XCRUN: &str = "/usr/bin/xcrun";
 
 pub fn simctl<I, S>(args: I) -> CmdSpec
@@ -113,6 +124,9 @@ pub fn parse_axe(out: &Output, what: &str) -> Result<Value> {
         Some(env) if env.get("didError").and_then(Value::as_bool) == Some(true) => {
             let code = env.pointer("/error/code").and_then(Value::as_str).unwrap_or("commandFailed");
             let message = env.pointer("/error/message").and_then(Value::as_str).unwrap_or("no message");
+            if code == "commandFailed" && message == "Timed out creating the simulator remote automation session" {
+                return Err(AutomationSessionPending(format!("{what} failed ({code}): {message}")).into());
+            }
             bail!("{what} failed ({code}): {message}")
         }
         Some(env) if out.success() => Ok(env.pointer("/data/result").cloned().unwrap_or(Value::Null)),
@@ -331,6 +345,30 @@ mod tests {
         };
         let err = parse_axe(&out, "tap").unwrap_err().to_string();
         assert!(err.contains("elementNotFound") && err.contains("matched --label 'X'"), "{err}");
+    }
+
+    #[test]
+    fn only_remote_automation_startup_timeouts_are_pending() {
+        let timeout = "Timed out creating the simulator remote automation session";
+        for (code, message, pending) in [
+            ("commandFailed", timeout, true),
+            ("permissionDenied", timeout, false),
+            ("commandFailed", "Connection refused", false),
+        ] {
+            let out = Output {
+                code: Some(1),
+                stdout: serde_json::to_vec(&serde_json::json!({
+                    "didError": true,
+                    "error": { "code": code, "message": message }
+                }))
+                .unwrap(),
+                stderr: Vec::new(),
+                timed_out: false,
+                cancelled: false,
+            };
+            let error = parse_axe(&out, "describe-ui during boot").unwrap_err();
+            assert_eq!(error.is::<AutomationSessionPending>(), pending, "{code}: {message}");
+        }
     }
 
     #[test]

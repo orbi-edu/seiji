@@ -487,7 +487,7 @@ Seiji captures a PNG (`xcrun simctl io <udid> screenshot --type=png --display=1`
 
 iOS screenshots and `recordVideo` explicitly select primary display 1. A multi-display simulator such as iPhone Duo otherwise fails with `Cannot choose between 2 displays`. This applies to doctor, standalone screenshots and recorded runs.
 
-For iOS, Seiji waits for a nonempty AXe accessibility tree after `simctl bootstatus`, within the same configured boot timeout. A successful `bootstatus` exit alone does not mean the interface is ready; it can return while the display still shows the Apple logo. AXe errors and malformed responses fail boot rather than being treated as readiness. Doctor also rejects an empty tree before reporting success.
+For iOS, Seiji waits for a nonempty AXe accessibility tree after `simctl bootstatus`, within the same configured boot timeout. A successful `bootstatus` exit alone does not mean the interface is ready; it can return while the display still shows the Apple logo. During a cold boot, AXe can report `commandFailed: Timed out creating the simulator remote automation session` while XCTest is still waiting for accessibility to load. Only that specific startup error remains pending within the boot deadline; other AXe errors and malformed responses fail boot. Doctor also rejects an empty tree before reporting success.
 
 | Message | Cause | Fix |
 |---|---|---|
