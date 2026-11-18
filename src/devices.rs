@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -661,7 +662,36 @@ impl Devices for HostDevices {
         let (job, is_video) = match capture {
             Capture::Video { dest } => {
                 let log = self.config.data_dir.join("run").join(format!("{handle}.log"));
-                (self.runner.spawn(&ctx.account, ios::record_video(udid, dest), &log)?, true)
+                let mut job = self.runner.spawn(&ctx.account, ios::record_video(udid, dest), &log)?;
+                let ready = tokio::time::timeout(SHORT, async {
+                    let mut reader = BufReader::new(tokio::fs::File::open(&log).await?);
+                    let mut line = String::new();
+                    loop {
+                        if reader.read_line(&mut line).await? > 0 {
+                            if line.trim() == "Recording started" {
+                                return Ok::<(), anyhow::Error>(());
+                            }
+                            if line.ends_with('\n') {
+                                line.clear();
+                            }
+                        } else {
+                            if job.try_exited() {
+                                bail!("simctl recordVideo exited before recording started");
+                            }
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
+                    }
+                })
+                .await
+                .context("simctl recordVideo did not start within 60 seconds")
+                .and_then(|result| result);
+                if let Err(error) = ready {
+                    self.runner.interrupt(&ctx.account, &mut job, Duration::from_secs(30)).await;
+                    let output = std::fs::read_to_string(&log).unwrap_or_default();
+                    let _ = std::fs::remove_file(&log);
+                    return Err(error.context(format!("recorder output: {}", tail(&output, 2000))));
+                }
+                (job, true)
             }
             Capture::Log { predicate, out } => {
                 (self.runner.spawn(&ctx.account, ios::log_stream(udid, predicate), out)?, false)
