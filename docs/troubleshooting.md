@@ -321,6 +321,7 @@ ls -ld /usr /usr/local /usr/local/var /usr/local/var/seiji
 
 | Error | Cause | Fix |
 |---|---|---|
+| `tap failed (invalidArguments): Either provide both -x/-y, or use --id/--label/--value to tap an element.` after clicking the viewer | Older Seiji builds send coordinate options as `--x`/`--y`, but AXe requires the short options `-x`/`-y`. | Upgrade Seiji to a build with the coordinate-tap fix. Changing Tunnel settings or restarting the simulator does not correct the command arguments. |
 | `<what> failed (<code>): <message>` | AXe ran and returned a typed error. `<code>` is AXe's error code, `commandFailed` when AXe gives none. For example `tap failed (elementNotFound): No accessibility element matched --label 'X'.` | Call `inspect_screen` and use the exact `label`, `id` or `value` it shows. Look at the failed step's files: `steps/<NNN>-<kind>-failure.png` and the tree `steps/<NNN>-<kind>-tree.txt`. |
 | `<what> timed out` | One AXe command took longer than `axe.stepTimeoutSeconds` (60 s). | A `tap` with a selector waits for its element with `timeout_seconds` (default 5 s) inside that limit. Raise `axe.stepTimeoutSeconds` only if the host is slow. |
 | `<what> was cancelled` | The lease was released during the step. | See [A run ends `failed`, `error` or `cancelled`](#a-run-ends-failed-error-or-cancelled). |

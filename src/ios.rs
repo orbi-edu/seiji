@@ -54,7 +54,7 @@ pub fn axe_input(cfg: &Axe, udid: &str, input: &UiInput) -> CmdSpec {
                 (_, Some(label), _) => s = s.arg(opt("label", label)),
                 (_, _, Some(value)) => s = s.arg(opt("value", value)),
                 _ => {
-                    s = s.arg(opt("x", t.x.unwrap_or_default())).arg(opt("y", t.y.unwrap_or_default()));
+                    s = s.arg(format!("-x={}", t.x.unwrap_or_default())).arg(format!("-y={}", t.y.unwrap_or_default()));
                 }
             }
             if t.id.is_some() || t.label.is_some() || t.value.is_some() {
@@ -303,6 +303,24 @@ mod tests {
 
     fn args(spec: &CmdSpec) -> Vec<String> {
         spec.args.iter().map(|a| a.to_string_lossy().into_owned()).collect()
+    }
+
+    #[test]
+    fn coordinate_taps_use_axes_short_options() {
+        for (x, y, hold) in [(0.0, 0.0, None), (12.5, 34.25, Some(0.5))] {
+            let tap: TapArgs = serde_json::from_value(serde_json::json!({
+                "x": x, "y": y, "hold_seconds": hold
+            }))
+            .unwrap();
+            let actual = args(&axe_input(&Axe::default(), "U1", &UiInput::Tap(tap)));
+            let mut expected =
+                vec!["--output".into(), "json".into(), "tap".into(), format!("-x={x}"), format!("-y={y}")];
+            if let Some(hold) = hold {
+                expected.push(format!("--hold={hold}"));
+            }
+            expected.push("--udid=U1".into());
+            assert_eq!(actual, expected);
+        }
     }
 
     #[test]
