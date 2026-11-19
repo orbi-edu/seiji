@@ -131,6 +131,27 @@ async fn viewers_share_one_stream_until_the_lease_ends() {
 }
 
 #[tokio::test]
+async fn a_still_screen_still_reaches_every_viewer() {
+    // The host skips identical frames: on a screen that does not change, the stream holds one
+    // frame. A viewer that joins later must still get it, and an open stream must not go quiet.
+    let env = setup_with(2, json!({"viewer": {"maxViewersPerLease": 2}})).await;
+    env.fake.still.store(true, Ordering::SeqCst);
+    let (token, lease) = device(&env, "alice").await;
+    let a = open(&env, &token, &lease, false).await;
+    let mut s1 = a.get("stream").await;
+    let first = tokio::time::timeout(Duration::from_secs(2), s1.chunk()).await.unwrap().unwrap().unwrap();
+    assert!(String::from_utf8_lossy(&first).contains("--seijiframe\r\n"));
+
+    let b = open(&env, &token, &lease, false).await;
+    let mut s2 = b.get("stream").await;
+    let joined = tokio::time::timeout(Duration::from_millis(500), s2.chunk()).await;
+    assert!(matches!(joined, Ok(Ok(Some(_)))), "a later viewer gets the current frame at once");
+
+    let again = tokio::time::timeout(Duration::from_secs(2), s1.chunk()).await;
+    assert!(matches!(again, Ok(Ok(Some(_)))), "the last frame is repeated while the screen is still");
+}
+
+#[tokio::test]
 async fn input_maps_to_points_and_respects_view_only_and_runs() {
     let env = setup(2).await;
     let (token, lease) = device(&env, "alice").await;

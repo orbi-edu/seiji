@@ -43,6 +43,8 @@ const TOUCH_EVERY: Duration = Duration::from_secs(60);
 /// How often the stream logs its stats for the operator.
 const STATS_LOG_EVERY: Duration = Duration::from_secs(30);
 const MAX_TEXT: usize = 10_000;
+/// A still screen's last frame is sent again this often (the page flags a stall after 2 s).
+const FRAME_REPEAT: Duration = Duration::from_secs(1);
 /// How long input waits for the device before it answers busy.
 const INPUT_WAIT: Duration = Duration::from_secs(1);
 
@@ -768,11 +770,17 @@ async fn stream(
     headers: HeaderMap,
 ) -> Result<Response, ViewError> {
     let v = pool.viewing(&sid, &headers)?;
-    let rx = subscribe(&pool, &v)?;
+    let mut rx = subscribe(&pool, &v)?;
+    // Identical frames are not sent again, so a screen that does not change produces no new
+    // frame: a viewer that joins (or reconnects) gets the current one at once, and the last
+    // frame is repeated every FRAME_REPEAT so the page and proxies see a live stream.
+    rx.mark_changed();
     let frames = futures_util::stream::unfold(rx, |mut rx| async move {
         loop {
-            // Err: the stream ended (the lease went away or the last viewer left).
-            rx.changed().await.ok()?;
+            // Ok(Err): the stream ended (the lease went away or the last viewer left).
+            if let Ok(changed) = tokio::time::timeout(FRAME_REPEAT, rx.changed()).await {
+                changed.ok()?;
+            }
             let frame = rx.borrow_and_update().clone();
             if let Some(f) = frame {
                 return Some((Ok::<_, Infallible>(part(&f)), rx));

@@ -51,6 +51,9 @@ pub struct FakeDevices {
     pub streams_started: AtomicUsize,
     /// JPEGs the fake stream cycles through; a tiny placeholder frame when empty.
     pub frames: Mutex<Vec<Vec<u8>>>,
+    /// A still screen: the stream produces one frame and then nothing (identical frames are
+    /// not sent again by the host).
+    pub still: AtomicBool,
 }
 
 impl FakeDevices {
@@ -227,6 +230,10 @@ impl Devices for FakeDevices {
                 std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis()
                     as i64;
             frames.send_replace(Some(Frame { jpeg: bytes::Bytes::from(jpeg), captured_at_ms }));
+            if self.still.load(Ordering::SeqCst) {
+                cancel.cancelled().await;
+                return Ok(());
+            }
             tokio::select! {
                 _ = cancel.cancelled() => return Ok(()),
                 _ = tokio::time::sleep(tick) => {}
