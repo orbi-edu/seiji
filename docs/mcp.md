@@ -531,7 +531,7 @@ iOS: prepares the simulator natively with `simctl`, for clean and comparable scr
 | `clear_location` | boolean | No | Remove the simulated location. Default false |
 | `permissions` | array of objects | No | Grant, revoke or reset privacy permissions. No system prompt appears for granted ones. Default `[]` |
 | `react_native_bundler` | object | No | React Native debug builds: where the app loads its JavaScript bundle from (the `RCT_jsLocation` default). Relaunch the app afterwards (see below) |
-| `pasteboard` | string | No | Text to put on the simulator pasteboard (clipboard), 1–200 000 bytes. The user or agent can then long-press Paste in any text field. Under `os_user` isolation it fails: `simctl pbcopy` crashes when the tenant account has no login session; type the text instead |
+| `pasteboard` | string | No | Text to put on the simulator clipboard, 1–200 000 bytes, any characters (accents, emoji). The user or agent can then long-press Paste in a text field, or press Cmd+V (`key-combo`) with a hardware keyboard |
 
 `status_bar` fields (unknown fields are a schema error):
 
@@ -571,7 +571,7 @@ The app reads `RCT_jsLocation` when it starts. Call [`launch_app`](#launch_app) 
 | 5 | `location` | `simctl location <udid> set <latitude>,<longitude>` |
 | 6 | `permissions` | `simctl privacy <udid> <action> <service> <bundle id>`, once for each item |
 | 7 | `react_native_bundler` | `simctl spawn <udid> defaults write <bundle id> RCT_jsLocation -string <location>`, or `simctl spawn <udid> defaults delete <bundle id> RCT_jsLocation` without `location` |
-| 8 | `pasteboard` | `simctl pbcopy <udid>` with the text as stdin, from a daemon-owned scratch file |
+| 8 | `pasteboard` | `axe clipboard copy --stdin` with the text as stdin, from a daemon-owned scratch file; AXe reads it back. Not `simctl pbcopy`: that goes through the host pasteboard, which a tenant account without a login session lacks (it crashes under `os_user`) |
 
 A failed operation stops the call. The operations before it stay applied.
 
@@ -1804,7 +1804,7 @@ The body of `POST /view/s/{sid}/input` is `{"input": {...}, "aspect": <width / h
 | `type` | `text` (1–10 000 bytes) | Types the text through `axe type --stdin`, from a scratch file in `<dataDir>/run/` that Seiji deletes after the input |
 | `key` | `code` | One HID key (usage code) |
 | `button` | `name` | A hardware button, for example `home` or `lock` |
-| `paste` | `text` (1–10 000 bytes) | Puts the text on the simulator pasteboard via `simctl pbcopy`; the user can then long-press Paste in the app. When the pasteboard cannot be reached (under `os_user` isolation `simctl pbcopy` crashes, as the tenant account has no login session), the text is typed into the focused field instead. Answers `200 {"via": "pasteboard"}` or `200 {"via": "typed"}` |
+| `paste` | `text` (1–10 000 bytes) | Puts the text on the simulator clipboard (`axe clipboard copy`) and presses Cmd+V into the focused field, so accents and emoji go through. If the clipboard cannot be set, types the text instead (US keyboard characters only). Answers `200 {"via": "pasted"}` or `200 {"via": "typed"}` |
 | `paste_and_type` | `text` (1–10 000 bytes) | Types the text character by character (same as `type`), for fields that refuse paste |
 
 Each input restarts the idle timer. Viewer input is not recorded as a run.

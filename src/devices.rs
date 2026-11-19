@@ -78,6 +78,11 @@ pub enum UiInput {
     Scroll(ScrollArgs),
     Button(HwButton),
     Key(u8),
+    /// HID modifiers held (in order) while `key` is pressed, e.g. Cmd+V = `[227]`, `25`.
+    KeyCombo {
+        modifiers: Vec<u8>,
+        key: u8,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
@@ -226,7 +231,7 @@ pub enum DeviceOp {
         bundle_id: String,
         location: Option<String>,
     },
-    /// Text placed on the simulator pasteboard via `simctl pbcopy`.
+    /// Text placed on the simulator clipboard via `axe clipboard copy` (verified by readback).
     Pasteboard {
         text_file: PathBuf,
     },
@@ -655,6 +660,7 @@ impl Devices for HostDevices {
             UiInput::Scroll(_) => "scroll",
             UiInput::Button(_) => "button",
             UiInput::Key(_) => "key",
+            UiInput::KeyCombo { .. } => "key-combo",
         };
         self.axe_run(ctx, ios::axe_input(&self.config.axe, ctx.device_id()?, input), what).await.map(|_| ())
     }
@@ -728,7 +734,7 @@ impl Devices for HostDevices {
 
     async fn device_op(&self, ctx: &DeviceCtx, op: &DeviceOp) -> Result<String> {
         self.ios_only(ctx, op.name())?;
-        let spec = ios::device_op(ctx.device_id()?, op)?;
+        let spec = ios::device_op(&self.config.axe, ctx.device_id()?, op)?;
         self.run(&ctx.account, spec, SHORT, &format!("simctl {}", op.name())).await
     }
 

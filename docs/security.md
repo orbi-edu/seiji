@@ -292,7 +292,7 @@ A session ends at `viewer.sessionHours` or with its lease, whichever comes first
 - A view-only session (`control: false`) gets `403` `view_only` for every input and preset change.
 - Input takes the lease's operation lock, like a tool call. It waits up to 1 s, then fails with `409` `busy`. So a person cannot interleave input with a run's steps.
 - Typed text (`type` and `paste_and_type` inputs) goes to `axe type --stdin` through a daemon-owned scratch file in `<dataDir>/run/`, deleted after the input, as in [Typed text and payloads](#typed-text-and-payloads). It is never an argument.
-- The `paste` input puts text on the simulator pasteboard through `simctl pbcopy`, also via a daemon-owned scratch file as stdin. It is never an argument.
+- The `paste` input puts text on the simulator clipboard through `axe clipboard copy --stdin`, also via a daemon-owned scratch file as stdin, then sends Cmd+V. It is never an argument.
 - Every AXe and simctl command, the stream included, runs through `Runner` as the user's account.
 
 ### The page

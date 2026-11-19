@@ -123,6 +123,7 @@ impl Devices for FakeDevices {
             }
             UiInput::Type { text_file } => self.note(format!("type {}", std::fs::read_to_string(text_file)?)),
             UiInput::Key(k) => self.note(format!("key {k}")),
+            UiInput::KeyCombo { modifiers, key } => self.note(format!("key-combo {modifiers:?}+{key}")),
             other => self.note(format!("{other:?}")),
         }
         Ok(())
