@@ -146,6 +146,9 @@ pub struct ConfigureArgs {
     /// React Native debug builds: where the app loads its JavaScript bundle from (the
     /// `RCT_jsLocation` default). Relaunch the app afterwards.
     pub react_native_bundler: Option<Bundler>,
+    /// Text to put on the simulator pasteboard (clipboard). The user or agent can then long-press
+    /// Paste in any text field.
+    pub pasteboard: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -526,14 +529,32 @@ impl SeijiMcp {
                 let bundle_id = self.pool.app_or_default(&user, lease, b.bundle_id)?;
                 ops.push(DeviceOp::Bundler { bundle_id, location: b.location });
             }
+            let mut scratch = None;
+            if let Some(text) = args.pasteboard {
+                if text.is_empty() || text.len() > MAX_TEXT {
+                    anyhow::bail!("pasteboard text must be 1-{MAX_TEXT} bytes");
+                }
+                let file = self.pool.config.data_dir.join("run").join(format!("{}.txt", uuid::Uuid::new_v4().simple()));
+                std::fs::write(&file, &text)?;
+                scratch = Some(file.clone());
+                ops.push(DeviceOp::Pasteboard { text_file: file });
+            }
             if ops.is_empty() {
                 anyhow::bail!("nothing to configure");
             }
             let mut done = Vec::new();
             for op in ops {
                 let name = op.name();
-                self.pool.device_op(&user, lease, op).await.context(name)?;
+                let result = self.pool.device_op(&user, lease, op).await.context(name);
+                if let Some(f) = &scratch {
+                    let _ = std::fs::remove_file(f);
+                    scratch = None;
+                }
+                result?;
                 done.push(name);
+            }
+            if let Some(f) = scratch {
+                let _ = std::fs::remove_file(f);
             }
             anyhow::Ok(format!("applied: {}", done.join(", ")))
         }

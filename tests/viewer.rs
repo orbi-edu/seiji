@@ -107,9 +107,12 @@ async fn viewers_share_one_stream_until_the_lease_ends() {
         s1.headers()["content-type"].to_str().unwrap().starts_with("multipart/x-mixed-replace; boundary=seijiframe")
     );
     let first = tokio::time::timeout(Duration::from_secs(2), s1.chunk()).await.unwrap().unwrap().unwrap();
+    let first_str = String::from_utf8_lossy(&first);
     assert!(
-        first.starts_with(b"--seijiframe\r\nContent-Type: image/jpeg\r\nContent-Length: 5\r\n\r\n\xff\xd8"),
-        "{first:?}"
+        first_str.contains("--seijiframe\r\n")
+            && first_str.contains("Content-Type: image/jpeg")
+            && first_str.contains("X-Capture-Time:"),
+        "{first_str}"
     );
     let s2 = b.get("stream").await;
     assert_eq!(s2.status(), 200);
@@ -177,4 +180,67 @@ async fn agents_share_a_view_only_link() {
     assert_eq!(link["control"], false);
     let opened = http().get(format!("{}{}", env.url, link["url"].as_str().unwrap())).send().await.unwrap();
     assert_eq!(opened.status(), 303);
+}
+
+#[tokio::test]
+async fn paste_puts_text_on_pasteboard_and_respects_guards() {
+    let env = setup(2).await;
+    let (token, lease) = device(&env, "alice").await;
+    let ctrl = open(&env, &token, &lease, true).await;
+    let watcher = open(&env, &token, &lease, false).await;
+
+    // Paste to pasteboard.
+    assert_eq!(ctrl.input(json!({"kind": "paste", "text": "hello clipboard"})).await.status(), 204);
+    assert!(env.fake.log().iter().any(|l| l.contains("pasteboard:hello clipboard")), "{:?}", env.fake.log());
+
+    // Paste and type goes through the typing path.
+    assert_eq!(ctrl.input(json!({"kind": "paste_and_type", "text": "typed text"})).await.status(), 204);
+    assert!(env.fake.log().iter().any(|l| l == "type typed text"), "{:?}", env.fake.log());
+
+    // View-only cannot paste.
+    assert_eq!(watcher.input(json!({"kind": "paste", "text": "no"})).await.status(), 403);
+
+    // Empty or over-limit text fails.
+    assert_eq!(ctrl.input(json!({"kind": "paste", "text": ""})).await.status(), 400);
+    let big = "x".repeat(10_001);
+    assert_eq!(ctrl.input(json!({"kind": "paste", "text": big})).await.status(), 400);
+}
+
+#[tokio::test]
+async fn stats_endpoint_returns_stream_data() {
+    let env = setup_with(2, json!({"viewer": {"fps": 20}})).await;
+    let (token, lease) = device(&env, "alice").await;
+    let view = open(&env, &token, &lease, false).await;
+
+    // Start the stream so the hub exists.
+    let mut stream = view.get("stream").await;
+    assert_eq!(stream.status(), 200);
+    // Read at least one frame.
+    let _ = tokio::time::timeout(Duration::from_secs(2), stream.chunk()).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let stats: Value = view.get("stats").await.json().await.unwrap();
+    assert!(stats["stream"]["total_frames"].as_u64().unwrap() > 0, "{stats}");
+    assert!(stats["stream"]["fps"].as_f64().unwrap() > 0.0, "{stats}");
+    assert_eq!(stats["preset"], "balanced");
+    assert!(stats["opts"]["fps"].as_u64().is_some());
+    assert!(stats["opts"]["scale"].as_f64().is_some());
+
+    // Without a session the endpoint fails.
+    assert_eq!(http().get(format!("{}stats", view.base)).send().await.unwrap().status(), 401);
+}
+
+#[tokio::test]
+async fn configure_device_sets_pasteboard() {
+    let env = setup(1).await;
+    let (token, _lease) = device(&env, "alice").await;
+    let c = client(&env, &token).await;
+    let r = call(&c, "configure_device", json!({"pasteboard": "agent text"})).await;
+    assert!(!is_err(&r), "{}", text(&r));
+    assert!(text(&r).contains("pasteboard"), "{}", text(&r));
+    assert!(env.fake.log().iter().any(|l| l.contains("pasteboard:agent text")), "{:?}", env.fake.log());
+
+    // Empty pasteboard fails.
+    let r2 = call(&c, "configure_device", json!({"pasteboard": ""})).await;
+    assert!(is_err(&r2));
 }

@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -30,7 +31,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::actions::{HwButton, SwipeArgs, TapArgs};
 use crate::config::Platform;
-use crate::devices::{DeviceCtx, StreamOpts, UiInput};
+use crate::devices::{DeviceCtx, DeviceOp, Frame, StreamOpts, UiInput};
 use crate::pool::{LeaseRuntime, Pool};
 use crate::store::{Lease, LeaseStatus, User, now};
 
@@ -39,6 +40,8 @@ const COOKIE: &str = "seiji_view";
 const BOUNDARY: &str = "seijiframe";
 /// A watched lease counts as used: the stream touches it this often.
 const TOUCH_EVERY: Duration = Duration::from_secs(60);
+/// How often the stream logs its stats for the operator.
+const STATS_LOG_EVERY: Duration = Duration::from_secs(30);
 const MAX_TEXT: usize = 10_000;
 /// How long input waits for the device before it answers busy.
 const INPUT_WAIT: Duration = Duration::from_secs(1);
@@ -62,9 +65,41 @@ struct Session {
     expires: i64,
 }
 
+/// Per-stream counters updated by a stats subscriber on the watch channel.
+struct StreamStats {
+    started_at_ms: i64,
+    frame_count: AtomicU64,
+    frame_bytes: AtomicU64,
+    last_frame_at_ms: AtomicI64,
+}
+
+/// A quality preset the viewer page can pick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamPreset {
+    Smooth,
+    Balanced,
+    Sharp,
+}
+
+impl StreamPreset {
+    fn opts(self, cfg: &crate::config::Viewer) -> StreamOpts {
+        match self {
+            StreamPreset::Smooth => StreamOpts { fps: 15, scale: 0.3, quality: 50 },
+            StreamPreset::Balanced => StreamOpts { fps: cfg.fps, scale: cfg.scale, quality: cfg.quality },
+            StreamPreset::Sharp => StreamOpts { fps: 5, scale: 0.8, quality: 85 },
+        }
+    }
+}
+
 struct Hub {
-    tx: watch::Sender<Option<Bytes>>,
+    tx: watch::Sender<Option<Frame>>,
     cancel: CancellationToken,
+    /// Cancels only the current AXe stream; a child of `cancel`.  Replaced on each restart.
+    stream_cancel: StdMutex<CancellationToken>,
+    opts: StdMutex<StreamOpts>,
+    preset: StdMutex<StreamPreset>,
+    stats: Arc<StreamStats>,
 }
 
 /// Tickets, sessions and the one stream per lease. In memory: a restart ends every lease, and
@@ -102,6 +137,10 @@ fn random_hex(bytes: usize) -> String {
 
 fn sha256_hex(s: &str) -> String {
     hex::encode(Sha256::digest(s.as_bytes()))
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as i64
 }
 
 /// Why a viewer request failed, as the page sees it.
@@ -304,6 +343,15 @@ pub enum ViewerInput {
     Button {
         name: HwButton,
     },
+    /// Put text on the simulator pasteboard (clipboard) via `simctl pbcopy`. The user can then
+    /// long-press Paste in the app.
+    Paste {
+        text: String,
+    },
+    /// Type the text character by character (like `Type`), for fields that refuse paste.
+    PasteAndType {
+        text: String,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -342,37 +390,53 @@ impl Pool {
         // than interleave with a run's steps.
         let _op = tokio::time::timeout(INPUT_WAIT, rt.op.clone().lock_owned()).await.map_err(|_| ViewError::Busy)?;
         let mut scratch = None;
-        let input = match req.input {
-            ViewerInput::Tap { x, y, hold } => {
-                let (w, h) = self.screen_points(&ctx, &rt, req.aspect).await?;
-                let hold = hold.filter(|s| *s >= 0.35).map(|s| s.min(10.0));
-                UiInput::Tap(tap(unit(x)? * w, unit(y)? * h, hold))
-            }
-            ViewerInput::Swipe { x1, y1, x2, y2, duration } => {
-                let (w, h) = self.screen_points(&ctx, &rt, req.aspect).await?;
-                UiInput::Swipe(SwipeArgs {
-                    from: [unit(x1)? * w, unit(y1)? * h],
-                    to: [unit(x2)? * w, unit(y2)? * h],
-                    duration_seconds: Some(duration.unwrap_or(0.3).clamp(0.05, 5.0)),
-                })
-            }
-            ViewerInput::Type { text } => {
+        // Paste goes through `simctl pbcopy`; everything else goes through AXe.
+        let result = match req.input {
+            ViewerInput::Paste { text } => {
                 if text.is_empty() || text.len() > MAX_TEXT {
                     return Err(ViewError::Bad(format!("text must be 1-{MAX_TEXT} bytes")));
                 }
                 let file = self.config.data_dir.join("run").join(format!("{}.txt", uuid::Uuid::new_v4().simple()));
-                std::fs::write(&file, text).context("writing typed text")?;
+                std::fs::write(&file, &text).context("writing pasteboard text")?;
                 scratch = Some(file.clone());
-                UiInput::Type { text_file: file }
+                self.devices.device_op(&ctx, &DeviceOp::Pasteboard { text_file: file }).await.map(|_| ())
             }
-            ViewerInput::Key { code } => UiInput::Key(code),
-            ViewerInput::Button { name } => UiInput::Button(name),
+            other => {
+                let input = match other {
+                    ViewerInput::Tap { x, y, hold } => {
+                        let (w, h) = self.screen_points(&ctx, &rt, req.aspect).await?;
+                        let hold = hold.filter(|s| *s >= 0.35).map(|s| s.min(10.0));
+                        UiInput::Tap(tap(unit(x)? * w, unit(y)? * h, hold))
+                    }
+                    ViewerInput::Swipe { x1, y1, x2, y2, duration } => {
+                        let (w, h) = self.screen_points(&ctx, &rt, req.aspect).await?;
+                        UiInput::Swipe(SwipeArgs {
+                            from: [unit(x1)? * w, unit(y1)? * h],
+                            to: [unit(x2)? * w, unit(y2)? * h],
+                            duration_seconds: Some(duration.unwrap_or(0.3).clamp(0.05, 5.0)),
+                        })
+                    }
+                    ViewerInput::Type { text } | ViewerInput::PasteAndType { text } => {
+                        if text.is_empty() || text.len() > MAX_TEXT {
+                            return Err(ViewError::Bad(format!("text must be 1-{MAX_TEXT} bytes")));
+                        }
+                        let file =
+                            self.config.data_dir.join("run").join(format!("{}.txt", uuid::Uuid::new_v4().simple()));
+                        std::fs::write(&file, text).context("writing typed text")?;
+                        scratch = Some(file.clone());
+                        UiInput::Type { text_file: file }
+                    }
+                    ViewerInput::Key { code } => UiInput::Key(code),
+                    ViewerInput::Button { name } => UiInput::Button(name),
+                    ViewerInput::Paste { .. } => unreachable!(),
+                };
+                self.devices.ui(&ctx, &input).await
+            }
         };
-        let sent = self.devices.ui(&ctx, &input).await;
         if let Some(f) = scratch {
             let _ = std::fs::remove_file(f);
         }
-        sent?;
+        result?;
         self.store.touch_lease(&v.lease.id, now())?;
         Ok(())
     }
@@ -381,14 +445,15 @@ impl Pool {
 // ---- stream ----
 
 /// Subscribes to the lease's frames, starting its stream when it is the first viewer.
-fn subscribe(pool: &Arc<Pool>, v: &Viewing) -> Result<watch::Receiver<Option<Bytes>>, ViewError> {
+fn subscribe(pool: &Arc<Pool>, v: &Viewing) -> Result<watch::Receiver<Option<Frame>>, ViewError> {
     let (ctx, rt) = pool.viewer_ctx(v)?;
     let max = pool.config.viewer.max_viewers_per_lease;
     let mut hubs = pool.viewers.hubs.lock().expect("hubs mutex");
     if let Some(hub) = hubs.get(&v.lease.id)
         && !hub.cancel.is_cancelled()
     {
-        if hub.tx.receiver_count() >= max {
+        // Count only external subscribers (exclude the stats watcher).
+        if hub.tx.receiver_count() > max {
             return Err(ViewError::Full(max));
         }
         let mut rx = hub.tx.subscribe();
@@ -396,20 +461,73 @@ fn subscribe(pool: &Arc<Pool>, v: &Viewing) -> Result<watch::Receiver<Option<Byt
         return Ok(rx);
     }
     let (tx, rx) = watch::channel(None);
-    let hub = Arc::new(Hub { tx, cancel: rt.cancel.child_token() });
+    let initial_cancel = rt.cancel.child_token();
+    let initial_opts = StreamPreset::Balanced.opts(&pool.config.viewer);
+    let stats = Arc::new(StreamStats {
+        started_at_ms: now_ms(),
+        frame_count: AtomicU64::new(0),
+        frame_bytes: AtomicU64::new(0),
+        last_frame_at_ms: AtomicI64::new(0),
+    });
+    let hub = Arc::new(Hub {
+        tx,
+        cancel: initial_cancel,
+        stream_cancel: StdMutex::new(rt.cancel.child_token()),
+        opts: StdMutex::new(initial_opts),
+        preset: StdMutex::new(StreamPreset::Balanced),
+        stats: stats.clone(),
+    });
     hubs.insert(v.lease.id.clone(), hub.clone());
     drop(hubs);
 
-    // Ends the stream when the last viewer leaves; keeps a watched lease from idling out.
+    // Stats subscriber: counts every frame that reaches the watch channel.
+    let mut stats_rx = hub.tx.subscribe();
+    let stats_for_watcher = stats.clone();
+    tokio::spawn(async move {
+        while stats_rx.changed().await.is_ok() {
+            let frame = stats_rx.borrow_and_update().clone();
+            if let Some(f) = frame {
+                stats_for_watcher.frame_count.fetch_add(1, Ordering::Relaxed);
+                stats_for_watcher.frame_bytes.fetch_add(f.jpeg.len() as u64, Ordering::Relaxed);
+                stats_for_watcher.last_frame_at_ms.store(f.captured_at_ms, Ordering::Relaxed);
+            }
+        }
+    });
+
+    // Ends the stream when the last viewer leaves; keeps a watched lease from idling out;
+    // logs stats every 30 s.
     let watcher = hub.clone();
     let (store, lease_id) = (pool.store.clone(), v.lease.id.clone());
+    let lease_id2 = lease_id.clone();
     tokio::spawn(async move {
+        let mut touch = tokio::time::interval(TOUCH_EVERY);
+        let mut log = tokio::time::interval(STATS_LOG_EVERY);
+        touch.tick().await;
+        log.tick().await;
         loop {
             tokio::select! {
                 _ = watcher.tx.closed() => break,
                 _ = watcher.cancel.cancelled() => break,
-                _ = tokio::time::sleep(TOUCH_EVERY) => {
+                _ = touch.tick() => {
                     let _ = store.touch_lease(&lease_id, now());
+                }
+                _ = log.tick() => {
+                    let st = &watcher.stats;
+                    let count = st.frame_count.load(Ordering::Relaxed);
+                    let bytes = st.frame_bytes.load(Ordering::Relaxed);
+                    // Subtract 1 for the stats watcher itself.
+                    let subscribers = watcher.tx.receiver_count().saturating_sub(1);
+                    let elapsed_s = (now_ms() - st.started_at_ms).max(1) as f64 / 1000.0;
+                    let fps = count as f64 / elapsed_s;
+                    let mean_bytes = if count > 0 { bytes / count } else { 0 };
+                    tracing::info!(
+                        lease = %lease_id2,
+                        capture_fps = format!("{fps:.1}"),
+                        mean_frame_bytes = mean_bytes,
+                        total_frames = count,
+                        subscribers,
+                        "stream stats"
+                    );
                 }
             }
         }
@@ -419,10 +537,11 @@ fn subscribe(pool: &Arc<Pool>, v: &Viewing) -> Result<watch::Receiver<Option<Byt
     let pool = pool.clone();
     let lease_id = v.lease.id.clone();
     tokio::spawn(async move {
-        let cfg = &pool.config.viewer;
-        let opts = StreamOpts { fps: cfg.fps, scale: cfg.scale, quality: cfg.quality };
         while !hub.cancel.is_cancelled() {
-            if let Err(e) = pool.devices.stream(&ctx, &opts, &hub.tx, &hub.cancel).await {
+            let opts = *hub.opts.lock().expect("opts mutex");
+            let sc = hub.cancel.child_token();
+            *hub.stream_cancel.lock().expect("stream_cancel mutex") = sc.clone();
+            if let Err(e) = pool.devices.stream(&ctx, &opts, &hub.tx, &sc).await {
                 tracing::warn!(lease = %lease_id, "screen stream: {e:#}");
             }
             // The stream process ended on its own: start it again while someone watches.
@@ -439,12 +558,15 @@ fn subscribe(pool: &Arc<Pool>, v: &Viewing) -> Result<watch::Receiver<Option<Byt
     Ok(rx)
 }
 
-fn part(frame: &[u8]) -> Bytes {
-    let mut out = Vec::with_capacity(frame.len() + 96);
-    out.extend_from_slice(
-        format!("--{BOUNDARY}\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n", frame.len()).as_bytes(),
+fn part(frame: &Frame) -> Bytes {
+    let hdr = format!(
+        "--{BOUNDARY}\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\nX-Capture-Time: {}\r\n\r\n",
+        frame.jpeg.len(),
+        frame.captured_at_ms
     );
-    out.extend_from_slice(frame);
+    let mut out = Vec::with_capacity(hdr.len() + frame.jpeg.len() + 2);
+    out.extend_from_slice(hdr.as_bytes());
+    out.extend_from_slice(&frame.jpeg);
     out.extend_from_slice(b"\r\n");
     Bytes::from(out)
 }
@@ -529,7 +651,16 @@ async fn info(
     let v = pool.viewing(&sid, &headers)?;
     let (_, rt) = pool.viewer_ctx(&v)?;
     let model = pool.config.ios.as_ref().and_then(|i| i.models.get(&v.lease.model));
-    let viewers = pool.viewers.hubs.lock().expect("hubs mutex").get(&v.lease.id).map_or(0, |h| h.tx.receiver_count());
+    let hubs = pool.viewers.hubs.lock().expect("hubs mutex");
+    let (viewers, preset, opts) = if let Some(hub) = hubs.get(&v.lease.id) {
+        let viewers = hub.tx.receiver_count().saturating_sub(1); // exclude stats watcher
+        let preset = *hub.preset.lock().expect("preset mutex");
+        let opts = *hub.opts.lock().expect("opts mutex");
+        (viewers, Some(preset), Some(opts))
+    } else {
+        (0, None, None)
+    };
+    drop(hubs);
     let busy = rt.op.try_lock().is_err();
     let mut resp = Json(serde_json::json!({
         "lease_id": v.lease.id,
@@ -543,8 +674,88 @@ async fn info(
         "control": v.control,
         "busy": busy,
         "viewers": viewers,
-        "fps": pool.config.viewer.fps,
+        "fps": opts.map_or(pool.config.viewer.fps, |o| o.fps),
         "app": rt.app.lock().expect("app mutex").clone(),
+        "preset": preset,
+        "stream_opts": opts.map(|o| serde_json::json!({"fps": o.fps, "scale": o.scale, "quality": o.quality})),
+        // Lets the page correct `X-Capture-Time` for its own clock when it shows a frame's age.
+        "server_time_ms": now_ms(),
+    }))
+    .into_response();
+    no_store(resp.headers_mut());
+    Ok(resp)
+}
+
+async fn stats(
+    State(pool): State<Arc<Pool>>,
+    Path(sid): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response, ViewError> {
+    let v = pool.viewing(&sid, &headers)?;
+    let hubs = pool.viewers.hubs.lock().expect("hubs mutex");
+    let hub = hubs.get(&v.lease.id).ok_or_else(|| ViewError::Gone("No active stream.".into()))?;
+    let st = &hub.stats;
+    let started_at_ms = st.started_at_ms;
+    let count = st.frame_count.load(Ordering::Relaxed);
+    let bytes = st.frame_bytes.load(Ordering::Relaxed);
+    let subscribers = hub.tx.receiver_count().saturating_sub(1);
+    let last_frame_ms = st.last_frame_at_ms.load(Ordering::Relaxed);
+    let preset = *hub.preset.lock().expect("preset mutex");
+    let opts = *hub.opts.lock().expect("opts mutex");
+    drop(hubs);
+    let elapsed_s = (now_ms() - started_at_ms).max(1) as f64 / 1000.0;
+    let fps = count as f64 / elapsed_s;
+    let mean_bytes = if count > 0 { bytes / count } else { 0 };
+    let mut resp = Json(serde_json::json!({
+        "stream": {
+            "started_at_ms": started_at_ms,
+            "fps": (fps * 10.0).round() / 10.0,
+            "mean_frame_bytes": mean_bytes,
+            "total_frames": count,
+            "total_bytes": bytes,
+            "subscribers": subscribers,
+            "last_frame_at_ms": last_frame_ms,
+        },
+        "preset": preset,
+        "opts": {"fps": opts.fps, "scale": opts.scale, "quality": opts.quality},
+    }))
+    .into_response();
+    no_store(resp.headers_mut());
+    Ok(resp)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PresetRequest {
+    preset: StreamPreset,
+}
+
+async fn preset(
+    State(pool): State<Arc<Pool>>,
+    Path(sid): Path<String>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Response, ViewError> {
+    if headers.get("x-seiji-view").and_then(|v| v.to_str().ok()) != Some("1") {
+        return Err(ViewError::Bad("missing X-Seiji-View header".into()));
+    }
+    let v = pool.viewing(&sid, &headers)?;
+    if !v.control {
+        return Err(ViewError::ViewOnly);
+    }
+    let req: PresetRequest =
+        serde_json::from_slice(&body).map_err(|e| ViewError::Bad(format!("invalid preset: {e}")))?;
+    let new_opts = req.preset.opts(&pool.config.viewer);
+    let hubs = pool.viewers.hubs.lock().expect("hubs mutex");
+    let hub = hubs.get(&v.lease.id).ok_or_else(|| ViewError::Gone("No active stream.".into()))?;
+    *hub.opts.lock().expect("opts mutex") = new_opts;
+    *hub.preset.lock().expect("preset mutex") = req.preset;
+    // Cancel only the AXe stream; the spawn loop will restart with the new opts.
+    hub.stream_cancel.lock().expect("stream_cancel mutex").cancel();
+    drop(hubs);
+    let mut resp = Json(serde_json::json!({
+        "preset": req.preset,
+        "opts": {"fps": new_opts.fps, "scale": new_opts.scale, "quality": new_opts.quality},
     }))
     .into_response();
     no_store(resp.headers_mut());
@@ -623,7 +834,9 @@ pub fn routes() -> Router<Arc<Pool>> {
         .route("/view/assets/{name}", get(asset))
         .route("/view/s/{sid}/", get(page))
         .route("/view/s/{sid}/info", get(info))
+        .route("/view/s/{sid}/stats", get(stats))
         .route("/view/s/{sid}/stream", get(stream))
         .route("/view/s/{sid}/input", post(input))
+        .route("/view/s/{sid}/preset", post(preset))
         .route("/view/s/{sid}/screenshot.jpg", get(screenshot))
 }

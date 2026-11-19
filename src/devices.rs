@@ -18,6 +18,7 @@ use crate::actions::{HwButton, ScrollArgs, SwipeArgs, TapArgs};
 use crate::config::{Config, Platform};
 use crate::exec::{Account, CmdSpec, Job, Runner, tail};
 use crate::ios;
+use bytes::Bytes;
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 
@@ -55,6 +56,14 @@ pub struct InstalledApp {
     /// iOS `CFBundleExecutable`: the process name in logs and crash reports.
     pub executable: Option<String>,
     pub version: Option<String>,
+}
+
+/// A screen frame with its server-side capture timestamp.
+#[derive(Clone, Debug)]
+pub struct Frame {
+    pub jpeg: Bytes,
+    /// Unix milliseconds when the daemon received the frame from the capture process.
+    pub captured_at_ms: i64,
 }
 
 /// One input sent to the screen (AXe on iOS).
@@ -217,6 +226,10 @@ pub enum DeviceOp {
         bundle_id: String,
         location: Option<String>,
     },
+    /// Text placed on the simulator pasteboard via `simctl pbcopy`.
+    Pasteboard {
+        text_file: PathBuf,
+    },
 }
 
 impl DeviceOp {
@@ -233,6 +246,7 @@ impl DeviceOp {
             DeviceOp::Push { .. } => "push_notification",
             DeviceOp::LogShow { .. } => "get_logs",
             DeviceOp::Bundler { .. } => "react_native_bundler",
+            DeviceOp::Pasteboard { .. } => "pasteboard",
         }
     }
 }
@@ -313,7 +327,7 @@ pub trait Devices: Send + Sync {
         &self,
         ctx: &DeviceCtx,
         opts: &StreamOpts,
-        frames: &tokio::sync::watch::Sender<Option<bytes::Bytes>>,
+        frames: &tokio::sync::watch::Sender<Option<Frame>>,
         cancel: &CancellationToken,
     ) -> Result<()>;
 }
@@ -764,14 +778,14 @@ impl Devices for HostDevices {
         &self,
         ctx: &DeviceCtx,
         opts: &StreamOpts,
-        frames: &tokio::sync::watch::Sender<Option<bytes::Bytes>>,
+        frames: &tokio::sync::watch::Sender<Option<Frame>>,
         cancel: &CancellationToken,
     ) -> Result<()> {
         use tokio::io::AsyncReadExt;
         self.ios_only(ctx, "the screen viewer")?;
         let spec = ios::axe_stream(&self.config.axe, ctx.device_id()?, opts);
         let (mut job, mut stdout) = self.runner.spawn_piped(&ctx.account, spec)?;
-        // AXe's `raw` format: a 4-byte big-endian length, then one JPEG.
+        let mut last_frame: Option<Vec<u8>> = None;
         let read = async {
             loop {
                 let mut len = [0u8; 4];
@@ -786,7 +800,15 @@ impl Devices for HostDevices {
                 }
                 let mut frame = vec![0u8; len];
                 stdout.read_exact(&mut frame).await?;
-                frames.send_replace(Some(bytes::Bytes::from(frame)));
+                // Skip identical frames (static screen) to save bandwidth.
+                if last_frame.as_deref() == Some(frame.as_slice()) {
+                    continue;
+                }
+                last_frame = Some(frame.clone());
+                let captured_at_ms =
+                    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis()
+                        as i64;
+                frames.send_replace(Some(Frame { jpeg: Bytes::from(frame), captured_at_ms }));
             }
         };
         let result = tokio::select! {

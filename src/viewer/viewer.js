@@ -1,6 +1,6 @@
-// Seiji's screen viewer: shows the simulator's MJPEG stream and turns pointer, wheel and keyboard
-// input into taps, swipes and typing. Every request is same-origin under the session path, with
-// the session cookie; input also carries `X-Seiji-View: 1`.
+// Seiji's screen viewer: shows the simulator's MJPEG stream parsed with fetch() and turns
+// pointer, wheel and keyboard input into taps, swipes and typing.  Every request is same-origin
+// under the session path, with the session cookie; input also carries `X-Seiji-View: 1`.
 "use strict";
 
 (() => {
@@ -10,7 +10,9 @@
   const veil = $("veil");
   const veilText = $("veil-text");
   const note = $("note");
+  const statsOverlay = $("stats-overlay");
   let info = null;
+  let clockOffset = 0;
   let ended = false;
   let control = false;
 
@@ -65,7 +67,10 @@
     if (ended) return;
     let resp;
     try {
+      const sent = Date.now();
       resp = await fetch("info", { cache: "no-store" });
+      resp.sentAt = sent;
+      resp.gotAt = Date.now();
     } catch {
       $("dot").className = "dot off";
       return;
@@ -76,6 +81,10 @@
     }
     if (!resp.ok) return;
     info = await resp.json();
+    // Server clock minus browser clock, taken at the middle of the round trip.
+    if (typeof info.server_time_ms === "number" && resp.sentAt) {
+      clockOffset = info.server_time_ms - (resp.sentAt + resp.gotAt) / 2;
+    }
     control = !!info.control;
     // com.apple.CoreSimulator.SimRuntime.iOS-18-2 → iOS 18.2
     const runtime = (info.runtime || "")
@@ -93,27 +102,165 @@
     $("keys").hidden = !control;
     $("dot").className = "dot " + (info.busy ? "busy" : "live");
     showNote(info.busy && control ? busyText : "");
+    if (info.preset) {
+      $("preset").value = info.preset;
+    }
   }
 
-  // ── stream ─────────────────────────────────────────────────────────────
+  // ── stream (fetch-based multipart reader) ──────────────────────────────
 
   let retry = 0;
-  function connect() {
-    if (ended) return;
-    frame.src = `stream?t=${Date.now()}`;
+  let prevBlobUrl = null;
+  let statsFrames = []; // {size, time, captureTime}
+  let statsOn = false;
+  let statsTimer = 0;
+
+  function concat(a, b) {
+    const c = new Uint8Array(a.length + b.length);
+    c.set(a);
+    c.set(b, a.length);
+    return c;
   }
-  frame.addEventListener("load", () => {
+
+  function indexOf(buf, needle, from) {
+    from = from || 0;
+    outer: for (let i = from; i <= buf.length - needle.length; i++) {
+      for (let j = 0; j < needle.length; j++) {
+        if (buf[i + j] !== needle[j]) continue outer;
+      }
+      return i;
+    }
+    return -1;
+  }
+
+  const ENC = new TextEncoder();
+  const DEC = new TextDecoder();
+  const BOUNDARY = ENC.encode("--seijiframe\r\n");
+  const HEADER_END = ENC.encode("\r\n\r\n");
+
+  function displayFrame(jpeg, captureTime) {
+    const blob = new Blob([jpeg], { type: "image/jpeg" });
+    const url = URL.createObjectURL(blob);
+    frame.src = url;
+    if (prevBlobUrl) URL.revokeObjectURL(prevBlobUrl);
+    prevBlobUrl = url;
     veil.hidden = true;
+
+    const now = Date.now();
+    statsFrames.push({ size: jpeg.byteLength, time: now, captureTime });
+    if (statsFrames.length > 120) statsFrames.splice(0, statsFrames.length - 120);
     retry = 0;
-  });
-  frame.addEventListener("error", () => {
+  }
+
+  async function connect() {
+    if (ended) return;
+    veilText.textContent = "Connecting…";
+    let resp;
+    try {
+      resp = await fetch("stream", { cache: "no-store" });
+    } catch {
+      scheduleReconnect();
+      return;
+    }
+    if (!resp.ok || !resp.body) {
+      if (resp.status === 401 || resp.status === 410) {
+        end((await errorOf(resp)).message || "The viewer closed.");
+        return;
+      }
+      scheduleReconnect();
+      return;
+    }
+    const reader = resp.body.getReader();
+    let buf = new Uint8Array(0);
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf = concat(buf, value);
+        // Parse as many complete parts as possible.
+        while (true) {
+          const bIdx = indexOf(buf, BOUNDARY);
+          if (bIdx === -1) break;
+          const afterBoundary = bIdx + BOUNDARY.length;
+          const hEnd = indexOf(buf, HEADER_END, afterBoundary);
+          if (hEnd === -1) break;
+          const headerText = DEC.decode(buf.subarray(afterBoundary, hEnd));
+          const bodyStart = hEnd + 4;
+          // Parse headers.
+          let contentLength = -1;
+          let captureTime = 0;
+          for (const line of headerText.split("\r\n")) {
+            const colon = line.indexOf(": ");
+            if (colon === -1) continue;
+            const k = line.substring(0, colon).toLowerCase();
+            const v = line.substring(colon + 2);
+            if (k === "content-length") contentLength = parseInt(v, 10);
+            else if (k === "x-capture-time") captureTime = parseInt(v, 10);
+          }
+          if (contentLength < 0 || buf.length < bodyStart + contentLength + 2) break;
+          const jpeg = buf.subarray(bodyStart, bodyStart + contentLength);
+          displayFrame(jpeg, captureTime);
+          buf = buf.subarray(bodyStart + contentLength + 2);
+        }
+        // Prevent unbounded buffering: if buf is very large, something is wrong.
+        if (buf.length > 16 * 1024 * 1024) buf = new Uint8Array(0);
+      }
+    } catch {
+      // stream broken
+    }
+    if (!ended) scheduleReconnect();
+  }
+
+  function scheduleReconnect() {
     if (ended) return;
     veil.hidden = false;
     veilText.textContent = "Reconnecting…";
     refresh();
     retry = Math.min(retry + 1, 5);
     setTimeout(connect, 600 * retry);
-  });
+  }
+
+  // ── stats overlay ──────────────────────────────────────────────────────
+
+  function renderStats() {
+    if (!statsOn || !statsOverlay) return;
+    const now = Date.now();
+    const oneSecAgo = now - 1000;
+    const recent = statsFrames.filter(f => f.time > oneSecAgo);
+    const fps = recent.length;
+    const last = statsFrames[statsFrames.length - 1];
+    const prev = statsFrames.length >= 2 ? statsFrames[statsFrames.length - 2] : null;
+    const gap = prev ? now - prev.time : 0;
+    const meanSize = statsFrames.length > 0 ? statsFrames.reduce((s, f) => s + f.size, 0) / statsFrames.length : 0;
+    const recentBytes = recent.reduce((s, f) => s + f.size, 0);
+    const bitrate = recentBytes * 8;
+    // A frame's age on the server's clock: capture → now, both in server time.
+    const age = last && last.captureTime > 0 ? Math.round(last.time + clockOffset - last.captureTime) : null;
+    const stalled = gap > 2000;
+    const res = frame.naturalWidth && frame.naturalHeight ? `${frame.naturalWidth}×${frame.naturalHeight}` : "—";
+    const lines = [
+      `FPS: ${fps}`,
+      `Frame: ${(meanSize / 1024).toFixed(1)} KiB`,
+      `Bitrate: ${(bitrate / 1e6).toFixed(2)} Mbit/s`,
+      `Resolution: ${res}`,
+      `Gap: ${gap} ms`,
+    ];
+    if (age !== null) lines.push(`Age: ${age} ms`);
+    if (stalled) lines.push("⚠ STALLED");
+    statsOverlay.textContent = lines.join("\n");
+  }
+
+  function toggleStats() {
+    statsOn = !statsOn;
+    statsOverlay.hidden = !statsOn;
+    clearInterval(statsTimer);
+    if (statsOn) {
+      renderStats();
+      statsTimer = setInterval(renderStats, 500);
+    }
+  }
+
+  $("stats-btn").addEventListener("click", toggleStats);
 
   // ── input ──────────────────────────────────────────────────────────────
 
@@ -243,6 +390,18 @@
     } else if (ev.metaKey && ev.key.toLowerCase() === "s") {
       ev.preventDefault();
       save();
+    } else if (ev.metaKey && ev.shiftKey && ev.key.toLowerCase() === "v") {
+      ev.preventDefault();
+      flushTyped();
+      doPaste();
+    } else if (ev.key.toLowerCase() === "i" && !ev.metaKey && !ev.ctrlKey && !ev.altKey && !ev.shiftKey) {
+      // Only toggle stats when the screen is focused and no modifier is held,
+      // and only when there is no active text input (no typed buffer).
+      if (typed === "") {
+        ev.preventDefault();
+        toggleStats();
+        return;
+      }
     } else if (ev.metaKey || ev.ctrlKey || ev.altKey) {
       // Leave the browser's own shortcuts alone.
     } else if (KEYS[ev.key]) {
@@ -263,6 +422,75 @@
       ev.preventDefault();
       flushTyped();
       send({ kind: "type", text });
+    }
+  });
+
+  // ── paste ──────────────────────────────────────────────────────────────
+
+  const pasteBox = $("paste-box");
+  const pasteText = $("paste-text");
+
+  async function doPaste() {
+    // Try the Clipboard API first (needs a user gesture and permission).
+    try {
+      const text = await navigator.clipboard.readText();
+      if (text) {
+        send({ kind: "paste", text });
+        flash("Pasted to simulator clipboard.");
+        return;
+      }
+    } catch { /* fall through to the text box */ }
+    // Fall back to showing a text area.
+    pasteBox.hidden = false;
+    pasteText.value = "";
+    pasteText.focus();
+  }
+
+  $("paste").addEventListener("click", doPaste);
+
+  $("paste-send").addEventListener("click", () => {
+    const text = pasteText.value;
+    pasteBox.hidden = true;
+    if (text) {
+      send({ kind: "paste", text });
+      flash("Pasted to simulator clipboard.");
+    }
+    screen.focus();
+  });
+
+  $("paste-type").addEventListener("click", () => {
+    const text = pasteText.value;
+    pasteBox.hidden = true;
+    if (text) {
+      send({ kind: "paste_and_type", text });
+      flash("Typing pasted text…");
+    }
+    screen.focus();
+  });
+
+  $("paste-cancel").addEventListener("click", () => {
+    pasteBox.hidden = true;
+    screen.focus();
+  });
+
+  // ── preset picker ──────────────────────────────────────────────────────
+
+  $("preset").addEventListener("change", async (ev) => {
+    const value = ev.target.value;
+    try {
+      const resp = await fetch("preset", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Seiji-View": "1" },
+        body: JSON.stringify({ preset: value }),
+      });
+      if (resp.ok) {
+        flash(`Preset: ${value}`);
+      } else {
+        const err = await errorOf(resp);
+        flash(err.message || "Could not change preset.", "error");
+      }
+    } catch {
+      flash("Could not reach Seiji.", "error");
     }
   });
 
