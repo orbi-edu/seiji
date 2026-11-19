@@ -519,7 +519,7 @@ fn subscribe(pool: &Arc<Pool>, v: &Viewing) -> Result<watch::Receiver<Option<Fra
                     let subscribers = watcher.tx.receiver_count().saturating_sub(1);
                     let elapsed_s = (now_ms() - st.started_at_ms).max(1) as f64 / 1000.0;
                     let fps = count as f64 / elapsed_s;
-                    let mean_bytes = if count > 0 { bytes / count } else { 0 };
+                    let mean_bytes = bytes.checked_div(count).unwrap_or(0);
                     tracing::info!(
                         lease = %lease_id2,
                         capture_fps = format!("{fps:.1}"),
@@ -705,7 +705,7 @@ async fn stats(
     drop(hubs);
     let elapsed_s = (now_ms() - started_at_ms).max(1) as f64 / 1000.0;
     let fps = count as f64 / elapsed_s;
-    let mean_bytes = if count > 0 { bytes / count } else { 0 };
+    let mean_bytes = bytes.checked_div(count).unwrap_or(0);
     let mut resp = Json(serde_json::json!({
         "stream": {
             "started_at_ms": started_at_ms,
