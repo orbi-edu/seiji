@@ -45,6 +45,9 @@ const STATS_LOG_EVERY: Duration = Duration::from_secs(30);
 const MAX_TEXT: usize = 10_000;
 /// A still screen's last frame is sent again this often (the page flags a stall after 2 s).
 const FRAME_REPEAT: Duration = Duration::from_secs(1);
+/// HID usage codes for Paste: Left Command + V.
+const CMD: u8 = 227;
+const KEY_V: u8 = 25;
 /// How long input waits for the device before it answers busy.
 const INPUT_WAIT: Duration = Duration::from_secs(1);
 
@@ -345,8 +348,8 @@ pub enum ViewerInput {
     Button {
         name: HwButton,
     },
-    /// Put text on the simulator pasteboard (clipboard) via `simctl pbcopy`. The user can then
-    /// long-press Paste in the app.
+    /// Put text on the simulator clipboard (`axe clipboard copy`) and press Cmd+V into the
+    /// focused field; typed instead when the clipboard cannot be set.
     Paste {
         text: String,
     },
@@ -395,7 +398,8 @@ impl Pool {
         let _op = tokio::time::timeout(INPUT_WAIT, rt.op.clone().lock_owned()).await.map_err(|_| ViewError::Busy)?;
         let mut scratch = None;
         let mut via = None;
-        // Paste goes through `simctl pbcopy`; everything else goes through AXe.
+        // Paste puts the text on the device clipboard (AXe) and presses Cmd+V into the focused
+        // field, so any character goes through; everything else goes through AXe input.
         let result = match req.input {
             ViewerInput::Paste { text } => {
                 if text.is_empty() || text.len() > MAX_TEXT {
@@ -406,13 +410,12 @@ impl Pool {
                 scratch = Some(file.clone());
                 match self.devices.device_op(&ctx, &DeviceOp::Pasteboard { text_file: file.clone() }).await {
                     Ok(_) => {
-                        via = Some("pasteboard");
-                        Ok(())
+                        via = Some("pasted");
+                        self.devices.ui(&ctx, &UiInput::KeyCombo { modifiers: vec![CMD], key: KEY_V }).await
                     }
-                    // Under `os_user` isolation the tenant has no login session, and
-                    // `simctl pbcopy` crashes without one: type the text into the focused field.
+                    // Without a clipboard, type it: US keyboard characters only.
                     Err(e) => {
-                        tracing::warn!(lease = %v.lease.id, error = %e, "pasteboard unavailable, typing instead");
+                        tracing::warn!(lease = %v.lease.id, error = %e, "clipboard unavailable, typing instead");
                         via = Some("typed");
                         self.devices.ui(&ctx, &UiInput::Type { text_file: file }).await
                     }

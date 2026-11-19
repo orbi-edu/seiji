@@ -288,8 +288,8 @@
     if (resp.status === 200 && input.kind === "paste") {
       const out = await resp.json().catch(() => ({}));
       flash(out.via === "typed"
-        ? "Typed into the focused field (this device's clipboard is not reachable)."
-        : "On the simulator clipboard: long-press a field and choose Paste.");
+        ? "Typed into the focused field (the device clipboard is not reachable; US keyboard characters only)."
+        : "Pasted into the focused field.");
       return;
     }
     if (resp.ok) return;

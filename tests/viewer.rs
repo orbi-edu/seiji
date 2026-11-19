@@ -210,11 +210,13 @@ async fn paste_puts_text_on_pasteboard_and_respects_guards() {
     let ctrl = open(&env, &token, &lease, true).await;
     let watcher = open(&env, &token, &lease, false).await;
 
-    // Paste to pasteboard.
-    let pasted = ctrl.input(json!({"kind": "paste", "text": "hello clipboard"})).await;
+    // Paste: the device clipboard, then Cmd+V into the focused field.
+    let pasted = ctrl.input(json!({"kind": "paste", "text": "olá clipboard"})).await;
     assert_eq!(pasted.status(), 200);
-    assert_eq!(pasted.json::<serde_json::Value>().await.unwrap(), json!({"via": "pasteboard"}));
-    assert!(env.fake.log().iter().any(|l| l.contains("pasteboard:hello clipboard")), "{:?}", env.fake.log());
+    assert_eq!(pasted.json::<serde_json::Value>().await.unwrap(), json!({"via": "pasted"}));
+    let log = env.fake.log();
+    let at = log.iter().position(|l| l.ends_with("pasteboard:olá clipboard")).expect("clipboard set");
+    assert_eq!(log[at + 1], "key-combo [227]+25", "{log:?}");
 
     // Without a reachable pasteboard the text is typed, and the page is told so.
     env.fake.no_pasteboard.store(true, Ordering::SeqCst);

@@ -111,6 +111,9 @@ pub fn axe_input(cfg: &Axe, udid: &str, input: &UiInput) -> CmdSpec {
             axe(cfg, &["button", name])
         }
         UiInput::Key(k) => axe(cfg, &["key"]).arg(k.to_string()),
+        UiInput::KeyCombo { modifiers, key } => axe(cfg, &["key-combo"])
+            .arg(opt("modifiers", modifiers.iter().map(u8::to_string).collect::<Vec<_>>().join(",")))
+            .arg(opt("key", key)),
     };
     spec = spec.arg(opt("udid", udid));
     spec
@@ -169,7 +172,7 @@ pub fn app_log_predicate(bundle_id: &str, executable: Option<&str>) -> String {
     }
 }
 
-pub fn device_op(udid: &str, op: &DeviceOp) -> Result<CmdSpec> {
+pub fn device_op(cfg: &Axe, udid: &str, op: &DeviceOp) -> Result<CmdSpec> {
     Ok(match op {
         DeviceOp::OpenUrl(url) => simctl(["openurl", udid, url]),
         DeviceOp::Launch { bundle_id, arguments, restart } => {
@@ -222,7 +225,12 @@ pub fn device_op(udid: &str, op: &DeviceOp) -> Result<CmdSpec> {
         DeviceOp::Bundler { bundle_id, location: None } => {
             simctl(["spawn", udid, "defaults", "delete", bundle_id, "RCT_jsLocation"])
         }
-        DeviceOp::Pasteboard { text_file } => simctl(["pbcopy", udid]).stdin_file(text_file),
+        // AXe writes the simulator's own clipboard and reads it back. `simctl pbcopy` goes
+        // through the host pasteboard, which an `os_user` tenant without a login session lacks
+        // (it crashes there).
+        DeviceOp::Pasteboard { text_file } => {
+            axe(cfg, &["clipboard", "copy", "--stdin"]).arg(opt("udid", udid)).stdin_file(text_file)
+        }
     })
 }
 
