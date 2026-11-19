@@ -54,6 +54,8 @@ pub struct FakeDevices {
     /// A still screen: the stream produces one frame and then nothing (identical frames are
     /// not sent again by the host).
     pub still: AtomicBool,
+    /// `simctl pbcopy` fails, as under `os_user` isolation (no login session for the tenant).
+    pub no_pasteboard: AtomicBool,
 }
 
 impl FakeDevices {
@@ -157,6 +159,9 @@ impl Devices for FakeDevices {
                 format!("{bundle_id} {}", std::fs::read_to_string(payload_file)?)
             }
             DeviceOp::Pasteboard { text_file } => {
+                if self.no_pasteboard.load(Ordering::SeqCst) {
+                    anyhow::bail!("simctl pasteboard killed: ");
+                }
                 format!("pasteboard:{}", std::fs::read_to_string(text_file)?)
             }
             DeviceOp::Privacy { action, service, bundle_id } => {

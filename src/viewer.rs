@@ -383,7 +383,9 @@ fn tap(x: f64, y: f64, hold: Option<f64>) -> TapArgs {
 }
 
 impl Pool {
-    async fn viewer_input(&self, v: &Viewing, req: InputRequest) -> Result<(), ViewError> {
+    /// Applies one input. `Some(via)` for a paste: `"pasteboard"`, or `"typed"` when the
+    /// device pasteboard could not be reached and the text was typed instead.
+    async fn viewer_input(&self, v: &Viewing, req: InputRequest) -> Result<Option<&'static str>, ViewError> {
         if !v.control {
             return Err(ViewError::ViewOnly);
         }
@@ -392,6 +394,7 @@ impl Pool {
         // than interleave with a run's steps.
         let _op = tokio::time::timeout(INPUT_WAIT, rt.op.clone().lock_owned()).await.map_err(|_| ViewError::Busy)?;
         let mut scratch = None;
+        let mut via = None;
         // Paste goes through `simctl pbcopy`; everything else goes through AXe.
         let result = match req.input {
             ViewerInput::Paste { text } => {
@@ -401,7 +404,19 @@ impl Pool {
                 let file = self.config.data_dir.join("run").join(format!("{}.txt", uuid::Uuid::new_v4().simple()));
                 std::fs::write(&file, &text).context("writing pasteboard text")?;
                 scratch = Some(file.clone());
-                self.devices.device_op(&ctx, &DeviceOp::Pasteboard { text_file: file }).await.map(|_| ())
+                match self.devices.device_op(&ctx, &DeviceOp::Pasteboard { text_file: file.clone() }).await {
+                    Ok(_) => {
+                        via = Some("pasteboard");
+                        Ok(())
+                    }
+                    // Under `os_user` isolation the tenant has no login session, and
+                    // `simctl pbcopy` crashes without one: type the text into the focused field.
+                    Err(e) => {
+                        tracing::warn!(lease = %v.lease.id, error = %e, "pasteboard unavailable, typing instead");
+                        via = Some("typed");
+                        self.devices.ui(&ctx, &UiInput::Type { text_file: file }).await
+                    }
+                }
             }
             other => {
                 let input = match other {
@@ -440,7 +455,7 @@ impl Pool {
         }
         result?;
         self.store.touch_lease(&v.lease.id, now())?;
-        Ok(())
+        Ok(via)
     }
 }
 
@@ -809,8 +824,11 @@ async fn input(
     }
     let v = pool.viewing(&sid, &headers)?;
     let req: InputRequest = serde_json::from_slice(&body).map_err(|e| ViewError::Bad(format!("invalid input: {e}")))?;
-    pool.viewer_input(&v, req).await?;
-    let mut resp = StatusCode::NO_CONTENT.into_response();
+    let mut resp = match pool.viewer_input(&v, req).await? {
+        // A paste says where the text went, so the page can tell the person.
+        Some(via) => Json(serde_json::json!({ "via": via })).into_response(),
+        None => StatusCode::NO_CONTENT.into_response(),
+    };
     no_store(resp.headers_mut());
     Ok(resp)
 }
