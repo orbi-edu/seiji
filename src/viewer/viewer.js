@@ -285,6 +285,13 @@
       flash("Could not reach Seiji.", "error");
       return;
     }
+    if (resp.status === 200 && input.kind === "paste") {
+      const out = await resp.json().catch(() => ({}));
+      flash(out.via === "typed"
+        ? "Typed into the focused field (this device's clipboard is not reachable)."
+        : "On the simulator clipboard: long-press a field and choose Paste.");
+      return;
+    }
     if (resp.ok) return;
     const err = await errorOf(resp);
     if (resp.status === 401 || resp.status === 410) {
@@ -436,7 +443,6 @@
       const text = await navigator.clipboard.readText();
       if (text) {
         send({ kind: "paste", text });
-        flash("Pasted to simulator clipboard.");
         return;
       }
     } catch { /* fall through to the text box */ }
@@ -453,7 +459,6 @@
     pasteBox.hidden = true;
     if (text) {
       send({ kind: "paste", text });
-      flash("Pasted to simulator clipboard.");
     }
     screen.focus();
   });

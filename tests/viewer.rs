@@ -211,8 +211,18 @@ async fn paste_puts_text_on_pasteboard_and_respects_guards() {
     let watcher = open(&env, &token, &lease, false).await;
 
     // Paste to pasteboard.
-    assert_eq!(ctrl.input(json!({"kind": "paste", "text": "hello clipboard"})).await.status(), 204);
+    let pasted = ctrl.input(json!({"kind": "paste", "text": "hello clipboard"})).await;
+    assert_eq!(pasted.status(), 200);
+    assert_eq!(pasted.json::<serde_json::Value>().await.unwrap(), json!({"via": "pasteboard"}));
     assert!(env.fake.log().iter().any(|l| l.contains("pasteboard:hello clipboard")), "{:?}", env.fake.log());
+
+    // Without a reachable pasteboard the text is typed, and the page is told so.
+    env.fake.no_pasteboard.store(true, Ordering::SeqCst);
+    let typed = ctrl.input(json!({"kind": "paste", "text": "olá"})).await;
+    assert_eq!(typed.status(), 200);
+    assert_eq!(typed.json::<serde_json::Value>().await.unwrap(), json!({"via": "typed"}));
+    assert!(env.fake.log().iter().any(|l| l == "type olá"), "{:?}", env.fake.log());
+    env.fake.no_pasteboard.store(false, Ordering::SeqCst);
 
     // Paste and type goes through the typing path.
     assert_eq!(ctrl.input(json!({"kind": "paste_and_type", "text": "typed text"})).await.status(), 204);
