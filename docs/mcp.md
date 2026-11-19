@@ -531,6 +531,7 @@ iOS: prepares the simulator natively with `simctl`, for clean and comparable scr
 | `clear_location` | boolean | No | Remove the simulated location. Default false |
 | `permissions` | array of objects | No | Grant, revoke or reset privacy permissions. No system prompt appears for granted ones. Default `[]` |
 | `react_native_bundler` | object | No | React Native debug builds: where the app loads its JavaScript bundle from (the `RCT_jsLocation` default). Relaunch the app afterwards (see below) |
+| `pasteboard` | string | No | Text to put on the simulator pasteboard (clipboard), 1–200 000 bytes. The user or agent can then long-press Paste in any text field |
 
 `status_bar` fields (unknown fields are a schema error):
 
@@ -570,6 +571,7 @@ The app reads `RCT_jsLocation` when it starts. Call [`launch_app`](#launch_app) 
 | 5 | `location` | `simctl location <udid> set <latitude>,<longitude>` |
 | 6 | `permissions` | `simctl privacy <udid> <action> <service> <bundle id>`, once for each item |
 | 7 | `react_native_bundler` | `simctl spawn <udid> defaults write <bundle id> RCT_jsLocation -string <location>`, or `simctl spawn <udid> defaults delete <bundle id> RCT_jsLocation` without `location` |
+| 8 | `pasteboard` | `simctl pbcopy <udid>` with the text as stdin, from a daemon-owned scratch file |
 
 A failed operation stops the call. The operations before it stay applied.
 
@@ -583,6 +585,7 @@ A failed operation stops the call. The operations before it stay applied.
 | `status_bar: battery_level 0-100, wifi_bars 0-3, cellular_bars 0-4, time 1-32 chars` | A `status_bar` value is out of range |
 | `react_native_bundler.location must be host:port, e.g. 127.0.0.1:52314` | `location` is not `host:port` |
 | `location: latitude -90..90, longitude -180..180` | A coordinate is out of range |
+| `pasteboard text must be 1-200000 bytes` | The `pasteboard` text is empty or too long |
 | `<operation>: simctl <operation> exited <n>: <output>` | A `simctl` command failed, for example `permissions: simctl permissions exited 1: …` |
 | `<operation>: <operation> supports iOS simulators only for now` | An Android lease |
 | The [default app](#the-default-app) errors | A permission or `react_native_bundler` without `bundle_id`, and no installed app |
@@ -1756,9 +1759,11 @@ These routes take no bearer token. `GET /view/open/{ticket}` trades a ticket (si
 | `GET /view/open/{ticket}` | `303` to the page with the session cookie. A used or expired ticket gets a `401` HTML page |
 | `GET /view/s/{sid}/` | The viewer page |
 | `GET /view/assets/viewer.js`, `GET /view/assets/viewer.css` | The page's script and style, embedded in the binary |
-| `GET /view/s/{sid}/info` | JSON: `lease_id`, `user`, `model`, `device_type`, `runtime`, `udid`, `started_at`, `ends_at_latest`, `control`, `busy` (a run holds the device), `viewers`, `fps`, `app` |
-| `GET /view/s/{sid}/stream` | `multipart/x-mixed-replace; boundary=seijiframe`, one JPEG part per frame |
+| `GET /view/s/{sid}/info` | JSON: `lease_id`, `user`, `model`, `device_type`, `runtime`, `udid`, `started_at`, `ends_at_latest`, `control`, `busy` (a run holds the device), `viewers`, `fps`, `app`, `preset`, `stream_opts` |
+| `GET /view/s/{sid}/stats` | JSON: `stream` (server-side capture stats: `started_at_ms`, `fps`, `mean_frame_bytes`, `total_frames`, `total_bytes`, `subscribers`, `last_frame_at_ms`), `preset`, `opts` (`fps`, `scale`, `quality`) |
+| `GET /view/s/{sid}/stream` | `multipart/x-mixed-replace; boundary=seijiframe`, one JPEG part per frame. Each part carries `Content-Type`, `Content-Length` and `X-Capture-Time` (Unix ms when the daemon received the frame) headers |
 | `POST /view/s/{sid}/input` | `204`. Needs the header `X-Seiji-View: 1` |
+| `POST /view/s/{sid}/preset` | JSON with the applied `preset` and `opts`. Needs `X-Seiji-View: 1` and a control session. Body: `{"preset": "smooth"|"balanced"|"sharp"}`. Restarts the stream with the new quality/fps/scale |
 | `GET /view/s/{sid}/screenshot.jpg` | A JPEG download of the screen |
 
 Errors are JSON, `{"error": {"code": "<code>", "message": "<text>"}}`:
@@ -1768,13 +1773,25 @@ Errors are JSON, `{"error": {"code": "<code>", "message": "<text>"}}`:
 | `401` | `expired` | No session, a wrong cookie, an expired session, or a disabled or removed user. Open a new link |
 | `410` | `gone` | The lease was released, or is booting or being released |
 | `409` | `busy` | Input while a run or another input holds the device. Input waits up to 1 s for the lease's operation lock |
-| `403` | `view_only` | Input in a view-only session |
+| `403` | `view_only` | Input or a preset change in a view-only session |
 | `429` | `full` | The lease already has `viewer.maxViewersPerLease` streams |
-| `400` | `bad_request` | No `X-Seiji-View: 1` header, or a bad input body |
+| `400` | `bad_request` | No `X-Seiji-View: 1` header, or a bad input/preset body |
 
 ### The stream
 
-Seiji runs one `axe stream-video --format=raw` process for each watched lease and sends its frames to every viewer. A slow viewer skips frames; it never queues them. The process starts with the first viewer and stops when the last one leaves or the lease ends. If AXe exits while someone watches, Seiji starts it again after 1 s. While someone watches, Seiji touches the lease every 60 s, so a watched device is not released as idle.
+Seiji runs one `axe stream-video --format=raw` process for each watched lease and sends its frames to every viewer. A slow viewer skips frames; it never queues them. Identical frames (static screen) are skipped at the capture side to save bandwidth. The process starts with the first viewer and stops when the last one leaves or the lease ends. If AXe exits while someone watches, Seiji starts it again after 1 s. While someone watches, Seiji touches the lease every 60 s, so a watched device is not released as idle. Every 30 s, Seiji logs a structured line with the stream's capture fps, mean frame bytes and subscriber count.
+
+Each MJPEG part includes an `X-Capture-Time` header (Unix milliseconds). The viewer page reads the stream with `fetch()` and parses the multipart parts to extract per-frame capture timestamps and display a stats overlay.
+
+### Quality presets
+
+A controller can pick a quality preset from the toolbar. Presets apply to the shared stream (all viewers see the change). The last controller's choice restarts the AXe capture with new options.
+
+| Preset | `fps` | `scale` | `quality` |
+|---|---|---|---|
+| `smooth` | 15 | 0.3 | 50 |
+| `balanced` | config default | config default | config default |
+| `sharp` | 5 | 0.8 | 85 |
 
 ### Input
 
@@ -1787,6 +1804,8 @@ The body of `POST /view/s/{sid}/input` is `{"input": {...}, "aspect": <width / h
 | `type` | `text` (1–10 000 bytes) | Types the text through `axe type --stdin`, from a scratch file in `<dataDir>/run/` that Seiji deletes after the input |
 | `key` | `code` | One HID key (usage code) |
 | `button` | `name` | A hardware button, for example `home` or `lock` |
+| `paste` | `text` (1–10 000 bytes) | Puts the text on the simulator pasteboard via `simctl pbcopy`. The user can then long-press Paste in the app |
+| `paste_and_type` | `text` (1–10 000 bytes) | Types the text character by character (same as `type`), for fields that refuse paste |
 
 Each input restarts the idle timer. Viewer input is not recorded as a run.
 

@@ -222,6 +222,7 @@ pub fn device_op(udid: &str, op: &DeviceOp) -> Result<CmdSpec> {
         DeviceOp::Bundler { bundle_id, location: None } => {
             simctl(["spawn", udid, "defaults", "delete", bundle_id, "RCT_jsLocation"])
         }
+        DeviceOp::Pasteboard { text_file } => simctl(["pbcopy", udid]).stdin_file(text_file),
     })
 }
 

@@ -16,18 +16,35 @@
   </div>
   <div class="acts" id="acts">
     <span class="badge" id="mode" hidden>View only</span>
+    <select id="preset" data-control hidden>
+      <option value="smooth">Smooth</option>
+      <option value="balanced" selected>Balanced</option>
+      <option value="sharp">Sharp</option>
+    </select>
+    <button type="button" id="paste" title="Paste to pasteboard (⌘⇧V)" data-control>Paste</button>
     <button type="button" id="home" title="Home (⌘⇧H)" data-control>Home</button>
     <button type="button" id="lock" title="Lock (⌘L)" data-control>Lock</button>
     <button type="button" id="shot" title="Save a screenshot (⌘S)">Screenshot</button>
+    <button type="button" id="stats-btn" title="Stream info (I)">Stats</button>
   </div>
 </header>
 <div class="note" id="note" hidden></div>
+<div class="paste-box" id="paste-box" hidden>
+  <label>Text to paste to the simulator clipboard:</label>
+  <textarea id="paste-text" rows="3" maxlength="10000"></textarea>
+  <div class="paste-acts">
+    <button type="button" id="paste-send">Paste to clipboard</button>
+    <button type="button" id="paste-type">Paste &amp; type</button>
+    <button type="button" id="paste-cancel">Cancel</button>
+  </div>
+</div>
 <main class="stage" id="stage">
   <div class="screen" id="screen" tabindex="0" aria-label="Simulator screen">
     <img id="frame" alt="Simulator screen" draggable="false">
     <div class="veil" id="veil">
       <p id="veil-text">Starting the stream…</p>
     </div>
+    <div class="stats-overlay" id="stats-overlay" hidden></div>
   </div>
 </main>
 <footer class="status" id="status">

@@ -18,7 +18,9 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use seiji::config::{Config, Quota};
-use seiji::devices::{Capture, DeviceCtx, DeviceOp, Devices, InstalledApp, UiInput, XctestOptions, XctestOutcome};
+use seiji::devices::{
+    Capture, DeviceCtx, DeviceOp, Devices, Frame, InstalledApp, UiInput, XctestOptions, XctestOutcome,
+};
 use seiji::exec::{Account, Runner};
 use seiji::pool::Pool;
 use seiji::store::Store;
@@ -151,6 +153,9 @@ impl Devices for FakeDevices {
             DeviceOp::Push { bundle_id, payload_file } => {
                 format!("{bundle_id} {}", std::fs::read_to_string(payload_file)?)
             }
+            DeviceOp::Pasteboard { text_file } => {
+                format!("pasteboard:{}", std::fs::read_to_string(text_file)?)
+            }
             DeviceOp::Privacy { action, service, bundle_id } => {
                 format!("{} {} {bundle_id}", action.as_str(), service.as_str())
             }
@@ -206,7 +211,7 @@ impl Devices for FakeDevices {
         &self,
         _ctx: &DeviceCtx,
         opts: &seiji::devices::StreamOpts,
-        frames: &tokio::sync::watch::Sender<Option<bytes::Bytes>>,
+        frames: &tokio::sync::watch::Sender<Option<Frame>>,
         cancel: &CancellationToken,
     ) -> Result<()> {
         self.streams_started.fetch_add(1, Ordering::SeqCst);
@@ -214,11 +219,14 @@ impl Devices for FakeDevices {
         let mut n: u8 = 0;
         loop {
             n = n.wrapping_add(1);
-            let frame = {
+            let jpeg = {
                 let set = self.frames.lock().unwrap();
                 if set.is_empty() { vec![0xff, 0xd8, n, 0xff, 0xd9] } else { set[usize::from(n) % set.len()].clone() }
             };
-            frames.send_replace(Some(bytes::Bytes::from(frame)));
+            let captured_at_ms =
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis()
+                    as i64;
+            frames.send_replace(Some(Frame { jpeg: bytes::Bytes::from(jpeg), captured_at_ms }));
             tokio::select! {
                 _ = cancel.cancelled() => return Ok(()),
                 _ = tokio::time::sleep(tick) => {}

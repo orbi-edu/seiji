@@ -330,10 +330,11 @@ sequenceDiagram
   V-->>U: 204
 ```
 
-- One AXe process serves every viewer of a lease. A tokio watch channel holds the newest frame, so a slow viewer skips frames and never queues them. A frame over 16 MiB ends the stream.
+- One AXe process serves every viewer of a lease. A tokio watch channel holds the newest frame, so a slow viewer skips frames and never queues them. Identical frames (static screen) are skipped at the capture side to save bandwidth. A frame over 16 MiB ends the stream. Each frame carries a `captured_at_ms` timestamp (Unix ms when the daemon received it from AXe).
 - The stream starts with the first viewer and stops when the last one leaves or the lease ends: its cancellation token is a child of the lease's. If AXe exits while someone watches, Seiji starts it again after 1 s.
-- While someone watches, Seiji touches the lease every 60 s, so a watched device is not released as idle.
-- Input takes the lease's op lock like a tool call, so it never interleaves with a run. Taps and swipes map the picture's fractions to points with the screen size from the root frame of the accessibility tree, cached per lease.
+- While someone watches, Seiji touches the lease every 60 s, so a watched device is not released as idle. Every 30 s, Seiji logs a structured line with the stream's capture fps, mean frame bytes and subscriber count.
+- Input takes the lease's op lock like a tool call, so it never interleaves with a run. Taps and swipes map the picture's fractions to points with the screen size from the root frame of the accessibility tree, cached per lease. The `paste` input puts text on the simulator pasteboard via `simctl pbcopy`. The `paste_and_type` input types it character by character through AXe.
+- A controller can pick a quality preset (`smooth`, `balanced`, `sharp`) that restarts the AXe stream with new fps, scale and quality. The preset applies to the shared stream for all viewers. `GET /view/s/{sid}/stats` and a toggleable overlay in the page show per-frame stats (received fps, frame size, bitrate, resolution, frame age, stalled indicator).
 - Tickets and sessions live in memory. The reaper prunes expired ones every 15 s.
 
 ## Evidence data flow
