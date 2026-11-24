@@ -53,7 +53,18 @@ tern plugin install github.com/orbi-edu/seiji/tern-plugin
 tern plugin list            # seiji 0.1.0 Seiji — 1 blocks, 0 lenses, window  ready
 ```
 
-Tern loads it at once; no restart.
+Tern loads it at once; no restart. This installs the plugin from `main`.
+
+To install the plugin of a release instead, take its `seiji-tern-plugin-<tag>.tar.gz` from the [releases](https://github.com/orbi-edu/seiji/releases) (each release carries one, with a `.sha256` file), unpack it and install the `seiji` folder:
+
+```sh
+gh release download v0.1.0 --repo orbi-edu/seiji --pattern 'seiji-tern-plugin-*'
+shasum -a 256 -c seiji-tern-plugin-v0.1.0.tar.gz.sha256
+tar -xzf seiji-tern-plugin-v0.1.0.tar.gz
+tern plugin install ./seiji --force
+```
+
+The workflow attaches the plugin only when the release's tag matches `version` in `tern-plugin/plugin.toml` (`v0.1.0` for `0.1.0`). Otherwise it fails, and the release has no plugin: bump the version before you tag.
 
 **3. Let Tern find the CLI.** The plugin checks `SEIJI_BIN`, then `$CARGO_HOME/bin/seiji` (or `~/.cargo/bin/seiji`), then `PATH`. Tern started from the Dock may not have `~/.cargo/bin` on its PATH; since Cargo installs to `~/.cargo/bin` by default, the plugin finds it there without extra setup. If it still says *The seiji CLI is missing*, set the path explicitly and start Tern again:
 

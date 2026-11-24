@@ -1,0 +1,38 @@
+name: Release
+
+# Attaches the Tern plugin to every published release, as
+# seiji-tern-plugin-<tag>.tar.gz with a SHA-256 file.
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  tern-plugin:
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.release.tag_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+      - name: Check that the tag matches the plugin's version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' tern-plugin/plugin.toml)
+          if [ "${TAG#v}" != "$version" ]; then
+            echo "::error::release $TAG does not match version $version in tern-plugin/plugin.toml"
+            exit 1
+          fi
+      - name: Package the plugin
+        run: |
+          name="seiji-tern-plugin-$TAG"
+          mkdir -p dist/stage
+          cp -R tern-plugin dist/stage/seiji
+          tar -czf "dist/$name.tar.gz" -C dist/stage seiji
+          (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
+      - name: Attach to the release
+        run: gh release upload "$TAG" dist/*.tar.gz dist/*.sha256 --clobber
