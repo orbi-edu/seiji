@@ -137,10 +137,13 @@ end
 local function clear_admin(state: any)
 	state.is_admin = false
 	state.data.admin_users = nil
+	state.data.admin_leases = nil
 	state.data.capacity = nil
 	state.data.in_use = nil
 	state.errs.admin_users = nil
+	state.errs.admin_leases = nil
 	state.read_at.admin_users = nil
+	state.read_at.admin_leases = nil
 	state.editing = nil
 	state.edit_error = nil
 	state.saving = false
@@ -224,37 +227,45 @@ poll = function(state: any)
 	end
 end
 
-read_admin_users = function(state: any)
-	if state.inflight.admin_users then
+-- Reads one admin endpoint; `apply` stores its data. A 403 drops the admin UI.
+local function read_admin(state: any, name: string, call: (any, (any, cli.CliError?) -> ()) -> (), apply: (data: any) -> ())
+	if state.inflight[name] then
 		return
 	end
-	state.inflight.admin_users = true
-	apimod.admin_users(state.api, function(data, err)
-		state.inflight.admin_users = nil
+	state.inflight[name] = true
+	call(state.api, function(data, err)
+		state.inflight[name] = nil
 		if state.stopped then
 			return
 		end
-		state.read_at.admin_users = tern.now()
+		state.read_at[name] = tern.now()
 		if err then
 			if err.code == "forbidden" then
 				clear_admin(state)
 				flash(state, "error", "You no longer have admin access.")
 			else
-				local text = cli.describe(err)
-				if state.errs.admin_users ~= text then
-					state.errs.admin_users = text
-				end
+				state.errs[name] = cli.describe(err)
 			end
 			state.cx:render()
 			return
 		end
-		state.errs.admin_users = nil
+		state.errs[name] = nil
 		if type(data) == "table" then
-			state.data.admin_users = data.users
-			state.data.capacity = data.capacity
-			state.data.in_use = data.in_use
+			apply(data)
 			state.cx:render()
 		end
+	end)
+end
+
+-- The user list and every user's devices.
+read_admin_users = function(state: any)
+	read_admin(state, "admin_users", apimod.admin_users, function(data)
+		state.data.admin_users = data.users
+		state.data.capacity = data.capacity
+		state.data.in_use = data.in_use
+	end)
+	read_admin(state, "admin_leases", apimod.admin_leases, function(data)
+		state.data.admin_leases = data.leases
 	end)
 end
 
@@ -264,6 +275,24 @@ local function admin_users(state: any): { any }
 end
 
 M.admin_users = admin_users
+
+local function admin_leases(state: any): { any }
+	local l = state.data.admin_leases
+	return if type(l) == "table" then l else {}
+end
+
+-- The devices that user `user_id` holds now.
+local function admin_devices(state: any, user_id: number): { any }
+	local out = {}
+	for _, d in admin_leases(state) do
+		if d.user_id == user_id then
+			table.insert(out, d)
+		end
+	end
+	return out
+end
+
+M.admin_devices = admin_devices
 
 local function admin_current(state: any): any
 	local list = admin_users(state)
@@ -355,7 +384,9 @@ end
 
 -- ── actions ────────────────────────────────────────────────────────────────
 
-local function viewer(state: any, d: any, control: boolean, float: boolean)
+-- Asks for a viewer link to `d`, then opens it beside this panel (`how` "beside"), floating
+-- ("float"), or copies it ("copy"). `admin` asks through the admin route, for any user's device.
+local function viewer(state: any, d: any, control: boolean, how: string, admin: boolean)
 	if not d then
 		return
 	end
@@ -372,9 +403,16 @@ local function viewer(state: any, d: any, control: boolean, float: boolean)
 		return
 	end
 	state.busy[key] = true
-	apimod.request(state.api, "POST", "/v1/leases/" .. d.lease_id .. "/viewer", { body = { control = control } }, function(link, err)
+	local path = (if admin then "/v1/admin/leases/" else "/v1/leases/") .. d.lease_id .. "/viewer"
+	apimod.request(state.api, "POST", path, { body = { control = control } }, function(link, err)
 		state.busy[key] = nil
 		if state.stopped then
+			return
+		end
+		if admin and err and err.code == "forbidden" then
+			clear_admin(state)
+			flash(state, "error", "You no longer have admin access.")
+			state.cx:render()
 			return
 		end
 		if err or type(link) ~= "table" or type(link.url) ~= "string" then
@@ -386,12 +424,14 @@ local function viewer(state: any, d: any, control: boolean, float: boolean)
 		if string.sub(url, 1, 1) == "/" then
 			url = state.api.creds.url .. url
 		end
-		if control then
-			ask(state, { kind = "screen", url = url, float = float })
-			flash(state, "success", "Opening the screen of " .. d.model .. (if float then " in a floating window." else " beside this panel."))
-		else
+		local what = if admin and d.user then d.user .. "'s " .. d.model else d.model
+		if how == "copy" then
 			state.cx:copy(url)
-			flash(state, "success", "Copied a view-only link to " .. d.model .. ". It opens once, within " .. tostring(link.expires_in or 60) .. " s.")
+			flash(state, "success", "Copied a " .. (if control then "" else "view-only ") .. "link to " .. what .. ". It opens once, within " .. tostring(link.expires_in or 60) .. " s.")
+		else
+			local float = how == "float"
+			ask(state, { kind = "screen", url = url, float = float })
+			flash(state, "success", "Opening the screen of " .. what .. (if control then "" else " (view only)") .. (if float then " in a floating window." else " beside this panel."))
 		end
 		state.cx:render()
 	end)
@@ -637,11 +677,14 @@ local function on_action(state: any, act: string, value: string?)
 		end
 		poll(state)
 	elseif act == "open" then
-		viewer(state, d, true, false)
+		viewer(state, d, true, "beside", false)
 	elseif act == "float" then
-		viewer(state, d, true, true)
+		viewer(state, d, true, "float", false)
 	elseif act == "share" then
-		viewer(state, d, false, false)
+		viewer(state, d, false, "copy", false)
+	elseif (act == "admin_watch" or act == "admin_control" or act == "admin_link") and value and state.is_admin then
+		local ad = find(admin_leases(state), "lease_id", value)
+		viewer(state, ad, act == "admin_control", if act == "admin_link" then "copy" else "beside", true)
 	elseif act == "shot" then
 		screenshot(state, d)
 	elseif act == "release" and d then

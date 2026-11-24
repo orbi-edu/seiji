@@ -137,7 +137,8 @@ These rules protect the host. A change that breaks one of them is a security bug
 - Every lease has its own driver port. Do not use `maestro mcp`: it fixes the iOS driver port at
   22087.
 - A lease belongs to one user. Resolve leases only through `Pool::resolve`, which checks the
-  owner.
+  owner. The one exception is `Pool::admin_lease`, for an admin's viewer link; its callers check
+  `adminUsers` first.
 
 ### 4.6 Evidence
 

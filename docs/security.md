@@ -265,7 +265,7 @@ The viewer shows a lease's screen live in a browser or in Tern, and can send inp
 
 ### Ticket and cookie
 
-1. The lease's owner asks for a viewer link with the bearer token: `share_screen` (view-only by default) or `POST /v1/leases/{lease_id}/viewer` (control by default). The lease must be the caller's, `ready`, and iOS.
+1. The lease's owner asks for a viewer link with the bearer token: `share_screen` (view-only by default) or `POST /v1/leases/{lease_id}/viewer` (control by default). The lease must be the caller's, `ready`, and iOS. An admin (a name in `adminUsers`) can also ask for a link to any user's lease with `POST /v1/admin/leases/{lease_id}/viewer` (view-only by default). That lease must be `ready` and iOS, and its user must exist and not be disabled. Seiji logs every admin link with the admin, the user, the lease and `control`.
 2. Seiji returns `/view/open/<ticket>`. The ticket is 64 random hex characters, lives 60 s and works once.
 3. `GET /view/open/{ticket}` removes the ticket and makes a viewer session: a session id (32 hex) and a secret (64 hex). Seiji keeps only the SHA-256 of the secret, in memory. It answers `303` to `/view/s/{sid}/` and sets `seiji_view=<secret>; Path=/view/s/<sid>; Max-Age=<sessionHours × 3600>; HttpOnly; SameSite=Strict`, plus `Secure` when `listen.publicUrl` starts with `https://`. A used or expired ticket gets a `401` HTML page.
 
@@ -273,18 +273,18 @@ A viewer link is a credential for 60 s: the first person who opens it gets the s
 
 ### What each request checks
 
-Every `/view/s/{sid}/...` request checks, in order: the session exists, it has not expired, the cookie's secret matches the stored hash, the user exists and is not disabled, and the lease is still that user's and `ready`. Errors are JSON `{"error": {"code", "message"}}`:
+Every `/view/s/{sid}/...` request checks, in order: the session exists, it has not expired, the cookie's secret matches the stored hash, the user exists and is not disabled, for an admin's link the admin exists, is not disabled and is still in `adminUsers`, and the lease is still that user's and `ready`. Errors are JSON `{"error": {"code", "message"}}`:
 
 | Status | `code` | Cause |
 |---|---|---|
-| `401` | `expired` | No session, a wrong secret, an expired session, or a removed or disabled user. Open a new link |
+| `401` | `expired` | No session, a wrong secret, an expired session, or a removed or disabled user or admin. Open a new link |
 | `410` | `gone` | The lease was released, is booting, or is being released |
 | `409` | `busy` | Input only: a run or another input holds the device |
 | `403` | `view_only` | Input in a view-only session |
 | `429` | `full` | The lease already has `viewer.maxViewersPerLease` streams |
 | `400` | `bad_request` | A missing `X-Seiji-View` header, or a bad input body |
 
-A session ends at `viewer.sessionHours` or with its lease, whichever comes first. `seiji user disable` and `seiji user remove` end it at the next request. Sessions and tickets live in memory: the reaper prunes expired ones every 15 s, and a daemon restart ends them all.
+A session ends at `viewer.sessionHours` or with its lease, whichever comes first. `seiji user disable` and `seiji user remove` end it at the next request, for the lease's user and for the admin who asked for the link. Sessions and tickets live in memory: the reaper prunes expired ones every 15 s, and a daemon restart ends them all.
 
 ### Input
 
@@ -308,6 +308,7 @@ No inline script runs, and no other site can frame the page.
 
 - **No `Secure` cookie over plain HTTP.** Without an `https://` `listen.publicUrl`, the cookie lacks `Secure`, and the browser sends it over plain HTTP too.
 - **A person with control acts as the user.** Taps and typing reach the user's device and app like the agent's own steps. They are not recorded as a run. Share view-only links unless the person must drive.
+- **An admin sees every device.** An admin can watch any user's screen, and with `control: true` drive it as that user. The user is not told. Only the log line records it. Keep `adminUsers` short.
 - **The stream is the screen.** Whatever the simulator shows, passwords in plain fields included, reaches every viewer.
 
 ## Tunnels (`seiji forward`)

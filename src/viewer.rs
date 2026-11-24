@@ -56,7 +56,10 @@ const SCRIPT: &str = include_str!("viewer/viewer.js");
 const STYLE: &str = include_str!("viewer/viewer.css");
 
 struct Ticket {
+    /// The lease's owner: the session acts as this user's account.
     user_id: i64,
+    /// Who asked for the link: the owner, or an admin.
+    viewer_id: i64,
     lease_id: String,
     control: bool,
     expires: i64,
@@ -65,6 +68,7 @@ struct Ticket {
 struct Session {
     secret_sha256: String,
     user_id: i64,
+    viewer_id: i64,
     lease_id: String,
     control: bool,
     expires: i64,
@@ -214,13 +218,36 @@ impl Pool {
     /// A one-time link to the caller's ready iOS lease.
     pub fn create_viewer(&self, user: &User, lease_id: Option<&str>, control: bool) -> anyhow::Result<ViewerLink> {
         let lease = self.peek_lease(user, lease_id)?;
+        self.issue_ticket(user.id, lease, control)
+    }
+
+    /// A one-time link to any user's ready iOS lease, for an admin. The session acts as the
+    /// lease's owner and ends when the admin loses admin access or is disabled.
+    pub fn create_admin_viewer(&self, admin: &User, lease_id: &str, control: bool) -> anyhow::Result<ViewerLink> {
+        let admin = self.fresh_user(admin)?;
+        if !self.config.admin_users.contains(&admin.name) {
+            anyhow::bail!("admin access required");
+        }
+        let (owner, lease) = self.admin_lease(lease_id)?;
+        let link = self.issue_ticket(admin.id, lease, control)?;
+        tracing::info!(admin = %admin.name, user = %owner.name, lease = %link.lease_id, control, "admin viewer link");
+        Ok(link)
+    }
+
+    fn issue_ticket(&self, viewer_id: i64, lease: Lease, control: bool) -> anyhow::Result<ViewerLink> {
         if lease.platform != Platform::Ios {
             anyhow::bail!("the screen viewer supports iOS simulators only for now");
         }
         let ticket = random_hex(32);
         self.viewers.tickets.lock().expect("tickets mutex").insert(
             ticket.clone(),
-            Ticket { user_id: user.id, lease_id: lease.id.clone(), control, expires: now() + TICKET_SECONDS },
+            Ticket {
+                user_id: lease.user_id,
+                viewer_id,
+                lease_id: lease.id.clone(),
+                control,
+                expires: now() + TICKET_SECONDS,
+            },
         );
         let base = self.config.listen.public_url.as_deref().unwrap_or("").trim_end_matches('/');
         Ok(ViewerLink {
@@ -244,6 +271,7 @@ impl Pool {
             Session {
                 secret_sha256: sha256_hex(&secret),
                 user_id: t.user_id,
+                viewer_id: t.viewer_id,
                 lease_id: t.lease_id,
                 control: t.control,
                 expires: now() + lifetime,
@@ -254,15 +282,21 @@ impl Pool {
 
     fn viewing(&self, sid: &str, headers: &HeaderMap) -> Result<Viewing, ViewError> {
         let secret = cookie(headers).ok_or(ViewError::Unauthorized)?;
-        let (user_id, lease_id, control) = {
+        let (user_id, viewer_id, lease_id, control) = {
             let sessions = self.viewers.sessions.lock().expect("sessions mutex");
             let s = sessions.get(sid).ok_or(ViewError::Unauthorized)?;
             if s.expires <= now() || s.secret_sha256 != sha256_hex(secret) {
                 return Err(ViewError::Unauthorized);
             }
-            (s.user_id, s.lease_id.clone(), s.control)
+            (s.user_id, s.viewer_id, s.lease_id.clone(), s.control)
         };
         let user = self.store.user_by_id(user_id)?.filter(|u| !u.disabled).ok_or(ViewError::Unauthorized)?;
+        if viewer_id != user_id {
+            self.store
+                .user_by_id(viewer_id)?
+                .filter(|a| !a.disabled && self.config.admin_users.contains(&a.name))
+                .ok_or(ViewError::Unauthorized)?;
+        }
         let lease = self
             .store
             .lease(&lease_id)?
@@ -593,7 +627,8 @@ fn part(frame: &Frame) -> Bytes {
 
 // ---- routes ----
 
-/// `POST /v1/leases/{lease_id}/viewer` (bearer): `{"control": true}` by default.
+/// The body of `POST /v1/leases/{lease_id}/viewer` (control by default) and
+/// `POST /v1/admin/leases/{lease_id}/viewer` (view-only by default).
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ViewerRequest {

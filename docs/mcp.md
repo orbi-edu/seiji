@@ -1496,6 +1496,8 @@ These routes exist besides `/mcp`. Error bodies of `/v1/apps`, `/v1/runs/…` an
 | `GET /v1/me` | Bearer token | `200` `{"user", "quota", "is_admin"}` |
 | `GET /v1/admin/users` | Bearer token (admin) | `200` `{"users", "capacity", "in_use"}` |
 | `PUT /v1/admin/users/{id}/limits` | Bearer token (admin) | `200`, updated user entry |
+| `GET /v1/admin/leases` | Bearer token (admin) | `200` `{"leases"}`, every active lease with its user |
+| `POST /v1/admin/leases/{lease_id}/viewer` | Bearer token (admin) | `200`, a viewer link to any user's lease |
 | `POST /v1/leases/{lease_id}/viewer` | Bearer token | `200`, a viewer link `{"url", "expires_in", "control", "lease_id"}` |
 | `GET /v1/leases/{lease_id}/screenshot.jpg` | Bearer token | `200`, the screen now as JPEG |
 | `GET /v1/leases/{lease_id}/forward` | Bearer token | `101`, a WebSocket that carries a tunnel for `seiji forward` |
@@ -1690,6 +1692,36 @@ Unknown fields are rejected. `monthly_minutes` must be ≥ 0, `max_concurrent` m
 | `404` | `{"error": "user not found"}` | No user with that id |
 
 Lowering `max_concurrent` blocks new acquisitions but does not evict already-held devices. Reducing `monthly_minutes` can end leases on the next reaper pass. The response carries the updated `used_minutes` and `active_devices`.
+
+### `GET /v1/admin/leases`
+
+Lists every active lease (booting or ready) of every user. Authenticated admin only.
+
+| Status | Body | Cause |
+|---|---|---|
+| `200` | `{"leases": [...]}` | Success |
+| `401` | plain text | Missing or invalid token |
+| `403` | `{"error": "admin access required"}` | The caller is not in `adminUsers` |
+
+Each entry has the fields of `active_leases` in [`budget_status`](#budget_status) (`lease_id`, `platform`, `model`, `device_id`, `status`, `started_at`, `ends_at_latest`, `idle_release_minutes`), plus `user_id` and `user`, the lease's owner.
+
+### `POST /v1/admin/leases/{lease_id}/viewer`
+
+Returns a viewer link to any user's ready iOS lease. Authenticated admin only. The body is optional: `{"control": <bool>}`. Here `control` defaults to `false`, so the link only watches; with `true` the admin drives the device as its user. An unknown field is an error. The response has `Cache-Control: no-store` and the same shape as [`POST /v1/leases/{lease_id}/viewer`](#post-v1leaseslease_idviewer).
+
+The viewer session acts as the lease's owner: the page shows the owner's name, and input runs as the owner's account. It also ends when the admin is disabled or removed. Seiji logs each link with the admin, the user, the lease and `control`.
+
+| Status | Body | Cause |
+|---|---|---|
+| `200` | `{"url": "/view/open/<ticket>", "expires_in": 60, "control": false, "lease_id": "<lease id>"}` | The link |
+| `400` | `{"error": "invalid body: <cause>"}` | The body is not `{"control": <bool>}` |
+| `401` | plain text | Missing or invalid token |
+| `403` | `{"error": "admin access required"}` | The caller is not in `adminUsers` |
+| `404` | `{"error": "<text>"}` | No active lease with that id, the lease is still booting, its user is disabled or removed, or `the screen viewer supports iOS simulators only for now` |
+
+```sh
+curl -s -X POST -H "Authorization: Bearer $SEIJI_TOKEN" https://seiji.example.com/v1/admin/leases/l_3f9c2a7b1e04/viewer
+```
 
 ### `POST /v1/leases/{lease_id}/viewer`
 

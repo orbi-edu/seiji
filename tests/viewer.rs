@@ -33,6 +33,11 @@ struct View {
 
 async fn open(env: &Env, token: &str, lease: &str, control: bool) -> View {
     let l: Value = link(env, token, lease, json!({"control": control})).await.json().await.unwrap();
+    open_link(env, &l).await
+}
+
+/// Opens the link of a viewer link response.
+async fn open_link(env: &Env, l: &Value) -> View {
     let opened = http().get(format!("{}{}", env.url, l["url"].as_str().unwrap())).send().await.unwrap();
     assert_eq!(opened.status(), 303);
     let location = opened.headers()["location"].to_str().unwrap().to_string();
@@ -40,6 +45,17 @@ async fn open(env: &Env, token: &str, lease: &str, control: bool) -> View {
     assert!(set_cookie.contains("HttpOnly") && set_cookie.contains("SameSite=Strict"), "{set_cookie}");
     assert!(set_cookie.contains(&format!("Path={}", location.trim_end_matches('/'))), "{set_cookie} {location}");
     View { base: format!("{}{location}", env.url), cookie: set_cookie.split(';').next().unwrap().to_string() }
+}
+
+async fn admin_link(env: &Env, token: &str, lease: &str, body: Option<Value>) -> reqwest::Response {
+    let req = http().post(format!("{}/v1/admin/leases/{lease}/viewer", env.url)).bearer_auth(token);
+    match body {
+        Some(b) => req.json(&b),
+        None => req,
+    }
+    .send()
+    .await
+    .unwrap()
 }
 
 impl View {
@@ -91,6 +107,59 @@ async fn a_link_opens_one_session_for_its_owner_only() {
     assert_eq!(info["model"], "iphone-16");
     assert_eq!(info["control"], true);
     assert_eq!(info["busy"], false);
+}
+
+#[tokio::test]
+async fn an_admin_lists_every_device_and_watches_any_of_them() {
+    let env = setup_with(2, json!({ "adminUsers": ["alice"] })).await;
+    let alice = add_user(&env, "alice", QUOTA);
+    let (bob, lease) = device(&env, "bob").await;
+
+    let leases = |token: String| {
+        let url = format!("{}/v1/admin/leases", env.url);
+        async move { http().get(url).bearer_auth(token).send().await.unwrap() }
+    };
+    assert_eq!(leases(bob.clone()).await.status(), 403);
+    let list: Value = leases(alice.clone()).await.json().await.unwrap();
+    let entries = list["leases"].as_array().unwrap();
+    assert_eq!(entries.len(), 1, "{list}");
+    assert_eq!(entries[0]["lease_id"], lease);
+    assert_eq!(entries[0]["user"], "bob");
+    assert_eq!(entries[0]["status"], "ready");
+    assert_eq!(entries[0]["platform"], "ios");
+
+    // Only an admin gets a link to another user's device; the owner's own route still refuses it.
+    assert_eq!(admin_link(&env, &bob, &lease, None).await.status(), 403);
+    assert_eq!(link(&env, &alice, &lease, json!({})).await.status(), 404);
+    assert_eq!(admin_link(&env, &alice, "l_000000000000", None).await.status(), 404);
+    assert_eq!(admin_link(&env, &alice, &lease, Some(json!({"role": "x"}))).await.status(), 400);
+
+    // View-only by default: the session shows bob's device and refuses input.
+    let resp = admin_link(&env, &alice, &lease, None).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers()["cache-control"], "no-store");
+    let l: Value = resp.json().await.unwrap();
+    assert_eq!(l["control"], false);
+    let watcher = open_link(&env, &l).await;
+    let info: Value = watcher.get("info").await.json().await.unwrap();
+    assert_eq!(info["lease_id"], lease);
+    assert_eq!(info["user"], "bob");
+    assert_eq!(info["control"], false);
+    assert_eq!(watcher.input(json!({"kind": "key", "code": 40})).await.status(), 403);
+
+    // With control, the admin's input reaches bob's device.
+    let l: Value = admin_link(&env, &alice, &lease, Some(json!({"control": true}))).await.json().await.unwrap();
+    assert_eq!(l["control"], true);
+    let driver = open_link(&env, &l).await;
+    assert_eq!(driver.input(json!({"kind": "key", "code": 40})).await.status(), 204);
+    assert!(env.fake.log().contains(&"key 40".to_string()), "{:?}", env.fake.log());
+
+    // Disabling the admin ends the admin's sessions; the owner's own session keeps working.
+    let own = open(&env, &bob, &lease, false).await;
+    env.pool.store.set_disabled("alice", true).unwrap();
+    assert_eq!(watcher.get("info").await.status(), 401);
+    assert_eq!(driver.input(json!({"kind": "key", "code": 40})).await.status(), 401);
+    assert_eq!(own.get("info").await.status(), 200);
 }
 
 #[tokio::test]
