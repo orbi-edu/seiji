@@ -62,6 +62,7 @@ document in the same commit.
 | `tests/forward.rs` | `seiji forward`: the tunnel end to end, its refusals, and the real CLI pointing the app. |
 | `assets/` | Logo: `logo-mark.svg`, `logo-light.svg`, `logo-dark.svg`. |
 | `deploy/` | Example config, sudoers rule, launchd plist. |
+| `.github/workflows/` | `ci.yml` (fmt, clippy, tests); `release.yml` (attaches the Tern plugin to each published release). |
 | `docs/` | User and operator documentation. |
 
 ## 3. Commands
