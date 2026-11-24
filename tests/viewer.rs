@@ -774,3 +774,237 @@ async fn configure_device_sets_pasteboard() {
     let r2 = call(&c, "configure_device", json!({"pasteboard": ""})).await;
     assert!(is_err(&r2));
 }
+
+// ---- WebRTC ----
+
+/// A free UDP port on loopback, for one test's `viewer.webrtc.ports`.
+fn free_udp_port() -> u16 {
+    std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+}
+
+async fn rtc_env(port: u16) -> Env {
+    setup_with(2, json!({"viewer": {"webrtc": {"enabled": true, "bind": "127.0.0.1", "ports": [port, port]}}})).await
+}
+
+/// What the page's WebRTC end saw.
+#[derive(Debug)]
+enum Rtc {
+    /// The input channel opened.
+    Open,
+    /// One video frame, as Annex B.
+    Frame(Vec<u8>),
+    /// A text message on the input channel.
+    Text(Value),
+}
+
+/// The page's WebRTC end, played by str0m on loopback: it offers to receive video and opens
+/// the `input` channel, as `viewer.js` does.
+struct RtcPage {
+    send: tokio::sync::mpsc::UnboundedSender<Value>,
+    seen: tokio::sync::mpsc::UnboundedReceiver<Rtc>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for RtcPage {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl RtcPage {
+    async fn next(&mut self) -> Rtc {
+        within("WebRTC event", self.seen.recv()).await.expect("the WebRTC end stopped")
+    }
+    async fn opened(&mut self) {
+        while !matches!(self.next().await, Rtc::Open) {}
+    }
+    async fn frame(&mut self) -> Vec<u8> {
+        loop {
+            if let Rtc::Frame(f) = self.next().await {
+                return f;
+            }
+        }
+    }
+    async fn text(&mut self) -> Value {
+        loop {
+            if let Rtc::Text(v) = self.next().await {
+                return v;
+            }
+        }
+    }
+}
+
+/// Sends an offer over the page's WebSocket; the server's reply: `rtc_answer` or an error.
+async fn offer(
+    ws: &mut Socket,
+) -> (Value, Option<(str0m::Rtc, str0m::change::SdpPendingOffer, tokio::net::UdpSocket)>) {
+    use str0m::media::{Direction, MediaKind};
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut rtc = str0m::Rtc::builder().clear_codecs().enable_h264(true).build(std::time::Instant::now());
+    rtc.add_local_candidate(str0m::Candidate::host(socket.local_addr().unwrap(), "udp").unwrap());
+    let mut api = rtc.sdp_api();
+    api.add_media(MediaKind::Video, Direction::RecvOnly, None, None, None);
+    api.add_channel("input".into());
+    let (sdp, pending) = api.apply().unwrap();
+    send(ws, json!({"t": "rtc_offer", "sdp": sdp.to_sdp_string()})).await;
+    let reply = text(ws).await;
+    let parts = (reply["t"] == "rtc_answer").then_some((rtc, pending, socket));
+    (reply, parts)
+}
+
+async fn rtc_page(ws: &mut Socket) -> RtcPage {
+    let (reply, parts) = offer(ws).await;
+    let (mut rtc, pending, socket) = parts.unwrap_or_else(|| panic!("no answer: {reply}"));
+    let answer = str0m::change::SdpAnswer::from_sdp_string(reply["sdp"].as_str().unwrap()).unwrap();
+    rtc.sdp_api().accept_answer(pending, answer).unwrap();
+    let (send, mut outgoing) = tokio::sync::mpsc::unbounded_channel::<Value>();
+    let (seen_tx, seen) = tokio::sync::mpsc::unbounded_channel();
+    let task = tokio::spawn(async move {
+        use str0m::{Event, Input, Output, net::Protocol, net::Receive};
+        let local = socket.local_addr().unwrap();
+        let mut channel = None;
+        let mut buf = vec![0u8; 2000];
+        loop {
+            let timeout = loop {
+                match rtc.poll_output().unwrap() {
+                    Output::Timeout(t) => break t,
+                    Output::Transmit(t) => {
+                        let _ = socket.send_to(&t.contents, t.destination).await;
+                    }
+                    Output::Event(Event::ChannelOpen(id, _)) => {
+                        channel = Some(id);
+                        let _ = seen_tx.send(Rtc::Open);
+                    }
+                    Output::Event(Event::MediaData(d)) => {
+                        let _ = seen_tx.send(Rtc::Frame(d.data.to_vec()));
+                    }
+                    Output::Event(Event::ChannelData(d)) => {
+                        let _ = seen_tx.send(Rtc::Text(serde_json::from_slice(&d.data).unwrap()));
+                    }
+                    Output::Event(_) => {}
+                }
+            };
+            let wait = timeout.saturating_duration_since(std::time::Instant::now());
+            tokio::select! {
+                r = socket.recv_from(&mut buf) => {
+                    let (n, source) = r.unwrap();
+                    let receive = Receive { proto: Protocol::Udp, source, destination: local, contents: buf[..n].try_into().unwrap() };
+                    rtc.handle_input(Input::Receive(std::time::Instant::now(), receive)).unwrap();
+                }
+                Some(m) = outgoing.recv(), if channel.is_some() => {
+                    rtc.channel(channel.unwrap()).unwrap().write(false, m.to_string().as_bytes()).unwrap();
+                }
+                _ = tokio::time::sleep(wait) => rtc.handle_input(Input::Timeout(std::time::Instant::now())).unwrap(),
+            }
+        }
+    });
+    RtcPage { send, seen, task }
+}
+
+/// Whether an Annex B frame holds a NAL unit of this type.
+fn has_nal(frame: &[u8], kind: u8) -> bool {
+    frame.windows(4).any(|w| w[..3] == [0, 0, 1] && w[3] & 0x1f == kind)
+}
+
+#[tokio::test]
+async fn webrtc_carries_the_stream_and_the_input() {
+    let env = rtc_env(free_udp_port()).await;
+    let (token, lease) = device(&env, "alice").await;
+    let view = open(&env, &token, &lease, true).await;
+    let info: Value = view.get("info").await.json().await.unwrap();
+    assert_eq!(info["webrtc"], true);
+    let mut ws = view.ws().await;
+    format(&mut ws).await;
+    let mut page = rtc_page(&mut ws).await;
+
+    // The first frame is a keyframe, with the stream's SPS and PPS before it.
+    let first = page.frame().await;
+    assert!(has_nal(&first, 7) && has_nal(&first, 8) && has_nal(&first, 5), "{first:02x?}");
+
+    // Input over the data channel reaches the device, pings come back on it.
+    page.opened().await;
+    page.send.send(json!({"t": "touch", "phase": "down", "x": 0.25, "y": 0.5})).unwrap();
+    page.send.send(json!({"t": "touch", "phase": "up", "x": 0.25, "y": 0.5})).unwrap();
+    logged(&env, "touch up 0.25,0.50").await;
+    page.send.send(json!({"t": "ping", "at": 12.5})).unwrap();
+    let pong = page.text().await;
+    assert_eq!((pong["t"].as_str(), pong["at"].as_f64()), (Some("pong"), Some(12.5)), "{pong}");
+    assert!(pong["server_ms"].as_i64().is_some());
+
+    // While the page shows the WebRTC video, the WebSocket carries no frames.
+    send(&mut ws, json!({"t": "video_via", "via": "rtc"})).await;
+    let mut ws_frames = 0;
+    let quiet = tokio::time::Instant::now() + Duration::from_millis(300);
+    while let Ok(m) = tokio::time::timeout_at(quiet, next(&mut ws)).await {
+        if let Msg::Frame { seq, .. } = m {
+            send(&mut ws, json!({"t": "ack", "seq": seq})).await;
+        }
+    }
+    let window = tokio::time::Instant::now() + Duration::from_millis(700);
+    while let Ok(m) = tokio::time::timeout_at(window, next(&mut ws)).await {
+        ws_frames += usize::from(matches!(m, Msg::Frame { .. }));
+    }
+    assert_eq!(ws_frames, 0, "frames went over the WebSocket too");
+    page.frame().await;
+
+    // Back on the WebSocket, its stream starts again at a keyframe.
+    send(&mut ws, json!({"t": "video_via", "via": "ws"})).await;
+    let (key, _) = frame(&mut ws).await;
+    assert!(key);
+}
+
+#[tokio::test]
+async fn a_view_only_page_watches_over_webrtc_but_cannot_touch() {
+    let env = rtc_env(free_udp_port()).await;
+    let (token, lease) = device(&env, "alice").await;
+    let mut ws = open(&env, &token, &lease, false).await.ws().await;
+    format(&mut ws).await;
+    let mut page = rtc_page(&mut ws).await;
+    page.frame().await;
+    page.opened().await;
+    page.send.send(json!({"t": "touch", "phase": "down", "x": 0.5, "y": 0.5})).unwrap();
+    assert_eq!(text(&mut ws).await["code"], "view_only");
+    assert!(!env.fake.log().iter().any(|l| l.starts_with("touch")), "{:?}", env.fake.log());
+}
+
+#[tokio::test]
+async fn webrtc_is_refused_when_it_is_off() {
+    let env = setup(2).await;
+    let (token, lease) = device(&env, "alice").await;
+    let view = open(&env, &token, &lease, true).await;
+    let info: Value = view.get("info").await.json().await.unwrap();
+    assert_eq!(info["webrtc"], false);
+    let mut ws = view.ws().await;
+    format(&mut ws).await;
+    let (reply, _) = offer(&mut ws).await;
+    assert_eq!(reply["code"], "rtc_unavailable", "{reply}");
+    // The page keeps its WebSocket stream.
+    frame(&mut ws).await;
+}
+
+#[tokio::test]
+async fn a_page_that_goes_away_frees_its_webrtc_port() {
+    // One port: one WebRTC session at a time.
+    let env = rtc_env(free_udp_port()).await;
+    let (token, lease) = device(&env, "alice").await;
+    let mut first = open(&env, &token, &lease, true).await.ws().await;
+    format(&mut first).await;
+    let page = rtc_page(&mut first).await;
+
+    let mut second = open(&env, &token, &lease, true).await.ws().await;
+    format(&mut second).await;
+    let (reply, _) = offer(&mut second).await;
+    assert_eq!(reply["code"], "rtc_unavailable", "the only port is taken: {reply}");
+
+    drop(page);
+    drop(first);
+    let started = std::time::Instant::now();
+    loop {
+        let (reply, _) = offer(&mut second).await;
+        if reply["t"] == "rtc_answer" {
+            break;
+        }
+        assert!(started.elapsed() < Duration::from_secs(5), "the port stayed taken: {reply}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}

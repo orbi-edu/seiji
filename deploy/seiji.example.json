@@ -62,7 +62,13 @@
     "scale": 0.5,
     "bitrateKbps": 2500,
     "maxViewersPerLease": 4,
-    "sessionHours": 12
+    "sessionHours": 12,
+    "webrtc": {
+      "enabled": false,
+      "bind": "0.0.0.0",
+      "ports": [50000, 50099],
+      "candidates": ["203.0.113.10"]
+    }
   },
   "forward": {
     "enabled": true,

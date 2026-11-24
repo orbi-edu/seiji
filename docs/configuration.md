@@ -59,6 +59,8 @@ Seiji reads one JSON file, `seiji.json`. This document is the reference for ever
 | `evidence.retentionHours`, `evidence.maxRunSeconds`, `evidence.maxSteps`, `evidence.maxRunBytes` and `evidence.maxBytesPerUser` are above 0 | `evidence.retentionHours, maxRunSeconds, maxSteps, maxRunBytes and maxBytesPerUser must be > 0` |
 | `axe.stepTimeoutSeconds` and `xctest.timeoutSeconds` are above 0 | `axe.stepTimeoutSeconds and xctest.timeoutSeconds must be > 0` |
 | `viewer.fps` is within 1–60, `viewer.scale` within 0.1–1, `viewer.bitrateKbps` within 100–20000, and `viewer.maxViewersPerLease` and `viewer.sessionHours` are above 0 | `viewer: fps 1-60, scale 0.1-1, bitrateKbps 100-20000, maxViewersPerLease and sessionHours must be > 0` |
+| With `viewer.webrtc.enabled`, `viewer.webrtc.ports` is `[first, last]` with `0 < first <= last` | `viewer.webrtc.ports must be [first, last] with 0 < first <= last` |
+| With `viewer.webrtc.enabled` and an unspecified `viewer.webrtc.bind` (`0.0.0.0`, `::`), `viewer.webrtc.candidates` is not empty | `viewer.webrtc.candidates: set the addresses that pages reach this host at` |
 | `forward.maxPerLease` is above 0 | `forward.maxPerLease must be > 0` |
 | `listen.publicUrl`, when set, starts with `https://` or `http://` | `listen.publicUrl must start with https:// or http://` |
 | Every name in `adminUsers` is a valid user name (1–32 chars of `[a-z0-9-]`) | `adminUsers: "<name>" is not a valid user name (1-32 chars of [a-z0-9-])` |
@@ -268,10 +270,24 @@ Optional section. The viewer shows a lease's screen live in a browser or in Tern
 | `viewer.bitrateKbps` | integer | `2500` | Target H.264 bitrate in kbit/s, for the `balanced` preset. A congested viewer lowers it for a while ([mcp.md](mcp.md#the-stream)). 100–20000. |
 | `viewer.maxViewersPerLease` | integer | `4` | Viewer pages that may stream one lease at the same time. One more gets `429` `full`. Above 0. |
 | `viewer.sessionHours` | integer | `12` | Longest life of a viewer session (and of its cookie). A session also ends when its lease ends. Above 0. |
+| `viewer.webrtc.enabled` | boolean | `false` | Pages may take the stream and send their input over WebRTC (UDP) instead of the WebSocket. See below. |
+| `viewer.webrtc.bind` | IP address | `"0.0.0.0"` | The address the WebRTC UDP sockets bind to. |
+| `viewer.webrtc.ports` | `[first, last]` | `[50000, 50099]` | The UDP ports, one for each open WebRTC session. When all are in use, a page stays on the WebSocket. |
+| `viewer.webrtc.candidates` | list of IP addresses | `[]` | The addresses pages reach this host at, sent to the page as ICE host candidates. Empty: `bind` (which must then be a specific address). |
 
 Seiji runs one helper process for each watched lease, however many viewers watch it: `<viewer.simBin> session --udid <udid> --fps <fps> --scale <scale> --bitrate <bits per second>`, through `Runner` as the user's account. It starts with the first viewer and stops when the last one leaves or the lease ends. It also carries the viewers' touches, keys and buttons. Higher `fps`, `scale` and `bitrateKbps` cost more bandwidth for each viewer; encoding runs on the Mac's media engine.
 
 Before this version the viewer streamed JPEG and took `viewer.quality`. That key no longer exists: remove it from `seiji.json`, or the config does not load.
+
+### WebRTC
+
+With `viewer.webrtc.enabled`, the page offers a WebRTC session over its WebSocket. Seiji answers it on one UDP port from `ports`, with a candidate for each address in `candidates`. The page then gets the stream as H.264 over SRTP and sends its input on a data channel, while the WebSocket keeps the replies and the presets. A lost packet holds back only its own frame, not the input or the frames after it, so a lossy link shows a stall less often. On a clean link WebRTC adds about 20 ms (the browser's packet pacing and decode); the page asks the browser to play each frame at once, without a jitter buffer.
+
+Seiji is ICE-lite and uses no STUN or TURN server: the page must reach one of `candidates` over UDP, on the ports in `ports`. When it cannot (the ports are closed, the page is behind a proxy that carries only HTTPS), the page stays on the WebSocket after 10 s and says nothing. On EC2, `candidates` is the instance's public address (or its private one, for pages that reach it over a VPN), and the security group must allow UDP on `ports` from the pages' networks ([install.md](install.md#webrtc)).
+
+```json
+"viewer": { "webrtc": { "enabled": true, "ports": [50000, 50099], "candidates": ["203.0.113.10"] } }
+```
 
 ## `forward`
 
@@ -379,7 +395,13 @@ This is [`deploy/seiji.example.json`](../deploy/seiji.example.json): ten seats, 
     "scale": 0.5,
     "bitrateKbps": 2500,
     "maxViewersPerLease": 4,
-    "sessionHours": 12
+    "sessionHours": 12,
+    "webrtc": {
+      "enabled": false,
+      "bind": "0.0.0.0",
+      "ports": [50000, 50099],
+      "candidates": ["203.0.113.10"]
+    }
   },
   "forward": {
     "enabled": true,

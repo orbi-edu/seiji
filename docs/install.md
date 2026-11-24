@@ -424,6 +424,18 @@ Notes:
 - Each tool call response is an SSE stream (`text/event-stream`) with keepalive comments every 15 s. The proxy needs only an idle read timeout above 15 s, not above the absolute operation time. Caddy has no response timeout by default. With another proxy (nginx, an ALB), set its idle or read timeout above 15 s.
 - Run evidence is served at `/v1/runs/<run id>/…` on the same host and needs the same `Authorization` header. A video or an `evidence.zip` can be large; Caddy streams it with no size limit.
 
+### WebRTC
+
+WebRTC carries the viewer's stream and input over UDP, beside the WebSocket ([configuration.md](configuration.md#webrtc)). It does not go through the TLS proxy, and it is off by default. To turn it on:
+
+1. Pick the UDP ports, one for each viewer page that can be open at the same time, for example `50000`–`50099`.
+2. Allow those ports over UDP from the pages' networks: in the security group, and in the macOS firewall if it is on.
+3. Set `viewer.webrtc` in `seiji.json`, with `candidates` set to the address pages reach the host at:
+   ```json
+   "viewer": { "webrtc": { "enabled": true, "ports": [50000, 50099], "candidates": ["203.0.113.10"] } }
+   ```
+4. Restart the daemon. In a viewer, **Stats** shows `Transport: WebRTC (UDP)` once the page plays the WebRTC stream. When it stays on `WebSocket`, the page cannot reach `candidates` on those ports.
+
 ## 12. Connect agents
 
 Each person uses their own token. The MCP endpoint is `https://<host>/mcp` (Streamable HTTP) with the header `Authorization: Bearer <token>`. [mcp.md](mcp.md) documents the tools and the upload endpoint.

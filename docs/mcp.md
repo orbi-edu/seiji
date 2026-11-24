@@ -1791,7 +1791,7 @@ These routes take no bearer token. `GET /view/open/{ticket}` trades a ticket (si
 | `GET /view/open/{ticket}` | `303` to the page with the session cookie. A used or expired ticket gets a `401` HTML page |
 | `GET /view/s/{sid}/` | The viewer page |
 | `GET /view/assets/viewer.js`, `GET /view/assets/viewer.css` | The page's script and style, embedded in the binary |
-| `GET /view/s/{sid}/info` | JSON: `lease_id`, `user`, `model`, `device_type`, `runtime`, `udid`, `started_at`, `ends_at_latest`, `control`, `busy` (a run holds the device), `viewers`, `app`, `preset`, `stream_opts` (`fps`, `scale`, `bitrate`), `server_time_ms` |
+| `GET /view/s/{sid}/info` | JSON: `lease_id`, `user`, `model`, `device_type`, `runtime`, `udid`, `started_at`, `ends_at_latest`, `control`, `busy` (a run holds the device), `viewers`, `app`, `preset`, `stream_opts` (`fps`, `scale`, `bitrate`), `server_time_ms`, `webrtc` (`viewer.webrtc.enabled`) |
 | `GET /view/s/{sid}/stats` | JSON: `stream` (`started_at_ms`, `fps`, `kbps`, `mean_frame_bytes`, `total_frames`, `total_bytes`, `viewers`, `last_frame_at_ms`), `preset`, `opts` (`fps`, `scale`, `bitrate` now) |
 | `GET /view/s/{sid}/ws` | The WebSocket of the page: the stream out, the input in (below). The `Origin` header, when present, must name this host |
 | `GET /view/s/{sid}/screenshot.jpg` | A JPEG download of the screen |
@@ -1818,11 +1818,24 @@ The server sends:
 
 - A text message `{"t": "format", "codec": "avc1.PPCCLL", "width", "height", "description": "<base64 avcC>"}` before the first frame and after a size change: the arguments of WebCodecs `VideoDecoder.configure`.
 - One binary message for each frame: 1 byte of flags (bit 0: keyframe), the frame number (4 bytes, big-endian), the capture time in Unix microseconds (8 bytes, big-endian), then the sample in AVCC form (a 4-byte length before each NAL unit).
-- `{"t": "pong", "at", "server_ms"}` for each ping, `{"t": "preset", "preset", "opts"}` after a preset change, and `{"t": "done", "id", "via"}` after a text input.
+- `{"t": "pong", "at", "server_ms"}` for each ping, `{"t": "preset", "preset", "opts"}` after a preset change, `{"t": "done", "id", "via"}` after a text input, and `{"t": "rtc_answer", "sdp"}` after a WebRTC offer.
 
 The page acknowledges each frame with `{"t": "ack", "seq": <frame number>}` once it has shown it (a frame it skips, once it skipped it), so a slow decoder holds the stream back like a slow link. A viewer whose oldest unacknowledged frame is older than its lowest round trip of the last 10 s plus 200 ms (or 60 frames are in flight) is congested: Seiji sends it no more frames until it catches up, then asks the helper for a keyframe and resumes there. So a slow link shows a recent picture with gaps, never a growing delay. A joining viewer gets the current format and a keyframe at once; a viewer that fell behind the shared buffer gets the current format again if it missed one. Seiji reads the page apart from writing to it: input reaches the device while a frame is still on its way down a slow link. When one write to the page stalls for 5 s, Seiji closes the session. Once a session ends, or the page closes its socket, input still queued for it is dropped.
 
 A congested viewer also lowers the shared bitrate to 70 %, at most every 2 s and never below 20 % of the preset. After 4 s without congestion the bitrate grows 15 % every 2 s, back to the preset.
+
+### WebRTC
+
+With `viewer.webrtc.enabled` (`info.webrtc` is `true`), the page can take the stream and send its input over WebRTC ([configuration.md](configuration.md#webrtc)):
+
+1. The page sends `{"t": "rtc_offer", "sdp"}` on its WebSocket: one `recvonly` video transceiver and a data channel labeled `input`. Seiji answers `{"t": "rtc_answer", "sdp"}`, or an `error` with `code` `rtc_unavailable` when WebRTC is off or every port is in use. A new offer replaces the session's old WebRTC session.
+2. The page connects over UDP to the answer's candidates. Seiji sends the shared stream as H.264 (Annex B, the SPS and PPS before each keyframe), with the capture time as RTP time at 90 kHz and a playout delay of 0. Frames start at a keyframe, and a lost one gets a keyframe on the browser's request (PLI or FIR).
+3. Once it plays the WebRTC video, the page sends `{"t": "video_via", "via": "rtc"}` on the WebSocket, and Seiji stops sending it frames there. `{"t": "video_via", "via": "ws"}` brings them back, starting at a keyframe.
+4. On the `input` channel, the page sends the same input messages as on the WebSocket (`touch`, `key`, `button`, `type`, `paste`, `paste_and_type`) and `ping`, answered on the channel with `pong`. They join the WebSocket's input queue; their replies (`done`, errors) come on the WebSocket. Anything else gets `bad_request`.
+
+The bandwidth estimate (transport-wide congestion control) replaces the acknowledgments: an estimate below 90 % of the stream's bitrate counts as congestion and lowers the shared bitrate, as above. A WebRTC session ends with its WebSocket, when its peer disconnects, or 15 s after the answer if the page never connects.
+
+The page uses WebRTC when `info.webrtc` is `true` and the browser has `RTCPeerConnection` and `requestVideoFrameCallback`. It falls back to the WebSocket stream when WebRTC does not play within 10 s or the connection fails, and tries again on its next WebSocket. A gesture keeps the path its `down` took.
 
 ### Quality presets
 
@@ -1849,7 +1862,9 @@ The page sends text messages, each a JSON object with `t`. Points are fractions 
 | `preset` | `name` | See [Quality presets](#quality-presets) |
 | `ack` | `seq` | The last frame shown (or skipped) |
 | `keyframe` | | The page dropped frames (its decoder fell behind or was reset): start over at a keyframe. Also allowed in a view-only session |
-| `ping` | `at` | Echoed back in a `pong`. The page sends one every second |
+| `ping` | `at` | Echoed back in a `pong`. The page sends one every second, on the WebRTC `input` channel when it is open |
+| `rtc_offer` | `sdp` | A WebRTC offer; see [WebRTC](#webrtc). Also allowed in a view-only session |
+| `video_via` | `via` (`ws`, `rtc`) | Where the page shows the stream from; see [WebRTC](#webrtc). Also allowed in a view-only session |
 
 Input restarts the idle timer. Viewer input is not recorded as a run.
 

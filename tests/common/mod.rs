@@ -232,15 +232,25 @@ impl Devices for FakeDevices {
         cancel: &CancellationToken,
     ) -> Result<()> {
         self.streams_started.fetch_add(1, Ordering::SeqCst);
-        let format =
-            ScreenFormat { codec: "avc1.64001f".into(), width: 402, height: 874, description: "AWQAH/8=".into() };
+        // An avcC with one SPS and one PPS, as `seiji-sim` sends it.
+        let format = ScreenFormat {
+            codec: "avc1.64001f".into(),
+            width: 402,
+            height: 874,
+            description: "AWQAH//hAARnZAAfAQACaM4=".into(),
+        };
         let size = self.frame_bytes.load(Ordering::SeqCst);
+        // One length-prefixed NAL unit, an IDR slice (5) or a non-IDR one (1), that carries the
+        // frame number.
         let frame = |n: u64, key: bool| {
             let captured_us =
                 std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_micros()
                     as i64;
-            let mut data = n.to_be_bytes().to_vec();
-            data.resize(size.max(data.len()), 0);
+            let mut nal = vec![if key { 0x65 } else { 0x41 }];
+            nal.extend_from_slice(&n.to_be_bytes());
+            nal.resize(size.saturating_sub(4).max(nal.len()), 0);
+            let mut data = (nal.len() as u32).to_be_bytes().to_vec();
+            data.extend_from_slice(&nal);
             ScreenEvent::Frame(VideoFrame { key, captured_us, data: bytes::Bytes::from(data) })
         };
         events.send(ScreenEvent::Ready).await?;

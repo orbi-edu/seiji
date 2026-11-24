@@ -9,7 +9,11 @@
 //! asked for a link to another user's lease) and that the lease is still the user's and ready;
 //! the page's WebSocket checks them again every 2 s. One `seiji-sim` helper per lease encodes the
 //! screen as H.264 for all its viewers and takes their touches and keys over one persistent HID
-//! connection; it stops when the last viewer leaves or the lease ends.
+//! connection; it stops when the last viewer leaves or the lease ends. With `viewer.webrtc` on, a
+//! page can take the stream and send its input over WebRTC instead (`rtc`), and keeps the
+//! WebSocket for the rest.
+
+mod rtc;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
@@ -411,6 +415,8 @@ pub enum ViewError {
     Full(usize),
     /// A WebSocket from a page on another site.
     CrossOrigin,
+    /// WebRTC is off, or no port is free: the page stays on the WebSocket.
+    Rtc(String),
     Bad(String),
     Internal(anyhow::Error),
 }
@@ -441,6 +447,7 @@ impl ViewError {
                 (StatusCode::FORBIDDEN, "cross_origin", "The viewer only accepts its own page.".into())
             }
             ViewError::Bad(why) => (StatusCode::BAD_REQUEST, "bad_request", why.clone()),
+            ViewError::Rtc(why) => (StatusCode::SERVICE_UNAVAILABLE, "rtc_unavailable", why.clone()),
             ViewError::Internal(e) => (StatusCode::INTERNAL_SERVER_ERROR, "internal", format!("{e:#}")),
         }
     }
@@ -791,6 +798,21 @@ enum ClientMsg {
         id: u32,
         text: String,
     },
+    /// The page's WebRTC offer (SDP); answered with `rtc_answer`.
+    RtcOffer {
+        sdp: String,
+    },
+    /// Where the page shows the stream from: `rtc` stops the frames on the WebSocket.
+    VideoVia {
+        via: Via,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Via {
+    Ws,
+    Rtc,
 }
 
 /// Which frames a viewer gets: all of them while it keeps up, then none until a keyframe once
@@ -886,6 +908,8 @@ async fn put(sink: &mut futures_util::stream::SplitSink<WebSocket, Message>, m: 
 enum Ctl {
     Ack(u32),
     Keyframe,
+    /// The page shows the WebRTC stream (`true`) or the WebSocket's.
+    Rtc(bool),
 }
 
 async fn session(live: Live, mut video: broadcast::Receiver<Video>, socket: WebSocket) {
@@ -914,6 +938,8 @@ async fn session(live: Live, mut video: broadcast::Receiver<Video>, socket: WebS
     });
     let input = tokio::spawn(run_input(input, in_rx, out_tx, stop.clone()));
     let mut flow = Flow::new();
+    // The page shows the WebRTC stream: the WebSocket carries no frames.
+    let mut rtc_video = false;
     // The format may be in the cache and in the channel both: send each one once.
     let mut sent_format = hub.format.lock().expect("format mutex").clone();
     let mut close = None;
@@ -937,7 +963,7 @@ async fn session(live: Live, mut video: broadcast::Receiver<Video>, socket: WebS
                     }
                 }
                 Ok(Video::Frame(f)) => {
-                    if flow.admit(&f, &hub) && !put(&mut sink, Message::Binary(f.message.clone())).await {
+                    if !rtc_video && flow.admit(&f, &hub) && !put(&mut sink, Message::Binary(f.message.clone())).await {
                         close = Some(None);
                     }
                 }
@@ -962,6 +988,14 @@ async fn session(live: Live, mut video: broadcast::Receiver<Video>, socket: WebS
                 Some(Ctl::Keyframe) => {
                     flow.need_key = true;
                     hub.keyframe(false);
+                }
+                Some(Ctl::Rtc(on)) => {
+                    rtc_video = on;
+                    if !on {
+                        // Back on the WebSocket: start over at a keyframe.
+                        flow = Flow::new();
+                        hub.keyframe(false);
+                    }
                 }
                 // The page closed its socket.
                 None => close = Some(None),
@@ -992,8 +1026,9 @@ async fn session(live: Live, mut video: broadcast::Receiver<Video>, socket: WebS
 }
 
 /// Reads the page on its own task, so input reaches the device while a video frame is still
-/// being written to a slow link. Replies go through `out`; acks and keyframe requests go to the
-/// session loop. Returns, closing `ctl`, when the page closes its socket.
+/// being written to a slow link. Replies go through `out`; acks, keyframe requests and the
+/// page's choice of video transport go to the session loop. The page's WebRTC session, if any,
+/// lives here. Returns, closing `ctl`, when the page closes its socket.
 async fn read_page(
     mut stream: futures_util::stream::SplitStream<WebSocket>,
     pool: Arc<Pool>,
@@ -1003,6 +1038,7 @@ async fn read_page(
     out: mpsc::Sender<Message>,
     ctl: mpsc::Sender<Ctl>,
 ) {
+    let mut rtc: Option<rtc::RtcSession> = None;
     while let Some(Ok(m)) = stream.next().await {
         let t = match m {
             Message::Text(t) => t,
@@ -1037,6 +1073,34 @@ async fn read_page(
             Ok(ClientMsg::Preset { name }) => {
                 let opts = hub.set_preset(name, &pool.config.viewer);
                 Some(text(serde_json::json!({ "t": "preset", "preset": name, "opts": opts })))
+            }
+            Ok(ClientMsg::RtcOffer { sdp }) => {
+                let cfg = &pool.config.viewer.webrtc;
+                if cfg.enabled {
+                    // A new offer replaces the old session and frees its port first.
+                    if let Some(old) = rtc.take() {
+                        old.close().await;
+                    }
+                    let peer = rtc::Peer { hub: hub.clone(), control, input: input.clone(), out: out.clone() };
+                    match rtc::start(cfg, &sdp, peer).await {
+                        Ok((answer, session)) => {
+                            rtc = Some(session);
+                            Some(text(serde_json::json!({ "t": "rtc_answer", "sdp": answer })))
+                        }
+                        Err(e) => Some(e.message(None)),
+                    }
+                } else {
+                    Some(
+                        ViewError::Rtc("WebRTC is off on this host: the video stays on the WebSocket.".into())
+                            .message(None),
+                    )
+                }
+            }
+            Ok(ClientMsg::VideoVia { via }) => {
+                if ctl.send(Ctl::Rtc(via == Via::Rtc && rtc.is_some())).await.is_err() {
+                    return;
+                }
+                None
             }
             Ok(msg) => input.try_send(msg).err().map(|_| ViewError::Busy.message(None)),
             Err(e) => Some(ViewError::Bad(format!("invalid message: {e}")).message(None)),
@@ -1207,7 +1271,13 @@ impl Input {
                 let via = self.pasted(&text).await?;
                 return Ok(Some(done(id, Some(via))));
             }
-            ClientMsg::Ack { .. } | ClientMsg::Ping { .. } | ClientMsg::Keyframe | ClientMsg::Preset { .. } => {}
+            // The reader handles these; they never reach the input queue.
+            ClientMsg::Ack { .. }
+            | ClientMsg::Ping { .. }
+            | ClientMsg::Keyframe
+            | ClientMsg::Preset { .. }
+            | ClientMsg::RtcOffer { .. }
+            | ClientMsg::VideoVia { .. } => {}
         }
         Ok(None)
     }
@@ -1423,6 +1493,7 @@ async fn info(
         "preset": preset,
         "stream_opts": opts,
         "server_time_ms": now_ms(),
+        "webrtc": pool.config.viewer.webrtc.enabled,
     }))
     .into_response();
     no_store(resp.headers_mut());

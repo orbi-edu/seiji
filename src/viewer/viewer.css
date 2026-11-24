@@ -228,6 +228,22 @@ button:focus-visible, select:focus-visible { outline: 2px solid var(--accent); o
 }
 .finger[hidden] { display: none; }
 
+/* The WebRTC stream, laid over the canvas once it plays. Kept in the layout (not display: none)
+   so the browser keeps decoding it; the canvas below takes the pointer. */
+.screen video.rtc {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  object-fit: fill;
+  border-radius: 24px;
+  background: #000;
+  pointer-events: none;
+}
+.screen video.rtc.on { opacity: 1; }
+
 /* The finger's path and taps, drawn at once over the picture. */
 .screen canvas.trail {
   position: absolute;

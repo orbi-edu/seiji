@@ -265,6 +265,8 @@ pub struct Viewer {
     pub max_viewers_per_lease: usize,
     /// A viewer session lasts at most this long (and never past its lease).
     pub session_hours: i64,
+    /// The stream and input over WebRTC (UDP), next to the WebSocket.
+    pub webrtc: Webrtc,
 }
 
 impl Default for Viewer {
@@ -276,6 +278,33 @@ impl Default for Viewer {
             bitrate_kbps: 2500,
             max_viewers_per_lease: 4,
             session_hours: 12,
+            webrtc: Webrtc::default(),
+        }
+    }
+}
+
+/// WebRTC for the viewer: each page that asks gets one UDP port from `ports` for its video and
+/// input. The page keeps the WebSocket for everything else, and falls back to it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields, default)]
+pub struct Webrtc {
+    /// Off: pages stream over the WebSocket only.
+    pub enabled: bool,
+    /// The address the UDP sockets bind to.
+    pub bind: std::net::IpAddr,
+    /// The UDP ports to use, `[first, last]`: one per open WebRTC session.
+    pub ports: [u16; 2],
+    /// The addresses pages reach this host at (ICE host candidates). Empty: `bind`.
+    pub candidates: Vec<std::net::IpAddr>,
+}
+
+impl Default for Webrtc {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            ports: [50000, 50099],
+            candidates: Vec::new(),
         }
     }
 }
@@ -428,6 +457,15 @@ impl Config {
             bail!(
                 "viewer: fps 1-60, scale 0.1-1, bitrateKbps 100-20000, maxViewersPerLease and sessionHours must be > 0"
             );
+        }
+        let rtc = &v.webrtc;
+        if rtc.enabled {
+            if rtc.ports[0] == 0 || rtc.ports[0] > rtc.ports[1] {
+                bail!("viewer.webrtc.ports must be [first, last] with 0 < first <= last");
+            }
+            if rtc.candidates.is_empty() && rtc.bind.is_unspecified() {
+                bail!("viewer.webrtc.candidates: set the addresses that pages reach this host at");
+            }
         }
         if config.forward.max_per_lease == 0 {
             bail!("forward.maxPerLease must be > 0");
