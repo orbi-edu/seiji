@@ -62,6 +62,15 @@ pub struct LeaseView {
     pub idle_release_minutes: i64,
 }
 
+/// An active lease and its owner, for the admin endpoints.
+#[derive(Debug, Serialize)]
+pub struct AdminLeaseView {
+    pub user_id: i64,
+    pub user: String,
+    #[serde(flatten)]
+    pub lease: LeaseView,
+}
+
 #[derive(Debug, Serialize)]
 pub struct BudgetView {
     pub user: String,
@@ -520,6 +529,39 @@ impl Pool {
     /// The caller's lease, checked for ownership and readiness, without taking its op lock.
     pub(crate) fn peek_lease(&self, user: &User, lease_id: Option<&str>) -> Result<Lease> {
         self.resolve(&self.fresh_user(user)?, lease_id, false)
+    }
+
+    /// Every active lease with its owner, for an admin. The caller checks `adminUsers`.
+    pub fn admin_leases(&self) -> Result<Vec<AdminLeaseView>> {
+        let users: HashMap<i64, User> = self.store.users()?.into_iter().map(|u| (u.id, u)).collect();
+        Ok(self
+            .store
+            .active_leases()?
+            .into_iter()
+            .filter_map(|l| {
+                let u = users.get(&l.user_id)?;
+                Some(AdminLeaseView { user_id: u.id, user: u.name.clone(), lease: self.view(&l, u) })
+            })
+            .collect())
+    }
+
+    /// Any user's ready lease and its enabled owner, for an admin. This is the one lookup that
+    /// skips the owner check of `resolve`; its callers check `adminUsers` first.
+    pub(crate) fn admin_lease(&self, lease_id: &str) -> Result<(User, Lease)> {
+        let lease = self
+            .store
+            .lease(lease_id)?
+            .filter(|l| l.status != LeaseStatus::Ended)
+            .with_context(|| format!("no active lease {lease_id:?}"))?;
+        if lease.status != LeaseStatus::Ready {
+            bail!("lease {} is still booting", lease.id);
+        }
+        let owner = self
+            .store
+            .user_by_id(lease.user_id)?
+            .filter(|u| !u.disabled)
+            .with_context(|| format!("the user of lease {} is disabled or removed", lease.id))?;
+        Ok((owner, lease))
     }
 
     pub(crate) fn runtime_of(&self, lease_id: &str) -> Option<Arc<LeaseRuntime>> {

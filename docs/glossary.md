@@ -4,7 +4,7 @@ All Seiji documents use these terms with these meanings only. [concepts.md](conc
 
 | Term | Meaning |
 |---|---|
-| **Admin** | A user whose name is in `adminUsers` in the config. Admins can list users and change budgets and concurrency through the admin HTTP endpoints. Authority comes only from the config, never from client-supplied flags. An admin is still an unprivileged macOS tenant. |
+| **Admin** | A user whose name is in `adminUsers` in the config. Admins can list users and change budgets and concurrency through the admin HTTP endpoints, list every user's devices, and get a viewer link to any user's device. Authority comes only from the config, never from client-supplied flags. An admin is still an unprivileged macOS tenant. |
 | **adb** | The Android Debug Bridge (`<android.sdkRoot>/platform-tools/adb`); all emulators on the host share one adb server on port 5037, because Maestro hardcodes that port. |
 | **Admission** | The atomic check under the admission lock (budget, concurrency, capacity, ports) that creates a `booting` lease, or fails at once because Seiji has no queue. |
 | **Admission lock** | The in-process lock of `seiji serve` that makes admission atomic, so two calls cannot both take the last slot. |
@@ -49,7 +49,7 @@ All Seiji documents use these terms with these meanings only. [concepts.md](conc
 | **Tunnel** | What `seiji forward` opens: a WebSocket to `GET /v1/leases/{lease_id}/forward` that carries every connection the device makes to its device address to one port on the developer's machine, such as Metro on `8081`; it ends with the client or the lease. |
 | **User** | A Seiji account with a token and a quota: a row in the `users` table. |
 | **Viewer** | The live view of a lease's iOS simulator screen in a browser or in Tern (`/view/…`), which can also send taps, swipes, typing and buttons; one AXe stream per lease serves every viewer of it. |
-| **Viewer link** | The one-time URL `<publicUrl>/view/open/<ticket>` from `share_screen` (view-only by default) or `POST /v1/leases/{lease_id}/viewer` (control by default), valid 60 s. |
+| **Viewer link** | The one-time URL `<publicUrl>/view/open/<ticket>` from `share_screen` (view-only by default), `POST /v1/leases/{lease_id}/viewer` (control by default) or, for an admin, `POST /v1/admin/leases/{lease_id}/viewer` (view-only by default), valid 60 s. |
 | **Viewer session** | What an opened viewer link becomes: a session id and a secret in the `seiji_view` cookie, kept in memory as a SHA-256, view-only or with control, ending at `viewer.sessionHours`, at the lease's end or at a daemon restart. |
 | **Workspace** | The root of a user's files on the host: `~<tenant account>/seiji` under `os_user`, `<dataDir>/tenants/<user>` under `shared`. |
 | **XCTest driver** | The test runner app that Maestro installs in an iOS simulator to drive it, reached through the driver port. |

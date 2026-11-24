@@ -61,7 +61,7 @@ flowchart LR
 | Boundary | Control |
 |---|---|
 | Agent → edge | TLS at the proxy. Seiji itself serves plain HTTP. |
-| Edge → daemon | A bearer token on `/mcp`, `POST /v1/apps`, `GET /v1/runs/{run_id}/...`, `GET /v1/me`, `/v1/admin/...` and `/v1/leases/{lease_id}/...`. A missing, unknown or disabled token gets `401`. The admin endpoints (`GET /v1/admin/users`, `PUT /v1/admin/users/{id}/limits`) also require the user's name to be in `adminUsers`; non-admin users get `403`. Admin authority comes only from the operator-controlled config, never from client-supplied flags. No endpoint grants or changes roles, creates users, reveals tokens or changes global host capacity. `/mcp` checks the `Host` header against `listen.allowedHosts`. `POST /v1/apps` has a body limit of `maxUploadBytes`. The viewer routes (`/view/...`) use a session cookie instead of the token (see [The viewer](#the-viewer)). `GET /healthz` is open. |
+| Edge → daemon | A bearer token on `/mcp`, `POST /v1/apps`, `GET /v1/runs/{run_id}/...`, `GET /v1/me`, `/v1/admin/...` and `/v1/leases/{lease_id}/...`. A missing, unknown or disabled token gets `401`. The admin endpoints (`GET /v1/admin/users`, `PUT /v1/admin/users/{id}/limits`, `GET /v1/admin/leases`, `POST /v1/admin/leases/{lease_id}/viewer`) also require the user's name to be in `adminUsers`; non-admin users get `403`. Admin authority comes only from the operator-controlled config, never from client-supplied flags. No endpoint grants or changes roles, creates users, reveals tokens or changes global host capacity. `/mcp` checks the `Host` header against `listen.allowedHosts`. `POST /v1/apps` has a body limit of `maxUploadBytes`. The viewer routes (`/view/...`) use a session cookie instead of the token (see [The viewer](#the-viewer)). `GET /healthz` is open. |
 | User → user (in Seiji) | Every lease operation checks that the lease belongs to the caller ("no active lease ... for you"). A build is found by id and owner together ("no uploaded app ..."). A run is found by id and owner together (`no run "r_..." for you`, HTTP `404` on the downloads). |
 | Daemon → root | sudoers allows `seiji` to run only `seiji exec-as *` and `seiji kill-as *`, with `-n` and `env_reset`. The helpers never read the config. They refuse every account that is not a valid tenant account. |
 | Root → tenant | `exec-drop` drops to the tenant account and checks that the drop stuck. The pidfile is written as the tenant account. `kill-as` signals as the tenant account. |
@@ -265,7 +265,7 @@ The viewer shows a lease's screen live in a browser or in Tern, and can send inp
 
 ### Ticket and cookie
 
-1. The lease's owner asks for a viewer link with the bearer token: `share_screen` (view-only by default) or `POST /v1/leases/{lease_id}/viewer` (control by default). The lease must be the caller's, `ready`, and iOS.
+1. The lease's owner asks for a viewer link with the bearer token: `share_screen` (view-only by default) or `POST /v1/leases/{lease_id}/viewer` (control by default). The lease must be the caller's, `ready`, and iOS. An admin (a name in `adminUsers`) can also ask for a link to any user's lease with `POST /v1/admin/leases/{lease_id}/viewer` (view-only by default). That lease must be `ready` and iOS, and its user must exist and not be disabled. Seiji logs every admin link with the admin, the user, the lease and `control`.
 2. Seiji returns `/view/open/<ticket>`. The ticket is 64 random hex characters, lives 60 s and works once.
 3. `GET /view/open/{ticket}` removes the ticket and makes a viewer session: a session id (32 hex) and a secret (64 hex). Seiji keeps only the SHA-256 of the secret, in memory. It answers `303` to `/view/s/{sid}/` and sets `seiji_view=<secret>; Path=/view/s/<sid>; Max-Age=<sessionHours × 3600>; HttpOnly; SameSite=Strict`, plus `Secure` when `listen.publicUrl` starts with `https://`. A used or expired ticket gets a `401` HTML page.
 
@@ -273,18 +273,18 @@ A viewer link is a credential for 60 s: the first person who opens it gets the s
 
 ### What each request checks
 
-Every `/view/s/{sid}/...` request checks, in order: the session exists, it has not expired, the cookie's secret matches the stored hash, the user exists and is not disabled, and the lease is still that user's and `ready`. Errors are JSON `{"error": {"code", "message"}}`:
+Every `/view/s/{sid}/...` request checks, in order: the session exists, it has not expired, the cookie's secret matches the stored hash, the user exists and is not disabled, for an admin's link to another user's lease the admin exists, is not disabled and is in `adminUsers`, and the lease is still that user's and `ready`. An admin's link to their own lease is the owner's session like any other. `adminUsers` changes only with a restart, which ends every session. Errors are JSON `{"error": {"code", "message"}}`:
 
 | Status | `code` | Cause |
 |---|---|---|
-| `401` | `expired` | No session, a wrong secret, an expired session, or a removed or disabled user. Open a new link |
+| `401` | `expired` | No session, a wrong secret, an expired session, or a removed or disabled user or admin. Open a new link |
 | `410` | `gone` | The lease was released, is booting, or is being released |
 | `409` | `busy` | Input only: a run or another input holds the device |
 | `403` | `view_only` | Input in a view-only session |
 | `429` | `full` | The lease already has `viewer.maxViewersPerLease` streams |
 | `400` | `bad_request` | A missing `X-Seiji-View` header, or a bad input body |
 
-A session ends at `viewer.sessionHours` or with its lease, whichever comes first. `seiji user disable` and `seiji user remove` end it at the next request. Sessions and tickets live in memory: the reaper prunes expired ones every 15 s, and a daemon restart ends them all.
+A session ends at `viewer.sessionHours` or with its lease, whichever comes first. `seiji user disable` and `seiji user remove` end it at the next request, for the lease's user and for the admin who asked for the link. Sessions and tickets live in memory: the reaper prunes expired ones every 15 s, and a daemon restart ends them all.
 
 ### Input
 
@@ -308,6 +308,7 @@ No inline script runs, and no other site can frame the page.
 
 - **No `Secure` cookie over plain HTTP.** Without an `https://` `listen.publicUrl`, the cookie lacks `Secure`, and the browser sends it over plain HTTP too.
 - **A person with control acts as the user.** Taps and typing reach the user's device and app like the agent's own steps. They are not recorded as a run. Share view-only links unless the person must drive.
+- **An admin sees every device.** An admin can watch any user's screen, and with `control: true` drive it as that user. The user is not told. Only the log line records it. Keep `adminUsers` short.
 - **The stream is the screen.** Whatever the simulator shows, passwords in plain fields included, reaches every viewer.
 
 ## Tunnels (`seiji forward`)
@@ -353,7 +354,7 @@ An open tunnel restarts its lease's idle timer every 60 s, so the lease is not r
 - **Not verified on a real host:** AXe and `recordVideo` as a tenant account through `exec-as`, and the exact JSON shape of `xcresulttool get test-results tests` (the parser is tolerant).
 - **Shared adb server.** See [Android and the shared adb server](#android-and-the-shared-adb-server).
 - **No token expiry, roles or rate limits.** Evidence links need the token too (see [`publicUrl` links](#publicurl-links)).
-- **Viewer link and sessions.** A viewer link opens for anyone in its first 60 s. A session lives up to `viewer.sessionHours` unless its lease ends first, and has no other revocation than disabling the user. Without an `https://` `publicUrl` the cookie is not `Secure`. The viewer works on iOS only. See [The viewer](#the-viewer).
+- **Viewer link and sessions.** A viewer link opens for anyone in its first 60 s. A session lives up to `viewer.sessionHours` unless its lease ends first. Disabling or removing the user ends it, and so does disabling or removing the admin who asked for a link to another user's lease; nothing else revokes it. Without an `https://` `publicUrl` the cookie is not `Secure`. The viewer works on iOS only. See [The viewer](#the-viewer).
 - **Viewer streaming is not verified on a real simulator.** The `axe stream-video` flags and its raw framing were checked against AXe's source only. `seiji doctor` does not test streaming yet.
 - **Tunnels use the shared loopback.** Any local process can connect to an open tunnel's port on the host while it is open, and so reach the developer's dev server. See [Tunnels (`seiji forward`)](#tunnels-seiji-forward).
 - **No audit log.** The `leases` table records who held which device and when, and the `runs` table records each run until retention. The log at `/usr/local/var/log/seiji.log` (from the launchd plist) records lease, release and run events.

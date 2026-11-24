@@ -147,7 +147,15 @@ An agent can call the MCP tool `share_screen` to give you a link to its simulato
 
 When the signed-in user is a Seiji admin (listed in `adminUsers` in [configuration.md](configuration.md)), the panel adds a **Users** tab beside Devices and Runs.
 
-The Users tab lists every Seiji user with their name, active devices, budget, admin and disabled state. Select a user to see their detail card: status, admin flag, used minutes, session and idle limits, and host capacity.
+The Users tab lists every Seiji user with their name, active devices, budget, admin and disabled state. Select a user to see their detail card: status, admin flag, used minutes, session and idle limits, host capacity, and the devices the user holds now.
+
+Each ready iOS device in the card has three actions:
+
+- **Watch** opens a view-only screen beside the panel.
+- **Control** opens the screen with control. Your taps and typing reach the user's device as that user.
+- **Copy link** copies a view-only viewer link. It opens once, within 60 s.
+
+These links come from `POST /v1/admin/leases/{lease_id}/viewer` ([mcp.md](mcp.md#post-v1adminleaseslease_idviewer)). Seiji logs each one. The user is not told ([security.md](security.md#the-viewer)).
 
 Press `e` (or click **Edit**) to edit the selected user's limits:
 

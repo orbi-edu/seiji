@@ -246,7 +246,46 @@ end
 
 -- ── Users (admin) ─────────────────────────────────────────────────────────
 
-local function user_detail(state: any, u: any): Node
+-- The devices the user holds, each with Watch (view-only), Control and Copy link (view-only).
+local function user_devices(state: any, A: any, u: any): Node
+	local rows: { Node } = {}
+	for _, d in A.admin_devices(state, u.id) do
+		local parts: { Node } = {
+			ui.text({
+				ui.span(d.model, "strong"),
+				ui.span("  " .. (if d.platform == "ios" then "iOS" else "Android"), "muted"),
+				ui.span("  " .. d.status, STATUS_TONE[d.status] or "muted"),
+				ui.span("  " .. d.lease_id, "muted mono"),
+				ui.span(" · ends " .. fmt.until_(d.ends_at_latest), "muted"),
+			}),
+		}
+		if d.platform == "ios" and d.status == "ready" then
+			local opening = state.busy["viewer:" .. d.lease_id]
+			table.insert(parts, h.action(if opening then "Opening…" else "Watch", "admin_watch=" .. d.lease_id, "accent", "watch"))
+			table.insert(parts, h.action("Control", "admin_control=" .. d.lease_id, "neutral", "control"))
+			table.insert(parts, h.action("Copy link", "admin_link=" .. d.lease_id, "neutral", "link"))
+		end
+		table.insert(rows, ui.node("row", { key = key_of(d.lease_id), gap = "sm", align = "center", wrap = true }, parts))
+	end
+	local err = state.errs.admin_leases
+	local loaded = type(state.data.admin_leases) == "table"
+	if #rows == 0 then
+		-- "No devices" only after a list came back; a failed first read says why instead.
+		if loaded then
+			table.insert(rows, h.with(h.muted("No devices."), { key = "none" }))
+		elseif err then
+			table.insert(rows, h.with(ui.text({ ui.span("Could not load devices: " .. err, "error") }), { key = "err" }))
+		else
+			table.insert(rows, h.with(h.muted("Loading devices…"), { key = "loading" }))
+		end
+	end
+	if loaded and err then
+		table.insert(rows, h.with(h.muted("Could not refresh: " .. err), { key = "stale" }))
+	end
+	return h.card("devices", { ui.span("Devices", "strong") }, rows)
+end
+
+local function user_detail(state: any, A: any, u: any): Node
 	local is_editing = state.editing and state.editing.user_id == u.id
 	local body: { Node } = {}
 
@@ -338,6 +377,7 @@ local function user_detail(state: any, u: any): Node
 			h.action_key("Edit", "edit_user", "e", "accent"),
 		}))
 	end
+	table.insert(body, user_devices(state, A, u))
 
 	local name_spans: Spans = { ui.span(u.name, "strong") }
 	if u.disabled then
@@ -405,7 +445,7 @@ local function users_view(state: any, A: any): Node
 	if #cap_parts > 0 then
 		table.insert(detail_parts, ui.node("row", { key = "cap", gap = "sm", align = "center" }, cap_parts))
 	end
-	table.insert(detail_parts, user_detail(state, u))
+	table.insert(detail_parts, user_detail(state, A, u))
 	local detail = ui.node("col", { key = "detail", gap = "md" }, detail_parts)
 	return master_detail(state, pick_list("users", items, sel_id, "edit_user"), detail)
 end

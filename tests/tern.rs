@@ -281,6 +281,52 @@ async fn admin_sees_users_tab_edits_and_saves_limits() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn admin_watches_another_users_device_from_the_users_tab() {
+    let Some(bin) = tern() else {
+        eprintln!("skipped: tern is not on PATH");
+        return;
+    };
+    let env = setup_with(2, json!({ "adminUsers": ["alice"] })).await;
+    let alice_token = add_user(&env, "alice", QUOTA);
+    let bob_token = add_user(&env, "bob", QUOTA);
+    let c = client(&env, &bob_token).await;
+    let lease = ok_json(&call(&c, "acquire_device", json!({"platform": "ios"})).await);
+    let lease_id = lease["lease_id"].as_str().unwrap().to_string();
+
+    let mut t = Tern::start(bin, &env, &alice_token).await;
+    t.ctl(&["plugins", "run", "plugin.seiji.devices"]).await;
+    t.wait_text("No devices", "sf-main").await;
+    t.ctl(&["key", "tab"]).await;
+    t.wait_text("No runs yet", "sf-main").await;
+    t.ctl(&["key", "tab"]).await;
+    t.wait_for("user list loaded", ".tn-pane.on .sf-main .sf-item", |s| s.contains("alice") && s.contains("bob")).await;
+    t.wait_text("No devices.", "sf-main").await;
+
+    // Bob's card lists his device; Watch opens a view-only screen beside the panel.
+    t.ctl(&["key", "down"]).await;
+    t.wait_text(&lease_id, "sf-main").await;
+    t.click_badge("Watch").await;
+    let opened = format!("{}/view/open/", env.url);
+    t.wait_for("the browser beside the panel", ".tn-pane.web", |s| s.contains(&opened)).await;
+    t.ctl(&["click", ".tn-pane.dim .sf-main"]).await;
+    t.wait_text("Opening the screen of bob's iphone-16 (view only)", "sf-dock").await;
+
+    // Copy link copies a view-only link.
+    t.click_badge("Copy link").await;
+    t.wait_text("Copied a view-only link to bob's iphone-16", "sf-dock").await;
+
+    // Control opens a screen with control.
+    t.click_badge("Control").await;
+    t.wait_for("the screen taking focus", ".tn-pane.dim .sf-main", |s| !s.is_empty()).await;
+    t.ctl(&["click", ".tn-pane.dim .sf-main"]).await;
+    t.wait_text("Opening the screen of bob's iphone-16 beside this panel.", "sf-dock").await;
+
+    assert_eq!(t.plugin_errors(), Vec::<String>::new());
+    let _ = t.ctl(&["quit"]).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), t.child.wait()).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn non_admin_does_not_see_users_tab_or_admin_data() {
     let Some(bin) = tern() else {
         eprintln!("skipped: tern is not on PATH");

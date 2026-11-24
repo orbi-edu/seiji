@@ -324,6 +324,26 @@ async fn admin_set_limits(
     Json(admin_entry(&user, pool.config.admin_users.contains(&user.name), used_secs, active_devices)).into_response()
 }
 
+/// `control` from the optional `{"control": <bool>}` body of a viewer link request.
+fn viewer_control(body: &[u8], default: bool) -> Result<bool, String> {
+    if body.is_empty() {
+        return Ok(default);
+    }
+    let req: crate::viewer::ViewerRequest = serde_json::from_slice(body).map_err(|e| format!("invalid body: {e}"))?;
+    Ok(req.control.unwrap_or(default))
+}
+
+fn viewer_response(link: anyhow::Result<crate::viewer::ViewerLink>) -> Response {
+    match link {
+        Ok(link) => {
+            let mut resp = Json(link).into_response();
+            resp.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            resp
+        }
+        Err(e) => bad(StatusCode::NOT_FOUND, format!("{e:#}")),
+    }
+}
+
 /// `POST /v1/leases/{lease_id}/viewer`: a one-time link to watch (and by default drive) the lease's
 /// screen from a browser.
 async fn viewer_link(
@@ -332,21 +352,37 @@ async fn viewer_link(
     UrlPath(lease_id): UrlPath<String>,
     body: axum::body::Bytes,
 ) -> Response {
-    let req: crate::viewer::ViewerRequest = if body.is_empty() {
-        Default::default()
-    } else {
-        match serde_json::from_slice(&body) {
-            Ok(r) => r,
-            Err(e) => return bad(StatusCode::BAD_REQUEST, format!("invalid body: {e}")),
-        }
-    };
-    match pool.create_viewer(&user, Some(&lease_id), req.control.unwrap_or(true)) {
-        Ok(link) => {
-            let mut resp = Json(link).into_response();
-            resp.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-            resp
-        }
-        Err(e) => bad(StatusCode::NOT_FOUND, format!("{e:#}")),
+    match viewer_control(&body, true) {
+        Ok(control) => viewer_response(pool.create_viewer(&user, Some(&lease_id), control)),
+        Err(e) => bad(StatusCode::BAD_REQUEST, e),
+    }
+}
+
+/// `GET /v1/admin/leases`: every active lease with its owner.
+async fn admin_leases(State(pool): State<Arc<Pool>>, Extension(AuthedUser(caller)): Extension<AuthedUser>) -> Response {
+    if !pool.config.admin_users.contains(&caller.name) {
+        return bad(StatusCode::FORBIDDEN, "admin access required");
+    }
+    match pool.admin_leases() {
+        Ok(leases) => Json(serde_json::json!({ "leases": leases })).into_response(),
+        Err(e) => bad(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+    }
+}
+
+/// `POST /v1/admin/leases/{lease_id}/viewer`: a one-time link to any user's lease, view-only by
+/// default.
+async fn admin_viewer_link(
+    State(pool): State<Arc<Pool>>,
+    Extension(AuthedUser(caller)): Extension<AuthedUser>,
+    UrlPath(lease_id): UrlPath<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    if !pool.config.admin_users.contains(&caller.name) {
+        return bad(StatusCode::FORBIDDEN, "admin access required");
+    }
+    match viewer_control(&body, false) {
+        Ok(control) => viewer_response(pool.create_admin_viewer(&caller, &lease_id, control)),
+        Err(e) => bad(StatusCode::BAD_REQUEST, e),
     }
 }
 
@@ -441,6 +477,8 @@ pub fn router(pool: Arc<Pool>, shutdown: CancellationToken) -> Router {
         .route("/v1/me", get(me))
         .route("/v1/admin/users", get(admin_users))
         .route("/v1/admin/users/{id}/limits", put(admin_set_limits))
+        .route("/v1/admin/leases", get(admin_leases))
+        .route("/v1/admin/leases/{lease_id}/viewer", post(admin_viewer_link))
         .route("/v1/leases/{lease_id}/viewer", post(viewer_link))
         .route("/v1/leases/{lease_id}/screenshot.jpg", get(lease_screenshot))
         .route("/v1/leases/{lease_id}/forward", get(forward))

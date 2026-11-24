@@ -139,7 +139,7 @@ The quota that `seiji user add` gives a new user for each flag you omit. Changin
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `adminUsers` | list of strings | `[]` | User names allowed to call the admin endpoints (`GET /v1/admin/users`, `PUT /v1/admin/users/{id}/limits`). |
+| `adminUsers` | list of strings | `[]` | User names allowed to call the admin endpoints (`GET /v1/admin/users`, `PUT /v1/admin/users/{id}/limits`, `GET /v1/admin/leases`, `POST /v1/admin/leases/{lease_id}/viewer`). An admin can watch and drive any user's device ([security.md](security.md#the-viewer)). |
 
 Authority comes only from this operator-controlled config, never from client-supplied flags. User tokens and database rows are unchanged; an admin is still an unprivileged macOS tenant. A disabled admin cannot authenticate. Names must meet the user-name rules (1–32 chars of `[a-z0-9-]`), or `Config::parse` fails with `adminUsers: "<name>" is not a valid user name`.
 
@@ -258,7 +258,7 @@ Optional section.
 
 ## `viewer`
 
-Optional section. The viewer shows a lease's screen live in a browser or in Tern, and can send taps, swipes, typing and buttons to it ([tern.md](tern.md), [security.md](security.md#the-viewer)). It works on iOS simulators only. A viewer link comes from `share_screen` or `POST /v1/leases/{lease_id}/viewer` ([mcp.md](mcp.md)).
+Optional section. The viewer shows a lease's screen live in a browser or in Tern, and can send taps, swipes, typing and buttons to it ([tern.md](tern.md), [security.md](security.md#the-viewer)). It works on iOS simulators only. A viewer link comes from `share_screen`, `POST /v1/leases/{lease_id}/viewer`, or for an admin `POST /v1/admin/leases/{lease_id}/viewer` ([mcp.md](mcp.md)).
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|

@@ -131,6 +131,11 @@ function M.admin_update_user(c: Client, user_id: number, body: { [string]: any }
 	M.request(c, "PUT", "/v1/admin/users/" .. tostring(user_id) .. "/limits", { body = body }, cb)
 end
 
+-- `GET /v1/admin/leases`: every active lease with its owner (`user_id`, `user`). Admin only.
+function M.admin_leases(c: Client, cb: (data: any, err: cli.CliError?) -> ())
+	M.request(c, "GET", "/v1/admin/leases", nil, cb)
+end
+
 -- Calls MCP tool `name`; `cb(value, err)` with the tool's text decoded as JSON when it is JSON.
 -- Handles both application/json and text/event-stream responses.
 function M.tool(c: Client, name: string, args: { [string]: any }?, timeout_ms: number?, cb: (value: any, err: cli.CliError?) -> ())
