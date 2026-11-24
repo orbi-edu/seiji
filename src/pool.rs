@@ -29,8 +29,6 @@ pub(crate) struct LeaseRuntime {
     end_reason: StdMutex<Option<String>>,
     /// The app installed last on this lease: default target for launches, logs and crash reports.
     pub(crate) app: StdMutex<Option<InstalledApp>>,
-    /// The screen's size in points, read once from the accessibility tree for viewer input.
-    pub(crate) screen: StdMutex<Option<(f64, f64)>>,
 }
 
 pub struct Pool {
@@ -370,7 +368,6 @@ impl Pool {
                 cancel: CancellationToken::new(),
                 end_reason: StdMutex::new(None),
                 app: StdMutex::new(None),
-                screen: StdMutex::new(None),
             });
             // Hold the op lock before the lease is visible to `release`: a release that arrives
             // during boot then waits for the boot to finish or fail, and never misses a device.

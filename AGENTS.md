@@ -21,7 +21,7 @@ Read these documents before you change a component:
 | Admission, leases, the reaper, billing | [docs/concepts.md](docs/concepts.md) |
 | `src/tenant.rs`, `src/exec.rs`, sudoers, permissions | [docs/security.md](docs/security.md) |
 | MCP tools or HTTP routes | [docs/mcp.md](docs/mcp.md) |
-| `src/viewer.rs`, `src/viewer/`, `/view/…` routes | [docs/security.md](docs/security.md#the-viewer), [docs/mcp.md](docs/mcp.md#viewer-routes) |
+| `src/viewer.rs`, `src/viewer/`, `sim/`, `/view/…` routes | [docs/security.md](docs/security.md#the-viewer), [docs/mcp.md](docs/mcp.md#viewer-routes) |
 | `tern-plugin/`, `src/client.rs` | [docs/tern.md](docs/tern.md), [docs/cli.md](docs/cli.md) |
 | `src/forward.rs`, `seiji forward`, `/v1/leases/{lease_id}/forward` | [docs/apps.md](docs/apps.md), [docs/security.md](docs/security.md#tunnels-seiji-forward), [docs/mcp.md](docs/mcp.md#get-v1leaseslease_idforward) |
 | Config keys | [docs/configuration.md](docs/configuration.md) |
@@ -44,18 +44,19 @@ document in the same commit.
 | `src/actions.rs` | The `run_actions` step model: `Action`, `Selector`, validation, execution, `render_tree`, redaction. |
 | `src/evidence.rs` | Evidence: copy-out from the tenant, manifest and SHA-256s, Markdown summary, step parsers, zip. |
 | `src/devices.rs` | The `Devices` trait and `HostDevices`: lifecycle, input, captures, device ops, XCTest, crashes. |
-| `src/ios.rs` | Command builders for `simctl` and AXe, and the install, XCTest and crash scripts. |
+| `src/ios.rs` | Command builders for `simctl`, AXe and `seiji-sim`, and the install, XCTest and crash scripts. |
 | `src/maestro.rs` | Maestro CLI calls with a driver port for each lease. |
 | `src/exec.rs` | `Runner`: runs a command as a user's account, captures output or streams it to a file, kills or interrupts process groups. |
 | `src/tenant.rs` | Root helpers and tenant account provisioning. Security-critical. |
 | `src/mcp.rs` | The MCP tools. |
-| `src/http.rs` | axum router: `/mcp`, `/v1/apps`, `/v1/runs/…`, `/v1/me`, `/v1/leases/{lease_id}/viewer`, `/v1/leases/{lease_id}/screenshot.jpg`, `/v1/leases/{lease_id}/forward` (WebSocket), `/healthz`, bearer auth. Merges the viewer routes. |
-| `src/viewer.rs` | The viewer: viewer links, tickets and viewer sessions (in memory), the `/view/…` routes and cookie checks, one shared AXe stream per lease, input under the op lock. Security-critical. |
-| `src/viewer/` | The viewer page assets, embedded in the binary: `index.html`, `viewer.js`, `viewer.css`. |
+| `src/http.rs` | axum router: `/mcp`, `/v1/apps`, `/v1/runs/…`, `/v1/me`, `/v1/admin/…`, `/v1/leases/{lease_id}/viewer`, `/v1/leases/{lease_id}/screenshot.jpg`, `/v1/leases/{lease_id}/forward` (WebSocket), `/healthz`, bearer auth. Merges the viewer routes. |
+| `src/viewer.rs` | The viewer: viewer links, tickets and viewer sessions (in memory), the `/view/…` routes and cookie checks, the page's WebSocket, one shared `seiji-sim` helper per lease with per-viewer flow control, input under the op lock. Security-critical. |
+| `src/viewer/` | The viewer page assets, embedded in the binary: `index.html`, `viewer.js` (WebCodecs decoding, touch, keys), `viewer.css`. |
+| `sim/` | `seiji-sim`, the Swift screen helper of the viewer: framebuffer capture, H.264 encoding, persistent HID input. Built with `swiftc` on the host ([sim/README.md](sim/README.md)). |
 | `src/forward.rs` | `seiji forward`: the tunnel protocol (hello, OPEN, DATA and CLOSE frames), tunnel admission and the server loop on a loopback port, and the client end that dials one local port. |
 | `src/client.rs` | The client commands on a developer's Mac: `login` (token into the keychain), `logout`, `token print`, and `forward` (picks the lease, runs the tunnel, points the app at it). |
 | `tern-plugin/` | The Tern plugin: `plugin.toml`, `host.luau`, `window.luau`, `styles.css`, `lib/*.luau`. |
-| `tests/common/mod.rs` | Test harness: real HTTP and MCP, `FakeDevices` (a login screen and a fake stream), a stub `maestro`. |
+| `tests/common/mod.rs` | Test harness: real HTTP and MCP, `FakeDevices` (a login screen and a fake screen helper), a stub `maestro`. |
 | `tests/e2e.rs`, `tests/runs.rs` | End-to-end tests: leases and billing; recorded runs and evidence. |
 | `tests/viewer.rs`, `tests/tern.rs` | The viewer; the Tern plugin in a headless Tern (skips without `tern` on `PATH`). |
 | `tests/forward.rs` | `seiji forward`: the tunnel end to end, its refusals, and the real CLI pointing the app. |
@@ -68,6 +69,7 @@ document in the same commit.
 | Task | Command |
 |---|---|
 | Build | `cargo build` |
+| Build the screen helper | `swiftc -O -swift-version 5 -o target/seiji-sim sim/*.swift -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework IOSurface -framework Accelerate` |
 | Run all tests | `cargo test` |
 | Run one test | `cargo test --test e2e enforces_concurrency_capacity_and_ownership` |
 | Lint | `cargo clippy --all-targets -- -D warnings` |
@@ -75,8 +77,8 @@ document in the same commit.
 | Run locally | `cargo run -- serve -c seiji.json` with `isolation.mode` `"shared"` |
 | Check a real host | `seiji doctor <user> --platform ios` |
 
-The tests need no simulator, no Xcode and no network. Seiji builds only on macOS: the root
-helpers use the Darwin signatures of `getgrouplist` and `initgroups`.
+The tests need no simulator, no Xcode and no network; they replace `seiji-sim` with a fake. Seiji
+builds only on macOS: the root helpers use the Darwin signatures of `getgrouplist` and `initgroups`.
 
 ## 4. Rules that you must obey
 

@@ -125,15 +125,20 @@ Each test starts with `ready_device`: a new user acquires an iOS device, uploads
 
 ### `tests/viewer.rs`
 
-Each test acquires an iOS device for a new user and opens viewer links with `POST /v1/leases/{lease_id}/viewer`; the admin test uses `POST /v1/admin/leases/{lease_id}/viewer`, and `agents_share_a_view_only_link` uses `share_screen`.
+Each test acquires an iOS device for a new user and opens viewer links with `POST /v1/leases/{lease_id}/viewer` (the admin test with `POST /v1/admin/leases/{lease_id}/viewer`, `agents_share_a_view_only_link` with `share_screen`). The page's WebSocket is a real `tokio-tungstenite` client with the session cookie and the page's `Origin`; it acknowledges frames like the page does.
 
 | Test | What it checks |
 |---|---|
-| `a_link_opens_one_session_for_its_owner_only` | `POST /v1/leases/{lease_id}/viewer` without a token gets `401`, and with Bob's token on Alice's lease `404`. Alice's link has `control: true` and `expires_in: 60`. The ticket opens once: `303`, then `401`. The page has a CSP with `default-src 'none'` and loads `/view/assets/viewer.js`. A request without the cookie, or with the forged cookie `seiji_view=00`, gets `401`. `info` returns the lease, `model: "iphone-16"`, `control: true` and `busy: false` |
-| `an_admin_lists_every_device_and_watches_any_of_them` | `GET /v1/admin/leases` is admin only and lists Bob's lease with `user: "bob"`. A non-admin gets `403` on the admin link, the owner route refuses the admin with `404`, an unknown lease gets `404`, a bad body `400`. A disabled owner's lease and a lease still booting get `404`. The admin link is view-only by default; its session shows Bob's device and refuses input. With `control: true` the admin's input reaches the device. Disabling the admin ends the admin's sessions, while Bob's own session keeps working |
-| `viewers_share_one_stream_until_the_lease_ends` | With `viewer.maxViewersPerLease: 2`, the stream is `multipart/x-mixed-replace; boundary=seijiframe`, and its first part is a `Content-Type: image/jpeg` frame. A second viewer streams too; a third gets `429`. The device layer started one stream for all viewers (`streams_started` is 1). After `release_device`, the stream ends and `info` gets `410` |
-| `input_maps_to_points_and_respects_view_only_and_runs` | A tap at `0.5, 0.5` reaches the device as `tap 201,437` on the fake's 402×874 screen. A tap with `hold: 0.8` is a long press. `type`, `key` and `button` inputs give `204`. A tap at `x: 2` gets `400`. Input without `X-Seiji-View` gets `400`. A view-only session gets `403`. While a `run_actions` call holds the device, input gets `409` and `info` shows `busy: true`; after the run, input works again |
+| `a_link_opens_one_session_for_its_owner_only` | `POST /v1/leases/{lease_id}/viewer` without a token gets `401`, and with Bob's token on Alice's lease `404`. Alice's link has `control: true` and `expires_in: 60`. The ticket opens once: `303`, then `401`. The page has a CSP with `default-src 'none'` and a `connect-src` for this host's WebSocket, and loads `/view/assets/viewer.js`. A request without the cookie, or with the forged cookie `seiji_view=00`, gets `401`; the WebSocket with a forged cookie gets `401`, and from `Origin: https://evil.example` `403`. `info` returns the lease, `model: "iphone-16"`, `control: true` and `busy: false` |
+| `an_admin_lists_every_device_and_watches_any_of_them` | `GET /v1/admin/leases` is admin only and lists Bob's lease with `user: "bob"`. A non-admin gets `403` on the admin link, the owner route refuses the admin with `404`, an unknown lease gets `404`, a bad body `400`. A disabled owner's lease and a lease still booting get `404`. The admin link is view-only by default; its session shows Bob's device and answers `view_only` to a key. With `control: true` the key reaches the device. Disabling the admin closes the admin's socket with `4401`, while Bob's own session keeps working |
+| `viewers_share_one_stream_until_the_lease_ends` | With `viewer.maxViewersPerLease: 2`, the first message is a `format` (`avc1.64001f`, 402×874) and the first frame a keyframe. A second viewer gets a format and a keyframe too; a third gets `429`. One helper serves both (`streams_started` is 1). After `release_device` the socket closes with `4410` and `info` gets `410` |
+| `a_still_screen_reaches_a_viewer_that_joins_later` | With `still` set, the fake sends frames only on a keyframe request; a viewer that joins later gets a keyframe within 500 ms |
+| `a_slow_viewer_gets_no_stale_frames_and_resumes_at_a_keyframe` | At 60 fps, a viewer that acknowledges nothing gets fewer than 60 frames in 1.5 s and none after 800 ms, and the shared bitrate drops to 70 % (`encode 60 0.5 1750000`). After it acknowledges, the next frame is a keyframe and frames in between were skipped |
+| `touches_keys_and_buttons_reach_the_device_in_order` | A touch down at the bottom edge, a move, an up, Shift+A, Home and a typed `hello` reach the device in that order. During the viewer's own gesture `info` shows `busy: false`. Points outside 0–1 and non-modifier `mods` get `bad_request`. A view-only page gets `view_only` once for a gesture and once for a button. While a `run_actions` call holds the device, a touch gets `busy` and `info` shows `busy: true`; after the run, input works again |
+| `a_finger_left_down_is_lifted_when_the_page_goes_away` | Closing the socket with a finger down sends a touch up at its last point, and an agent's `inspect_screen` works again |
 | `agents_share_a_view_only_link` | `share_screen` with no arguments returns `control: false`, and its link opens with `303` |
+| `paste_puts_text_on_pasteboard_and_respects_guards` | `paste` sets the clipboard and then presses Cmd+V through the helper (`hid key 227 down`, `25 down`, `25 up`, `227 up`), and answers `done` with `via: "pasted"`; without a clipboard, `via: "typed"`. `paste_and_type` types. A view-only page gets `view_only`; empty or over-limit text gets `bad_request` with the input's `id` |
+| `presets_and_stats_describe_the_shared_stream` | `stats` counts frames and shows `balanced` with `fps`, `scale` and `bitrate`. The `sharp` preset sends `encode 20 0.8 5000000` to the helper and shows in `info`. A view-only page cannot change the preset |
 
 ### `tests/forward.rs`
 
@@ -168,6 +173,7 @@ The test runs `tern serve` headless, with `tern-plugin/` as a fixture plugin. Th
 | `src/ios.rs` | `tap_uses_equals_form_so_values_never_become_flags` | A `tap` with the label `--udid=OTHER` builds `--output json tap --label=--udid=OTHER --wait-timeout=5 --element-type=Button --count=2 --udid=U1` |
 | `src/ios.rs` | `axe_errors_surface_their_code` | An AXe envelope with `didError: true` becomes an error with `elementNotFound` and the message |
 | `src/ios.rs` | `log_predicate_escapes_quotes` | `app_log_predicate` escapes `"` in the executable name |
+| `src/devices.rs` | `helper_messages_reach_viewers_only_when_well_formed` | A `format` from `seiji-sim` passes with an `avc1.` codec, sizes in range and a base64 record; a codec with markup, another codec, a zero or huge size, a non-base64 record or bad JSON fail. A `frame` keeps its keyframe flag, capture time and sample; a frame without a sample or an unknown kind fails. `status` maps to ready or a warning |
 | `src/evidence.rs` | `tenant_paths_are_cleaned_and_bounded` | `clean_relative` keeps `steps/001-tap.png`, turns `Login screen ✓.png` into `Login_screen__.png`, rejects `../etc/passwd` and `a//b`, turns `.hidden` into `hidden`, and rejects 9 levels |
 | `src/evidence.rs` | `xcresult_tests_become_steps` | `xctest_steps` turns two `Test Case` nodes into steps named `AppUITests/LoginTests/testLogin()` (3500 ms) and a `failed` step with the error `XCTAssertTrue failed` |
 
@@ -217,7 +223,7 @@ The helpers:
 | `destroy` | Records the lease id in `destroyed` |
 | `install` | Records `<filename>:<file contents>` in `installed`. Returns `bundle_id: "com.example.demo"`, `executable: "Demo"`, `version: "1.2.3"` |
 | `screenshot` | Returns four bytes: an empty JPEG (`FF D8 FF D9`) |
-| `stream` | Sends frames at `viewer.fps` until it is cancelled, and counts each start in `streams_started` |
+| `screen` | Like `seiji-sim`: `Ready`, a `format`, a keyframe, then frames at the `fps` it is given (every tenth a keyframe), and a keyframe at once on request. With `still` set, frames only on request. Logs `touch <phase> <x>,<y>` (with ` edge <edge>`), `hid key <usage> down|up`, `hid button <name> down|up` and `encode <fps> <scale> <bitrate>`. Counts each start in `streams_started` |
 | `cleanup_orphans` | Does nothing |
 | `ui` | A tap on the label `Missing` fails with `tap failed (elementNotFound): No accessibility element matched --label 'Missing'.`. A tap on `Sign In` sets `signed_in`. Logs `tap label=<label>`, `tap <x>,<y>` (with ` hold <seconds>` for a long press) for a tap on a point, `type <text read from the stdin file>`, `key <code>`, or the debug form of other inputs |
 | `describe_ui` | An `Application` `Demo` with a `Button` `Sign In` (`AXUniqueId` `signin`, with a frame). After the sign-in, also a `StaticText` `Welcome, Ana!` |
@@ -261,7 +267,7 @@ The tests must be fast and deterministic, and they must run on any Mac. A real d
 |---|---|
 | `HostDevices`: `simctl`, `emulator`, `adb`, `sips` screenshots, `INSTALL_SCRIPT` and the Android install | `seiji doctor`, the smoke test |
 | AXe against a real simulator: taps, typing, gestures, `describe-ui`, the JSON envelope of a real AXe version (only the argument lists and the error parser are unit-tested) | `seiji doctor` (`describe-ui`), the smoke test |
-| The viewer stream on a real simulator: `axe stream-video` and its raw framing (checked against AXe's source only), and viewer input through real AXe | Not verified yet. `seiji doctor` does not test streaming yet |
+| The screen helper on a real simulator: framebuffer capture, H.264 encoding, HID input, and its framing against the daemon's parser | `seiji doctor` (`screen session`), and by hand on Xcode 27.2 with an iOS 26.5 runtime under `shared`: taps, drags, typing and paste in a browser, also through a 140 ms round trip. `sim/` has no automated tests |
 | `seiji forward` against a real simulator: `RCT_jsLocation` through `simctl spawn … defaults write`, Metro and Fast Refresh through the tunnel, Expo Go's archive in `INSTALL_SCRIPT`, and the tunnel on Android | Not verified yet. The tunnel itself is tested end to end |
 | AXe and `recordVideo` as a tenant account through `exec-as`. Not verified on a real host yet | `seiji doctor` with a tenant account |
 | `recordVideo` stopped with SIGINT (`Runner::interrupt`) giving a playable `video.mp4`, and `log stream` | `seiji doctor` (3 s capture), the smoke test |
@@ -305,10 +311,12 @@ The command prints one line `== <step>` for each step, and stops at the first fa
 | `identity` | `/usr/bin/id` as the user's account. Under `os_user` isolation, it shows the tenant account (`seiji-alice`) |
 | `maestro --version` | `maestro.bin --version`, with `maestro.javaHome` as `JAVA_HOME`. Only when the config has `maestro` |
 | `axe --version` | `axe.bin --version`. iOS only |
+| `seiji-sim --version` | `viewer.simBin --version`. iOS only |
 | `create <platform> <model>` | Creates a device of the default model. The iOS simulator is named `seiji-doctor-<8 hex>`. The Android emulator takes the first free even console port of `android.consolePortRange` that no active lease uses |
 | `boot` | Waits for the boot and prints `booted in Ns` |
 | `screenshot` | Takes a screenshot and prints `N bytes of JPEG` |
 | `accessibility tree (axe describe-ui)` | Reads the tree with AXe and prints `N elements`. iOS only |
+| `screen session (seiji-sim: capture, H.264, HID)` | Starts the viewer's screen helper and prints the codec, the size and the first keyframe. iOS only |
 | `video and log capture (3 s)` | Records the screen and streams the `SpringBoard` log for 3 seconds, stops both, and prints `video N bytes, log N bytes`. iOS only |
 | `destroy` | Deletes the device and the lease dir. It runs also when an earlier device step failed |
 

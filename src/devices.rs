@@ -58,12 +58,115 @@ pub struct InstalledApp {
     pub version: Option<String>,
 }
 
-/// A screen frame with its server-side capture timestamp.
-#[derive(Clone, Debug)]
-pub struct Frame {
-    pub jpeg: Bytes,
-    /// Unix milliseconds when the daemon received the frame from the capture process.
-    pub captured_at_ms: i64,
+/// The decoder setup of the screen stream, as WebCodecs `VideoDecoder.configure` takes it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ScreenFormat {
+    /// RFC 6381 codec string, `avc1.PPCCLL`.
+    pub codec: String,
+    /// Coded size in pixels.
+    pub width: u32,
+    pub height: u32,
+    /// The avcC record (SPS and PPS), base64.
+    pub description: String,
+}
+
+/// One encoded H.264 sample of the screen.
+#[derive(Debug, Clone)]
+pub struct VideoFrame {
+    /// An IDR frame: a decoder can start here.
+    pub key: bool,
+    /// Unix microseconds when the helper captured the screen.
+    pub captured_us: i64,
+    /// AVCC: a 4-byte big-endian length before each NAL unit.
+    pub data: Bytes,
+}
+
+/// What the screen helper reports.
+#[derive(Debug, Clone)]
+pub enum ScreenEvent {
+    /// Capture, encoder and input are up.
+    Ready,
+    /// A new decoder setup; it comes before the first frame and after a size change.
+    Format(ScreenFormat),
+    Frame(VideoFrame),
+    /// A non-fatal problem the helper reported (a bad command, an input it could not send).
+    Warning(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TouchPhase {
+    Down,
+    Move,
+    Up,
+}
+
+/// The screen edge a gesture starts at, for system gestures (home indicator, Notification Centre).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Edge {
+    Top,
+    Bottom,
+    Left,
+    Right,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScreenButton {
+    Home,
+    Lock,
+}
+
+/// Input and control for the screen helper. Points are fractions (0-1) of the picture.
+#[derive(Debug)]
+pub enum ScreenCommand {
+    Touch {
+        phase: TouchPhase,
+        x: f64,
+        y: f64,
+        edge: Option<Edge>,
+    },
+    /// A HID keyboard usage (page 7) down or up.
+    Key {
+        usage: u8,
+        down: bool,
+    },
+    Button {
+        button: ScreenButton,
+        down: bool,
+    },
+    /// Make the next frame a keyframe, now.
+    Keyframe,
+    Encode(StreamOpts),
+    /// Answered once every command before it is with the helper, so input that does not go
+    /// through the helper (AXe typing) comes after it.
+    Sync(tokio::sync::oneshot::Sender<()>),
+}
+
+impl ScreenCommand {
+    /// The command as one line of the helper's stdin protocol; `None` for `Sync`.
+    pub fn to_line(&self) -> Option<String> {
+        let v = match self {
+            ScreenCommand::Touch { phase, x, y, edge } => {
+                let mut v = serde_json::json!({ "touch": phase, "x": x, "y": y });
+                if let Some(e) = edge {
+                    v["edge"] = serde_json::json!(e);
+                }
+                v
+            }
+            ScreenCommand::Key { usage, down } => serde_json::json!({ "key": usage, "down": down }),
+            ScreenCommand::Button { button, down } => serde_json::json!({ "button": button, "down": down }),
+            ScreenCommand::Keyframe => serde_json::json!({ "keyframe": true }),
+            ScreenCommand::Encode(o) => {
+                serde_json::json!({ "encode": { "fps": o.fps, "scale": o.scale, "bitrate": o.bitrate } })
+            }
+            ScreenCommand::Sync(_) => return None,
+        };
+        let mut line = v.to_string();
+        line.push('\n');
+        Some(line)
+    }
 }
 
 /// One input sent to the screen (AXe on iOS).
@@ -78,11 +181,6 @@ pub enum UiInput {
     Scroll(ScrollArgs),
     Button(HwButton),
     Key(u8),
-    /// HID modifiers held (in order) while `key` is pressed, e.g. Cmd+V = `[227]`, `25`.
-    KeyCombo {
-        modifiers: Vec<u8>,
-        key: u8,
-    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
@@ -327,26 +425,76 @@ pub trait Devices: Send + Sync {
     ) -> Result<XctestOutcome>;
     /// Copies crash reports of `executable` written during the run into `<run_dir>/crashes`.
     async fn collect_crashes(&self, ctx: &DeviceCtx, run_dir: &Path, executable: &str) -> Result<usize>;
-    /// Sends JPEG frames of the screen into `frames` until `cancel` fires or the stream ends.
-    async fn stream(
+    /// Runs the screen helper until `cancel` fires or the helper ends: it streams the encoded
+    /// screen into `events` and takes input and control from `commands`.
+    async fn screen(
         &self,
         ctx: &DeviceCtx,
-        opts: &StreamOpts,
-        frames: &tokio::sync::watch::Sender<Option<Frame>>,
+        opts: StreamOpts,
+        commands: tokio::sync::mpsc::Receiver<ScreenCommand>,
+        events: tokio::sync::mpsc::Sender<ScreenEvent>,
         cancel: &CancellationToken,
     ) -> Result<()>;
 }
 
-/// How a screen stream encodes its frames.
-#[derive(Debug, Clone, Copy)]
+/// How the screen helper encodes the stream.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct StreamOpts {
     pub fps: u8,
     pub scale: f64,
-    pub quality: u8,
+    /// Bits per second.
+    pub bitrate: u32,
 }
 
-/// A JPEG larger than this is not a frame but a broken stream.
-const MAX_FRAME: usize = 16 * 1024 * 1024;
+/// A helper message larger than this is not a frame but a broken stream.
+const MAX_MESSAGE: usize = 8 * 1024 * 1024;
+const MSG_FORMAT: u8 = 1;
+const MSG_FRAME: u8 = 2;
+const MSG_STATUS: u8 = 3;
+
+/// Checks a `format` message from the helper. The helper runs as the tenant, so its output is
+/// untrusted: only a well-formed codec string, sane sizes and a base64 record go to a viewer.
+fn parse_format(payload: &[u8]) -> Result<ScreenFormat> {
+    let v: serde_json::Value = serde_json::from_slice(payload).context("format is not JSON")?;
+    let codec = v["codec"].as_str().unwrap_or_default();
+    let hex = codec.strip_prefix("avc1.").unwrap_or_default();
+    if hex.len() != 6 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!("format has a bad codec {codec:?}");
+    }
+    let size = |k: &str| v[k].as_u64().filter(|n| (2..=8192).contains(n)).map(|n| n as u32);
+    let (Some(width), Some(height)) = (size("width"), size("height")) else { bail!("format has a bad size") };
+    let description = v["description"].as_str().unwrap_or_default();
+    if description.is_empty()
+        || description.len() > 4096
+        || !description.bytes().all(|b| b.is_ascii_alphanumeric() || b"+/=".contains(&b))
+    {
+        bail!("format has a bad description");
+    }
+    Ok(ScreenFormat { codec: codec.to_string(), width, height, description: description.to_string() })
+}
+
+/// One helper message as an event; `None` for a status the daemon does not use.
+fn parse_message(kind: u8, payload: Vec<u8>) -> Result<Option<ScreenEvent>> {
+    match kind {
+        MSG_FORMAT => Ok(Some(ScreenEvent::Format(parse_format(&payload)?))),
+        MSG_FRAME => {
+            if payload.len() < 10 {
+                bail!("a {}-byte frame", payload.len());
+            }
+            let captured_us = i64::from_be_bytes(payload[1..9].try_into().expect("8 bytes"));
+            let key = payload[0] & 1 == 1;
+            Ok(Some(ScreenEvent::Frame(VideoFrame { key, captured_us, data: Bytes::from(payload).slice(9..) })))
+        }
+        MSG_STATUS => {
+            let v: serde_json::Value = serde_json::from_slice(&payload).context("status is not JSON")?;
+            if v["ready"] == true {
+                return Ok(Some(ScreenEvent::Ready));
+            }
+            Ok(v["error"].as_str().map(|e| ScreenEvent::Warning(crate::exec::head(e, 300).to_string())))
+        }
+        other => bail!("unknown message kind {other}"),
+    }
+}
 
 pub struct HostDevices {
     config: Arc<Config>,
@@ -660,7 +808,6 @@ impl Devices for HostDevices {
             UiInput::Scroll(_) => "scroll",
             UiInput::Button(_) => "button",
             UiInput::Key(_) => "key",
-            UiInput::KeyCombo { .. } => "key-combo",
         };
         self.axe_run(ctx, ios::axe_input(&self.config.axe, ctx.device_id()?, input), what).await.map(|_| ())
     }
@@ -780,48 +927,116 @@ impl Devices for HostDevices {
         Ok(self.run(&ctx.account, spec, SHORT, "collecting crash reports").await?.trim().parse().unwrap_or(0))
     }
 
-    async fn stream(
+    async fn screen(
         &self,
         ctx: &DeviceCtx,
-        opts: &StreamOpts,
-        frames: &tokio::sync::watch::Sender<Option<Frame>>,
+        opts: StreamOpts,
+        mut commands: tokio::sync::mpsc::Receiver<ScreenCommand>,
+        events: tokio::sync::mpsc::Sender<ScreenEvent>,
         cancel: &CancellationToken,
     ) -> Result<()> {
-        use tokio::io::AsyncReadExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         self.ios_only(ctx, "the screen viewer")?;
-        let spec = ios::axe_stream(&self.config.axe, ctx.device_id()?, opts);
-        let (mut job, mut stdout) = self.runner.spawn_piped(&ctx.account, spec)?;
-        let mut last_frame: Option<Vec<u8>> = None;
+        let spec = ios::sim_session(&self.config.viewer.sim_bin, ctx.device_id()?, &opts);
+        let (mut job, mut stdin, mut stdout, mut stderr) = self.runner.spawn_duplex(&ctx.account, spec)?;
+        // The last of stderr, for the error when the helper ends on its own.
+        let stderr = tokio::spawn(async move {
+            let (mut buf, mut chunk) = (Vec::new(), [0u8; 4096]);
+            while let Ok(n @ 1..) = stderr.read(&mut chunk).await {
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.len() > 8192 {
+                    buf.drain(..buf.len() - 4096);
+                }
+            }
+            String::from_utf8_lossy(&buf).trim().to_string()
+        });
+        let write = async {
+            while let Some(cmd) = commands.recv().await {
+                match (cmd.to_line(), cmd) {
+                    (Some(line), _) => stdin.write_all(line.as_bytes()).await?,
+                    (None, ScreenCommand::Sync(done)) => {
+                        let _ = done.send(());
+                    }
+                    (None, _) => {}
+                }
+            }
+            anyhow::Ok(())
+        };
         let read = async {
+            let mut head = [0u8; 5];
             loop {
-                let mut len = [0u8; 4];
-                match stdout.read_exact(&mut len).await {
+                match stdout.read_exact(&mut head).await {
                     Ok(_) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return anyhow::Ok(()),
+                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return anyhow::Ok(true),
                     Err(e) => return Err(e.into()),
                 }
-                let len = u32::from_be_bytes(len) as usize;
-                if len == 0 || len > MAX_FRAME {
-                    bail!("the stream sent a {len}-byte frame");
+                let len = u32::from_be_bytes(head[1..5].try_into().expect("4 bytes")) as usize;
+                if len > MAX_MESSAGE {
+                    bail!("seiji-sim sent a {len}-byte message");
                 }
-                let mut frame = vec![0u8; len];
-                stdout.read_exact(&mut frame).await?;
-                // Skip identical frames (static screen) to save bandwidth.
-                if last_frame.as_deref() == Some(frame.as_slice()) {
-                    continue;
+                let mut payload = vec![0u8; len];
+                stdout.read_exact(&mut payload).await?;
+                let event = parse_message(head[0], payload).context("seiji-sim sent a bad message")?;
+                if let Some(event) = event
+                    && events.send(event).await.is_err()
+                {
+                    return Ok(false);
                 }
-                last_frame = Some(frame.clone());
-                let captured_at_ms =
-                    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis()
-                        as i64;
-                frames.send_replace(Some(Frame { jpeg: Bytes::from(frame), captured_at_ms }));
             }
         };
+        // `true`: the helper closed its output by itself.
         let result = tokio::select! {
             r = read => r,
-            _ = cancel.cancelled() => Ok(()),
+            r = write => r.map(|_| false),
+            _ = cancel.cancelled() => Ok(false),
         };
         self.runner.kill(&ctx.account, &mut job).await;
-        result
+        let stderr = stderr.await.unwrap_or_default();
+        match result {
+            Ok(true) => bail!("seiji-sim ended: {}", if stderr.is_empty() { "no output" } else { tail(&stderr, 2000) }),
+            Ok(false) => Ok(()),
+            Err(e) if stderr.is_empty() => Err(e),
+            Err(e) => Err(e.context(format!("seiji-sim: {}", tail(&stderr, 2000)))),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn helper_messages_reach_viewers_only_when_well_formed() {
+        let good = br#"{"codec":"avc1.64001F","width":602,"height":1310,"description":"AWQAH/8=","screen":{}}"#;
+        let Some(ScreenEvent::Format(f)) = parse_message(MSG_FORMAT, good.to_vec()).unwrap() else { panic!() };
+        assert_eq!((f.codec.as_str(), f.width, f.height), ("avc1.64001F", 602, 1310));
+
+        // The helper runs as the tenant: nothing else may reach a viewer's page.
+        for bad in [
+            r#"{"codec":"avc1.64001F\"<script>","width":602,"height":1310,"description":"AQ=="}"#,
+            r#"{"codec":"vp09.00","width":602,"height":1310,"description":"AQ=="}"#,
+            r#"{"codec":"avc1.64001F","width":0,"height":1310,"description":"AQ=="}"#,
+            r#"{"codec":"avc1.64001F","width":602,"height":99999,"description":"AQ=="}"#,
+            r#"{"codec":"avc1.64001F","width":602,"height":1310,"description":"<img>"}"#,
+            "not json",
+        ] {
+            assert!(parse_message(MSG_FORMAT, bad.as_bytes().to_vec()).is_err(), "{bad}");
+        }
+
+        let mut frame = vec![1u8];
+        frame.extend_from_slice(&1_795_548_363_000_000i64.to_be_bytes());
+        frame.extend_from_slice(&[0, 0, 0, 1, 0x65]);
+        let Some(ScreenEvent::Frame(f)) = parse_message(MSG_FRAME, frame).unwrap() else { panic!() };
+        assert!(f.key);
+        assert_eq!(f.captured_us, 1_795_548_363_000_000);
+        assert_eq!(&f.data[..], &[0, 0, 0, 1, 0x65]);
+        assert!(parse_message(MSG_FRAME, vec![1; 9]).is_err(), "a frame needs a sample");
+        assert!(parse_message(9, vec![]).is_err(), "unknown kinds end the stream");
+
+        assert!(matches!(parse_message(MSG_STATUS, br#"{"ready":true}"#.to_vec()), Ok(Some(ScreenEvent::Ready))));
+        assert!(matches!(
+            parse_message(MSG_STATUS, br#"{"error":"bad line"}"#.to_vec()),
+            Ok(Some(ScreenEvent::Warning(w))) if w == "bad line"
+        ));
     }
 }

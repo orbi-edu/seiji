@@ -19,7 +19,8 @@ use tokio_util::sync::CancellationToken;
 
 use seiji::config::{Config, Quota};
 use seiji::devices::{
-    Capture, DeviceCtx, DeviceOp, Devices, Frame, InstalledApp, UiInput, XctestOptions, XctestOutcome,
+    Capture, DeviceCtx, DeviceOp, Devices, InstalledApp, ScreenCommand, ScreenEvent, ScreenFormat, StreamOpts, UiInput,
+    VideoFrame, XctestOptions, XctestOutcome,
 };
 use seiji::exec::{Account, Runner};
 use seiji::pool::Pool;
@@ -49,10 +50,9 @@ pub struct FakeDevices {
     pub signed_in: AtomicBool,
     pub stopped_captures: AtomicUsize,
     pub streams_started: AtomicUsize,
-    /// JPEGs the fake stream cycles through; a tiny placeholder frame when empty.
+    /// JPEGs `screenshot` returns; a tiny placeholder when empty.
     pub frames: Mutex<Vec<Vec<u8>>>,
-    /// A still screen: the stream produces one frame and then nothing (identical frames are
-    /// not sent again by the host).
+    /// A still screen: the helper sends frames only when asked for a keyframe.
     pub still: AtomicBool,
     /// `simctl pbcopy` fails, as under `os_user` isolation (no login session for the tenant).
     pub no_pasteboard: AtomicBool,
@@ -123,7 +123,6 @@ impl Devices for FakeDevices {
             }
             UiInput::Type { text_file } => self.note(format!("type {}", std::fs::read_to_string(text_file)?)),
             UiInput::Key(k) => self.note(format!("key {k}")),
-            UiInput::KeyCombo { modifiers, key } => self.note(format!("key-combo {modifiers:?}+{key}")),
             other => self.note(format!("{other:?}")),
         }
         Ok(())
@@ -216,33 +215,62 @@ impl Devices for FakeDevices {
         std::fs::write(run_dir.join(format!("crashes/{executable}-2026-11-16.ips")), "{\"bug_type\":\"309\"}")?;
         Ok(1)
     }
-    async fn stream(
+    /// Like `seiji-sim`: ready, a format, then frames at `fps` (every 10th a keyframe), a keyframe at
+    /// once when asked. Touches, keys and buttons go to the log, e.g. `touch down 0.50,0.25`.
+    async fn screen(
         &self,
         _ctx: &DeviceCtx,
-        opts: &seiji::devices::StreamOpts,
-        frames: &tokio::sync::watch::Sender<Option<Frame>>,
+        opts: StreamOpts,
+        mut commands: tokio::sync::mpsc::Receiver<ScreenCommand>,
+        events: tokio::sync::mpsc::Sender<ScreenEvent>,
         cancel: &CancellationToken,
     ) -> Result<()> {
         self.streams_started.fetch_add(1, Ordering::SeqCst);
-        let tick = Duration::from_millis(1000 / u64::from(opts.fps.max(1)));
-        let mut n: u8 = 0;
-        loop {
-            n = n.wrapping_add(1);
-            let jpeg = {
-                let set = self.frames.lock().unwrap();
-                if set.is_empty() { vec![0xff, 0xd8, n, 0xff, 0xd9] } else { set[usize::from(n) % set.len()].clone() }
-            };
-            let captured_at_ms =
-                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis()
+        let format =
+            ScreenFormat { codec: "avc1.64001f".into(), width: 402, height: 874, description: "AWQAH/8=".into() };
+        let frame = |n: u64, key: bool| {
+            let captured_us =
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_micros()
                     as i64;
-            frames.send_replace(Some(Frame { jpeg: bytes::Bytes::from(jpeg), captured_at_ms }));
-            if self.still.load(Ordering::SeqCst) {
-                cancel.cancelled().await;
-                return Ok(());
-            }
+            ScreenEvent::Frame(VideoFrame { key, captured_us, data: bytes::Bytes::from(n.to_be_bytes().to_vec()) })
+        };
+        events.send(ScreenEvent::Ready).await?;
+        events.send(ScreenEvent::Format(format)).await?;
+        events.send(frame(0, true)).await?;
+        let mut tick = tokio::time::interval(Duration::from_millis(1000 / u64::from(opts.fps.max(1))));
+        tick.tick().await;
+        let mut n: u64 = 1;
+        loop {
             tokio::select! {
                 _ = cancel.cancelled() => return Ok(()),
-                _ = tokio::time::sleep(tick) => {}
+                _ = tick.tick(), if !self.still.load(Ordering::SeqCst) => {
+                    events.send(frame(n, n % 10 == 0)).await?;
+                    n += 1;
+                }
+                cmd = commands.recv() => match cmd {
+                    None => return Ok(()),
+                    Some(ScreenCommand::Keyframe) => {
+                        events.send(frame(n, true)).await?;
+                        n += 1;
+                    }
+                    Some(ScreenCommand::Touch { phase, x, y, edge }) => self.note(format!(
+                        "touch {} {x:.2},{y:.2}{}",
+                        serde_json::to_value(phase)?.as_str().unwrap_or("?"),
+                        edge.map(|e| format!(" edge {}", serde_json::to_value(e).unwrap().as_str().unwrap())).unwrap_or_default()
+                    )),
+                    Some(ScreenCommand::Key { usage, down }) => {
+                        self.note(format!("hid key {usage} {}", if down { "down" } else { "up" }))
+                    }
+                    Some(ScreenCommand::Button { button, down }) => self.note(format!(
+                        "hid button {} {}",
+                        serde_json::to_value(button)?.as_str().unwrap_or("?"),
+                        if down { "down" } else { "up" }
+                    )),
+                    Some(ScreenCommand::Encode(o)) => self.note(format!("encode {} {} {}", o.fps, o.scale, o.bitrate)),
+                    Some(ScreenCommand::Sync(done)) => {
+                        let _ = done.send(());
+                    }
+                },
             }
         }
     }

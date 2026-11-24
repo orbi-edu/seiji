@@ -515,15 +515,15 @@ The viewer shows a lease's iOS simulator live ([tern.md](tern.md)). Its routes a
 | An admin disabled or removed the user. | `sudo -u seiji seiji user enable <name>`. |
 | The browser did not send the cookie. Without an `https://` `listen.publicUrl` the cookie is not `Secure`; with one, the page must load over HTTPS. | Open the link on the URL in `listen.publicUrl`, over HTTPS ([security.md](security.md#the-viewer)). |
 
-### Input gets `409` (busy)
+### Input answers busy
 
-**Sign:** Taps and typing do nothing, the status dot is amber, and input answers `409` with `A run is using the device. Input works again when it ends.`
+**Sign:** Touches and typing do nothing, the status dot is amber, and the page shows `A run is using the device. Input works again when it ends.`
 
-**Cause:** A tool call holds the device, for example a `run_actions` run. Input waits up to 1 s for the lease's operation lock, then gives up, so it never mixes with a run's steps. The picture keeps streaming.
+**Cause:** A tool call holds the device, for example a `run_actions` run, or another viewer has a finger down. Input waits up to 1 s for the lease's operation lock, then gives up, so it never mixes with a run's steps. The picture keeps streaming.
 
 **Fix:** Wait until the run ends. Input works again on its own.
 
-A view-only session answers `403` with `This viewer is view-only.` for every input. Ask for a link with `control: true`.
+A view-only session answers `This viewer is view-only.` for every input. Ask for a link with `control: true`.
 
 ### The picture stays black or keeps reconnecting
 
@@ -531,13 +531,29 @@ A view-only session answers `403` with `This viewer is view-only.` for every inp
 
 | Cause | Fix |
 |---|---|
-| AXe is not at `axe.bin`, or the user's account cannot run it. The stream is `axe stream-video`, and Seiji starts it again every second while someone watches. | See [AXe does not start](#axe-does-not-start). Run `seiji doctor <user>`; it does not test streaming, but it checks that AXe runs. |
-| The installed AXe has no `stream-video`, or a new Xcode broke it. | `brew upgrade axe`, then open the link again. |
+| `seiji-sim` is not at `viewer.simBin`, or the user's account cannot run it (`spawning …`, `seiji-sim ended: …`). Seiji starts it again every second while someone watches. | Build and install it ([install.md](install.md#3-build-and-install-the-binary)), then run `seiji doctor <user>`: its `screen session` step starts the helper as the user's account. |
+| A new Xcode moved or changed the private simulator frameworks (`seiji-sim ended: seiji-sim: …` naming a framework, a class or the framebuffer). | Rebuild `seiji-sim` with the new Xcode. If it still fails, the helper needs a fix for that Xcode. |
+| The page says `This browser cannot show the stream: it needs WebCodecs`. | Use Tern, or a current Chrome, Edge, Safari or Firefox. |
+| A proxy between the browser and Seiji does not pass WebSockets on `/view/s/…/ws`. | Let the proxy upgrade WebSockets (Caddy does by default; `seiji forward` needs the same). |
 | The lease is not an iOS simulator. A link for an Android lease fails with `the screen viewer supports iOS simulators only for now`. | Use an iOS lease. On Android, use `take_screenshot`. |
 | The lease ended. The page shows `The device was released.` (`410`). | Acquire a device and open a new link. |
 | The lease already has `viewer.maxViewersPerLease` streams (`429`, `This device already has <n> viewers open.`). | Close a viewer, or raise `viewer.maxViewersPerLease`. |
 
-> **Not verified:** the viewer stream has not run against a real simulator yet. The `axe stream-video` flags and its framing were checked against AXe's source only.
+### The picture moves but touches do nothing
+
+**Sign:** The stream plays and the dot is green, but taps and drags have no effect. The daemon log may have `seiji-sim: …` warnings.
+
+**Cause:** The simulator's runtime ignores the legacy HID path that `seiji-sim` uses (idb reports this for some iOS 27 runtimes), or the helper's HID connection broke.
+
+**Fix:** Close the page and open it again, so the helper starts over. If touches still do nothing, use a runtime that accepts them (iOS 26.5 is verified) and report the Xcode and runtime versions.
+
+### The picture is blurry or skips on a slow link
+
+**Sign:** The picture gets soft or jumps ahead, and **Stats** (⌥I) shows a low bitrate or frame rate.
+
+**Cause:** The link cannot carry the stream. Seiji skips frames for that viewer instead of queueing them, and lowers the bitrate for a while ([mcp.md](mcp.md#the-stream)).
+
+**Fix:** Pick **Smooth** in the toolbar, or lower `viewer.bitrateKbps` or `viewer.scale` for the host. The round trip itself (for example about 140 ms from São Paulo to us-east-1) does not lower the frame rate.
 
 ### The Tern plugin says the CLI is missing
 

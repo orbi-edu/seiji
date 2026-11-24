@@ -273,33 +273,39 @@ A viewer link is a credential for 60 s: the first person who opens it gets the s
 
 ### What each request checks
 
-Every `/view/s/{sid}/...` request checks, in order: the session exists, it has not expired, the cookie's secret matches the stored hash, the user exists and is not disabled, for an admin's link to another user's lease the admin exists, is not disabled and is in `adminUsers`, and the lease is still that user's and `ready`. An admin's link to their own lease is the owner's session like any other. `adminUsers` changes only with a restart, which ends every session. Errors are JSON `{"error": {"code", "message"}}`:
+Every `/view/s/{sid}/...` request checks, in order: the session exists, it has not expired, the cookie's secret matches the stored hash, the user exists and is not disabled, for an admin's link to another user's lease the admin exists, is not disabled and is in `adminUsers`, and the lease is still that user's and `ready`. An admin's link to their own lease is the owner's session like any other. `adminUsers` changes only with a restart, which ends every session. The page's WebSocket (`/view/s/{sid}/ws`) is checked the same way when it opens and again every 2 s while it is open; a failed check closes it with `4401` (open a new link) or `4410` (the device is gone). Errors are JSON `{"error": {"code", "message"}}`:
 
 | Status | `code` | Cause |
 |---|---|---|
 | `401` | `expired` | No session, a wrong secret, an expired session, or a removed or disabled user or admin. Open a new link |
 | `410` | `gone` | The lease was released, is booting, or is being released |
-| `409` | `busy` | Input only: a run or another input holds the device |
+| `409` | `busy` | Input only: a run or another viewer's gesture holds the device |
 | `403` | `view_only` | Input in a view-only session |
+| `403` | `cross_origin` | A WebSocket whose `Origin` names another host |
 | `429` | `full` | The lease already has `viewer.maxViewersPerLease` streams |
-| `400` | `bad_request` | A missing `X-Seiji-View` header, or a bad input body |
+| `400` | `bad_request` | A bad message on the WebSocket |
 
-A session ends at `viewer.sessionHours` or with its lease, whichever comes first. `seiji user disable` and `seiji user remove` end it at the next request, for the lease's user and for the admin who asked for the link. Sessions and tickets live in memory: the reaper prunes expired ones every 15 s, and a daemon restart ends them all.
+A session ends at `viewer.sessionHours` or with its lease, whichever comes first. `seiji user disable` and `seiji user remove` end it within 2 s, for the lease's user and for the admin who asked for the link. Sessions and tickets live in memory: the reaper prunes expired ones every 15 s, and a daemon restart ends them all.
 
 ### Input
 
-- `POST /view/s/{sid}/input` needs the header `X-Seiji-View: 1`, else `400`. A cross-site form cannot set it, and `SameSite=Strict` keeps the cookie off cross-site requests. Together they stop cross-site request forgery. `POST /view/s/{sid}/preset` has the same requirement.
-- A view-only session (`control: false`) gets `403` `view_only` for every input and preset change.
-- Input takes the lease's operation lock, like a tool call. It waits up to 1 s, then fails with `409` `busy`. So a person cannot interleave input with a run's steps.
+- Input travels on the page's WebSocket. Its upgrade request must carry an `Origin` that names this host (the `Host` header), else `403` `cross_origin`: a page on another site cannot open it with the person's cookie. `SameSite=Strict` keeps the cookie off cross-site requests too. A request without `Origin` does not come from a browser page, and it still needs the cookie.
+- A view-only session (`control: false`) gets `view_only` for every input and preset change.
+- Input takes the lease's operation lock, like a tool call. It waits up to 1 s, then fails with `busy`. A touch holds the lock from down to up; a finger left down 10 s, or when the page goes away, is lifted. So a person cannot interleave input with a run's steps.
+- Touches, keys and buttons go to the lease's `seiji-sim` helper as JSON lines on its stdin. The daemon writes those lines itself from checked numbers and names (points within 0–1, a HID usage, modifier usages 224–231, `home` or `lock`); nothing a person types reaches them.
 - Typed text (`type` and `paste_and_type` inputs) goes to `axe type --stdin` through a daemon-owned scratch file in `<dataDir>/run/`, deleted after the input, as in [Typed text and payloads](#typed-text-and-payloads). It is never an argument.
-- The `paste` input puts text on the simulator clipboard through `axe clipboard copy --stdin`, also via a daemon-owned scratch file as stdin, then sends Cmd+V. It is never an argument.
-- Every AXe and simctl command, the stream included, runs through `Runner` as the user's account.
+- The `paste` input puts text on the simulator clipboard through `axe clipboard copy --stdin`, also via a daemon-owned scratch file as stdin, then sends Cmd+V through the helper. It is never an argument.
+- Every AXe, simctl and `seiji-sim` command runs through `Runner` as the user's account.
+
+### The stream
+
+`seiji-sim` runs as the tenant, so its output is untrusted, like any file a tenant writes. The daemon reads only its framed messages, at most 8 MiB each, and ends the stream on anything else. A `format` must have an `avc1.` codec of six hex digits, sizes of 2–8192 and a base64 record of at most 4 KiB. Frames go only to the viewers of that lease, who see that screen anyway; the browser's own H.264 decoder parses them, as it parses any video.
 
 ### The page
 
 The page and its assets (`/view/assets/viewer.js`, `/view/assets/viewer.css`) are embedded in the binary. The page carries:
 
-- `Content-Security-Policy: default-src 'none'; img-src 'self' blob:; script-src 'self'; style-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`
+- `Content-Security-Policy: default-src 'none'; img-src 'self' blob:; script-src 'self'; style-src 'self'; connect-src 'self' wss://<host> ws://<host>; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`, where `<host>` is the request's `Host` (not every browser counts a WebSocket to the same host as `'self'`)
 - `Cache-Control: no-store`, `Referrer-Policy: no-referrer` and `X-Content-Type-Options: nosniff`
 
 No inline script runs, and no other site can frame the page.
@@ -355,7 +361,7 @@ An open tunnel restarts its lease's idle timer every 60 s, so the lease is not r
 - **Shared adb server.** See [Android and the shared adb server](#android-and-the-shared-adb-server).
 - **No token expiry, roles or rate limits.** Evidence links need the token too (see [`publicUrl` links](#publicurl-links)).
 - **Viewer link and sessions.** A viewer link opens for anyone in its first 60 s. A session lives up to `viewer.sessionHours` unless its lease ends first. Disabling or removing the user ends it, and so does disabling or removing the admin who asked for a link to another user's lease; nothing else revokes it. Without an `https://` `publicUrl` the cookie is not `Secure`. The viewer works on iOS only. See [The viewer](#the-viewer).
-- **Viewer streaming is not verified on a real simulator.** The `axe stream-video` flags and its raw framing were checked against AXe's source only. `seiji doctor` does not test streaming yet.
+- **The screen helper uses private frameworks.** `seiji-sim` drives the simulator through SimulatorKit's `SimDeviceLegacyHIDClient` and the framebuffer IOSurface, like AXe. A new Xcode can break it. It was verified on Xcode 27.2 with an iOS 26.5 runtime under `shared` isolation; `seiji doctor` checks it as the tenant. idb reports that iOS 27 runtimes may drop this legacy input path; if they do, touches stop working in the viewer while the picture keeps playing.
 - **Tunnels use the shared loopback.** Any local process can connect to an open tunnel's port on the host while it is open, and so reach the developer's dev server. See [Tunnels (`seiji forward`)](#tunnels-seiji-forward).
 - **No audit log.** The `leases` table records who held which device and when, and the `runs` table records each run until retention. The log at `/usr/local/var/log/seiji.log` (from the launchd plist) records lease, release and run events.
 

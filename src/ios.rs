@@ -111,9 +111,6 @@ pub fn axe_input(cfg: &Axe, udid: &str, input: &UiInput) -> CmdSpec {
             axe(cfg, &["button", name])
         }
         UiInput::Key(k) => axe(cfg, &["key"]).arg(k.to_string()),
-        UiInput::KeyCombo { modifiers, key } => axe(cfg, &["key-combo"])
-            .arg(opt("modifiers", modifiers.iter().map(u8::to_string).collect::<Vec<_>>().join(",")))
-            .arg(opt("key", key)),
     };
     spec = spec.arg(opt("udid", udid));
     spec
@@ -139,16 +136,18 @@ pub fn parse_axe(out: &Output, what: &str) -> Result<Value> {
     }
 }
 
-/// `axe stream-video` in its `raw` framing (a 4-byte big-endian length before each JPEG). It takes
-/// no `--output` format, unlike the other AXe commands.
-pub fn axe_stream(cfg: &Axe, udid: &str, opts: &crate::devices::StreamOpts) -> CmdSpec {
-    CmdSpec::new(&cfg.bin)
-        .arg("stream-video")
-        .arg(opt("udid", udid))
-        .arg(opt("format", "raw"))
-        .arg(opt("fps", opts.fps))
-        .arg(opt("quality", opts.quality))
-        .arg(opt("scale", opts.scale))
+/// `seiji-sim session`: the screen helper of the viewer (H.264 out, touch and keys in).
+pub fn sim_session(bin: &Path, udid: &str, opts: &crate::devices::StreamOpts) -> CmdSpec {
+    CmdSpec::new(bin)
+        .arg("session")
+        .arg("--udid")
+        .arg(udid)
+        .arg("--fps")
+        .arg(opts.fps.to_string())
+        .arg("--scale")
+        .arg(opts.scale.to_string())
+        .arg("--bitrate")
+        .arg(opts.bitrate.to_string())
 }
 
 pub fn screenshot(udid: &str, dest: &Path) -> CmdSpec {

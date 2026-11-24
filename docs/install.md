@@ -205,13 +205,20 @@ In shared mode the emulators run as `seiji`, which is not in `seiji-tenants`. Us
    ```sh
    cargo build --release
    ```
-4. Install it owned by root and writable only by root:
+4. Build the viewer's screen helper (Swift, with the Xcode toolchain):
+   ```sh
+   swiftc -O -swift-version 5 -o target/seiji-sim sim/*.swift -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework IOSurface -framework Accelerate
+   ```
+5. Install both owned by root and writable only by root:
    ```sh
    sudo install -o root -g wheel -m 755 target/release/seiji /usr/local/bin/seiji
    ```
-5. Check that neither the file nor its directory is writable by anyone but root:
    ```sh
-   ls -ld /usr/local/bin /usr/local/bin/seiji
+   sudo install -o root -g wheel -m 755 target/seiji-sim /usr/local/bin/seiji-sim
+   ```
+6. Check that neither the files nor their directory are writable by anyone but root:
+   ```sh
+   ls -ld /usr/local/bin /usr/local/bin/seiji /usr/local/bin/seiji-sim
    ```
 
 **Why root-owned:** sudoers lets the daemon account run `/usr/local/bin/seiji exec-as *` and `/usr/local/bin/seiji kill-as *` as root. If `seiji` could write the binary, or the directory that holds it, it could replace the binary and run anything as root. The binary is the only thing the root helpers trust: they never read the config, which the daemon account could change. The rest of the commands below stay in the clone directory, because they use files from `deploy/`.
@@ -468,17 +475,23 @@ Stopping the daemon releases every device. Tell the users first.
    ```sh
    git pull
    ```
-2. Build it:
+2. Build it, and the screen helper (step 3):
    ```sh
    cargo build --release
+   ```
+   ```sh
+   swiftc -O -swift-version 5 -o target/seiji-sim sim/*.swift -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework IOSurface -framework Accelerate
    ```
 3. Stop the daemon:
    ```sh
    sudo launchctl bootout system/dev.seiji.daemon
    ```
-4. Install the binary:
+4. Install the binaries:
    ```sh
    sudo install -o root -g wheel -m 755 target/release/seiji /usr/local/bin/seiji
+   ```
+   ```sh
+   sudo install -o root -g wheel -m 755 target/seiji-sim /usr/local/bin/seiji-sim
    ```
 5. Compare the deploy files with the installed copies, and install the ones that changed (steps 7 and 10):
    ```sh
@@ -494,7 +507,7 @@ Stopping the daemon releases every device. Tell the users first.
 
 Seiji has no schema migrations: at start it creates missing tables (`CREATE TABLE IF NOT EXISTS`) and changes nothing else. Back up `seiji.db` before an upgrade ([configuration.md](configuration.md#the-data-directory)).
 
-After an upgrade, run `sudo -u seiji seiji doctor <user> --platform ios`. It checks AXe and the capture as the user's account. If the host predates recorded runs, install AXe first ([AXe](#axe)); the `runs` table is created at the next start.
+After an upgrade, run `sudo -u seiji seiji doctor <user> --platform ios`. It checks AXe, the screen helper and the capture as the user's account. If the host predates recorded runs, install AXe first ([AXe](#axe)); the `runs` table is created at the next start. If the config still has `viewer.quality` (from the JPEG viewer), remove it: the daemon does not start with it ([configuration.md](configuration.md#viewer)).
 
 ## 14. Uninstall
 
@@ -534,9 +547,9 @@ After an upgrade, run `sudo -u seiji seiji doctor <user> --platform ios`. It che
    ```sh
    sudo rm -rf /usr/local/var/seiji /usr/local/etc/seiji /usr/local/var/log/seiji.log
    ```
-10. Delete the binary:
+10. Delete the binaries:
    ```sh
-   sudo rm /usr/local/bin/seiji
+   sudo rm /usr/local/bin/seiji /usr/local/bin/seiji-sim
    ```
 
 Check for emulators that are still running with `ps -axo user,pid,command | grep -- '[-]avd '`. Remove `/opt/maestro`, `/opt/android-sdk` and `/opt/android-avd` if nothing else uses them, and AXe with `brew uninstall axe`.
@@ -545,7 +558,7 @@ Check for emulators that are still running with `ps -axo user,pid,command | grep
 
 On a laptop you run everything as yourself, with no daemon account, no sudoers rule and no tenant accounts.
 
-1. Install Xcode with an iOS runtime, AXe and Rust (see [step 2](#2-prepare-the-host)). Java 17 and Maestro are optional; Maestro can stay in `~/.maestro`.
+1. Install Xcode with an iOS runtime, AXe and Rust (see [step 2](#2-prepare-the-host)). Java 17 and Maestro are optional; Maestro can stay in `~/.maestro`. Build the screen helper (step 3) and set `viewer.simBin` to `target/seiji-sim` in your clone, with its full path.
 2. Write a config outside the repository, for example `~/seiji-dev/seiji.json`. Start from the smallest example in [configuration.md](configuration.md#full-example). To use `run_flow`, add `maestro`, with your paths:
    ```json
    "maestro": {

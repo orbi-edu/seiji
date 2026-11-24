@@ -57,9 +57,10 @@
     "timeoutSeconds": 3600
   },
   "viewer": {
-    "fps": 10,
+    "simBin": "/usr/local/bin/seiji-sim",
+    "fps": 30,
     "scale": 0.5,
-    "quality": 70,
+    "bitrateKbps": 2500,
     "maxViewersPerLease": 4,
     "sessionHours": 12
   },

@@ -175,7 +175,7 @@ button:focus-visible, select:focus-visible { outline: 2px solid var(--accent); o
   outline: none;
 }
 
-.screen img {
+.screen canvas {
   display: block;
   max-height: 100%;
   max-width: 100%;
@@ -187,7 +187,7 @@ button:focus-visible, select:focus-visible { outline: 2px solid var(--accent); o
   background: #000;
 }
 
-.screen:focus-visible img { box-shadow: 0 0 0 2px var(--accent), 0 12px 32px rgba(0, 0, 0, 0.18); }
+.screen:focus-visible canvas { box-shadow: 0 0 0 2px var(--accent), 0 12px 32px rgba(0, 0, 0, 0.18); }
 
 .veil {
   position: absolute;
@@ -201,22 +201,18 @@ button:focus-visible, select:focus-visible { outline: 2px solid var(--accent); o
 
 .veil[hidden] { display: none; }
 
-.touch {
+/* Where the finger is while it is down: drawn at once, before the device answers. */
+.finger {
   position: absolute;
-  width: 34px;
-  height: 34px;
-  margin: -17px 0 0 -17px;
+  width: 30px;
+  height: 30px;
+  margin: -15px 0 0 -15px;
   border-radius: 50%;
   border: 2px solid var(--accent);
-  background: color-mix(in srgb, var(--accent) 18%, transparent);
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
   pointer-events: none;
-  animation: touch 420ms ease-out forwards;
 }
-
-@keyframes touch {
-  from { opacity: 1; transform: scale(0.6); }
-  to { opacity: 0; transform: scale(1.4); }
-}
+.finger[hidden] { display: none; }
 
 .stats-overlay {
   position: absolute;
