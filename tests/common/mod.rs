@@ -56,6 +56,8 @@ pub struct FakeDevices {
     pub still: AtomicBool,
     /// `simctl pbcopy` fails, as under `os_user` isolation (no login session for the tenant).
     pub no_pasteboard: AtomicBool,
+    /// Pads each frame to this many bytes, to fill a socket that the page does not read.
+    pub frame_bytes: AtomicUsize,
 }
 
 impl FakeDevices {
@@ -228,11 +230,14 @@ impl Devices for FakeDevices {
         self.streams_started.fetch_add(1, Ordering::SeqCst);
         let format =
             ScreenFormat { codec: "avc1.64001f".into(), width: 402, height: 874, description: "AWQAH/8=".into() };
+        let size = self.frame_bytes.load(Ordering::SeqCst);
         let frame = |n: u64, key: bool| {
             let captured_us =
                 std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_micros()
                     as i64;
-            ScreenEvent::Frame(VideoFrame { key, captured_us, data: bytes::Bytes::from(n.to_be_bytes().to_vec()) })
+            let mut data = n.to_be_bytes().to_vec();
+            data.resize(size.max(data.len()), 0);
+            ScreenEvent::Frame(VideoFrame { key, captured_us, data: bytes::Bytes::from(data) })
         };
         events.send(ScreenEvent::Ready).await?;
         events.send(ScreenEvent::Format(format)).await?;
