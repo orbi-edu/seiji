@@ -244,7 +244,7 @@ impl Devices for FakeDevices {
             tokio::select! {
                 _ = cancel.cancelled() => return Ok(()),
                 _ = tick.tick(), if !self.still.load(Ordering::SeqCst) => {
-                    events.send(frame(n, n % 10 == 0)).await?;
+                    events.send(frame(n, n.is_multiple_of(10))).await?;
                     n += 1;
                 }
                 cmd = commands.recv() => match cmd {
