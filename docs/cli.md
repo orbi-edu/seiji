@@ -164,10 +164,12 @@ Exercises the real host path for one user, as the daemon would, without a lease 
 | `identity` | always | `/usr/bin/id` as the user's account (through `sudo -n … exec-as` under `os_user`). |
 | `maestro --version` | only when `maestro` is configured | `maestro.bin --version` with `maestro.javaHome`. |
 | `axe --version` | `--platform ios` | `axe.bin --version` as the user's account (30 s limit). |
+| `seiji-sim --version` | `--platform ios` | `viewer.simBin --version` as the user's account (30 s limit). |
 | `create <platform> <model>` | always | Creates a device of the platform's `defaultModel`: simulator `seiji-doctor-<8 hex>`, or an emulator on the first free even port of `android.consolePortRange` that no active lease holds. |
 | `boot` | always | Waits for boot with the configured boot timeout. |
 | `screenshot` | always | Captures a JPEG through `sips`. |
 | `accessibility tree (axe describe-ui)` | `--platform ios` | Reads the accessibility tree with `axe describe-ui` and prints the number of elements. |
+| `screen session (seiji-sim: capture, H.264, HID)` | `--platform ios` | Starts the viewer's screen helper as the user's account, waits up to 20 s for its decoder setup and first keyframe, then stops it. Prints the codec, the size, the keyframe's bytes and the time it took. Its HID connection opens before the first frame, so a pass shows that input can connect too; it does not prove that a touch reaches the app. |
 | `video and log capture (3 s)` | `--platform ios` | Starts `xcrun simctl io <udid> recordVideo` and `xcrun simctl spawn <udid> log stream` (predicate `process == "SpringBoard"`) as the user's account, waits 3 s, stops the video with `SIGINT` and the log stream, then prints both sizes. It fails with `video file exited <code>: <output>` when no video file was written. A log of 0 bytes does not fail the step. |
 | `destroy` | always, also when an earlier step failed | Deletes the device and its directory. |
 
@@ -178,6 +180,8 @@ uid=601(seiji-alice) gid=20(staff) groups=20(staff),701(seiji-tenants)
 <maestro version>
 == axe --version
 <axe version>
+== seiji-sim --version
+seiji-sim 0.1.0
 == create ios iphone-16
 device <UDID>
 == boot
@@ -186,6 +190,8 @@ booted in 38s
 412233 bytes of JPEG
 == accessibility tree (axe describe-ui)
 57 elements
+== screen session (seiji-sim: capture, H.264, HID)
+avc1.64001F 602x1310, first keyframe 33799 bytes after 1.6s
 == video and log capture (3 s)
 video 184320 bytes, log 2048 bytes
 == destroy

@@ -1,18 +1,20 @@
-// Seiji's screen viewer: shows the simulator's MJPEG stream parsed with fetch() and turns
-// pointer, wheel and keyboard input into taps, swipes and typing.  Every request is same-origin
-// under the session path, with the session cookie; input also carries `X-Seiji-View: 1`.
+// Seiji's screen viewer. One WebSocket (`ws`, same origin, with the session cookie) carries the
+// simulator's screen as H.264, decoded with WebCodecs onto a canvas, and the input: a finger that
+// follows the pointer (down, move, up), wheel scrolls as drags, keys as HID usages, text through
+// the simulator clipboard. The page acknowledges every frame so the server never queues more
+// than a few frames for it on a slow link.
 "use strict";
 
 (() => {
   const $ = (id) => document.getElementById(id);
-  const frame = $("frame");
+  const canvas = $("frame");
+  const g2d = canvas.getContext("2d", { alpha: false, desynchronized: true });
   const screen = $("screen");
   const veil = $("veil");
   const veilText = $("veil-text");
   const note = $("note");
   const statsOverlay = $("stats-overlay");
   let info = null;
-  let clockOffset = 0;
   let ended = false;
   let control = false;
 
@@ -39,11 +41,12 @@
 
   function end(message) {
     ended = true;
-    frame.removeAttribute("src");
     veil.hidden = false;
     veilText.textContent = message;
     $("dot").className = "dot off";
-    for (const b of document.querySelectorAll("button")) b.disabled = true;
+    for (const b of document.querySelectorAll("button, select")) b.disabled = true;
+    if (ws) ws.close();
+    if (decoder && decoder.state !== "closed") decoder.close();
   }
 
   async function errorOf(resp) {
@@ -67,10 +70,7 @@
     if (ended) return;
     let resp;
     try {
-      const sent = Date.now();
       resp = await fetch("info", { cache: "no-store" });
-      resp.sentAt = sent;
-      resp.gotAt = Date.now();
     } catch {
       $("dot").className = "dot off";
       return;
@@ -81,10 +81,6 @@
     }
     if (!resp.ok) return;
     info = await resp.json();
-    // Server clock minus browser clock, taken at the middle of the round trip.
-    if (typeof info.server_time_ms === "number" && resp.sentAt) {
-      clockOffset = info.server_time_ms - (resp.sentAt + resp.gotAt) / 2;
-    }
     control = !!info.control;
     // com.apple.CoreSimulator.SimRuntime.iOS-18-2 → iOS 18.2
     const runtime = (info.runtime || "")
@@ -102,151 +98,248 @@
     $("keys").hidden = !control;
     $("dot").className = "dot " + (info.busy ? "busy" : "live");
     showNote(info.busy && control ? busyText : "");
-    if (info.preset) {
-      $("preset").value = info.preset;
-    }
+    if (info.preset) $("preset").value = info.preset;
   }
 
-  // ── stream (fetch-based multipart reader) ──────────────────────────────
+  // ── socket ─────────────────────────────────────────────────────────────
 
+  let ws = null;
   let retry = 0;
-  let prevBlobUrl = null;
-  let statsFrames = []; // {size, time, captureTime}
-  let statsOn = false;
-  let statsTimer = 0;
+  let clockOffset = 0; // server clock minus browser clock
+  let rtt = null;
 
-  function concat(a, b) {
-    const c = new Uint8Array(a.length + b.length);
-    c.set(a);
-    c.set(b, a.length);
-    return c;
+  // `false` when the socket is not open: the message was not sent.
+  function send(msg) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+    ws.send(JSON.stringify(msg));
+    return true;
   }
 
-  function indexOf(buf, needle, from) {
-    from = from || 0;
-    outer: for (let i = from; i <= buf.length - needle.length; i++) {
-      for (let j = 0; j < needle.length; j++) {
-        if (buf[i + j] !== needle[j]) continue outer;
-      }
-      return i;
-    }
-    return -1;
-  }
-
-  const ENC = new TextEncoder();
-  const DEC = new TextDecoder();
-  const BOUNDARY = ENC.encode("--seijiframe\r\n");
-  const HEADER_END = ENC.encode("\r\n\r\n");
-
-  function displayFrame(jpeg, captureTime) {
-    const blob = new Blob([jpeg], { type: "image/jpeg" });
-    const url = URL.createObjectURL(blob);
-    frame.src = url;
-    if (prevBlobUrl) URL.revokeObjectURL(prevBlobUrl);
-    prevBlobUrl = url;
-    veil.hidden = true;
-
-    const now = Date.now();
-    statsFrames.push({ size: jpeg.byteLength, time: now, captureTime });
-    if (statsFrames.length > 120) statsFrames.splice(0, statsFrames.length - 120);
-    retry = 0;
-  }
-
-  async function connect() {
+  function connect() {
     if (ended) return;
-    veilText.textContent = "Connecting…";
-    let resp;
-    try {
-      resp = await fetch("stream", { cache: "no-store" });
-    } catch {
-      scheduleReconnect();
+    if (!("VideoDecoder" in window)) {
+      end("This browser cannot show the stream: it needs WebCodecs (a current Chrome, Edge, Safari or Firefox).");
       return;
     }
-    if (!resp.ok || !resp.body) {
-      if (resp.status === 401 || resp.status === 410) {
-        end((await errorOf(resp)).message || "The viewer closed.");
+    veil.hidden = false;
+    veilText.textContent = retry ? "Reconnecting…" : "Connecting…";
+    const url = new URL("ws", location.href);
+    url.protocol = location.protocol === "https:" ? "wss:" : "ws:";
+    ws = new WebSocket(url);
+    ws.binaryType = "arraybuffer";
+    ws.onopen = () => {
+      retry = 0;
+      ping();
+    };
+    ws.onmessage = (ev) => (typeof ev.data === "string" ? onText(JSON.parse(ev.data)) : onFrame(ev.data));
+    ws.onclose = (ev) => {
+      ws = null;
+      resetVideo();
+      if (ended) return;
+      // An input sent before the drop may or may not have reached the device: say so, never replay.
+      if (pending.size) {
+        flash(`The connection dropped: ${pending.size === 1 ? "an input" : `${pending.size} inputs`} may not have been applied.`, "error");
+        pending.clear();
+      }
+      // 4401: the session expired. 4410: the device was released.
+      if (ev.code === 4401 || ev.code === 4410) {
+        end(ev.reason || "The viewer closed.");
         return;
       }
-      scheduleReconnect();
-      return;
-    }
-    const reader = resp.body.getReader();
-    let buf = new Uint8Array(0);
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buf = concat(buf, value);
-        // Parse as many complete parts as possible.
-        while (true) {
-          const bIdx = indexOf(buf, BOUNDARY);
-          if (bIdx === -1) break;
-          const afterBoundary = bIdx + BOUNDARY.length;
-          const hEnd = indexOf(buf, HEADER_END, afterBoundary);
-          if (hEnd === -1) break;
-          const headerText = DEC.decode(buf.subarray(afterBoundary, hEnd));
-          const bodyStart = hEnd + 4;
-          // Parse headers.
-          let contentLength = -1;
-          let captureTime = 0;
-          for (const line of headerText.split("\r\n")) {
-            const colon = line.indexOf(": ");
-            if (colon === -1) continue;
-            const k = line.substring(0, colon).toLowerCase();
-            const v = line.substring(colon + 2);
-            if (k === "content-length") contentLength = parseInt(v, 10);
-            else if (k === "x-capture-time") captureTime = parseInt(v, 10);
-          }
-          if (contentLength < 0 || buf.length < bodyStart + contentLength + 2) break;
-          const jpeg = buf.subarray(bodyStart, bodyStart + contentLength);
-          displayFrame(jpeg, captureTime);
-          buf = buf.subarray(bodyStart + contentLength + 2);
-        }
-        // Prevent unbounded buffering: if buf is very large, something is wrong.
-        if (buf.length > 16 * 1024 * 1024) buf = new Uint8Array(0);
-      }
-    } catch {
-      // stream broken
-    }
-    if (!ended) scheduleReconnect();
+      veil.hidden = false;
+      veilText.textContent = "Reconnecting…";
+      refresh();
+      retry = Math.min(retry + 1, 5);
+      setTimeout(connect, 600 * retry);
+    };
   }
 
-  function scheduleReconnect() {
-    if (ended) return;
-    veil.hidden = false;
-    veilText.textContent = "Reconnecting…";
-    refresh();
-    retry = Math.min(retry + 1, 5);
-    setTimeout(connect, 600 * retry);
+  function ping() {
+    send({ t: "ping", at: performance.now() });
   }
+  setInterval(ping, 2000);
+
+  const pending = new Map(); // input id → what it was
+  let nextId = 1;
+
+  function onText(msg) {
+    switch (msg.t) {
+      case "format":
+        configure(msg);
+        break;
+      case "pong": {
+        const now = performance.now();
+        rtt = now - msg.at;
+        // The server's clock at the middle of the round trip.
+        clockOffset = msg.server_ms - (Date.now() - rtt / 2);
+        break;
+      }
+      case "preset":
+        flash(`Preset: ${msg.preset}`);
+        break;
+      case "done": {
+        const kind = pending.get(msg.id);
+        pending.delete(msg.id);
+        if (kind === "paste") {
+          flash(msg.via === "typed"
+            ? "Typed into the focused field (the device clipboard is not reachable; US keyboard characters only)."
+            : "Pasted into the focused field.");
+        }
+        break;
+      }
+      case "error":
+        if (msg.id) pending.delete(msg.id);
+        flash(msg.message || "Input failed.", msg.code === "busy" ? "warning" : "error");
+        if (msg.code === "busy") refresh();
+        break;
+    }
+  }
+
+  // ── video ──────────────────────────────────────────────────────────────
+
+  let decoder = null;
+  let waitingKey = true;
+  let format = null;
+  let decodeErrors = [];
+  const stats = { frames: [], bytes: [], age: null, drawn: 0 };
+  // Frames sent to the decoder and not yet shown: capture time → [frame number, when sent]. A
+  // frame is acknowledged once it is shown, so a slow decoder holds the stream back like a slow
+  // link.
+  const decoding = new Map();
+  // At most this many frames wait in the decoder; past it, frames are dropped up to a keyframe.
+  const MAX_DECODE_QUEUE = 3;
+
+  function base64Bytes(s) {
+    const bin = atob(s);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+
+  // Acknowledges every frame still in the decoder (it was reset, or stalled) and starts over at a
+  // keyframe.
+  function flushDecoding() {
+    let last = null;
+    for (const [seq] of decoding.values()) last = seq;
+    decoding.clear();
+    if (last !== null) send({ t: "ack", seq: last });
+    waitingKey = true;
+    send({ t: "keyframe" });
+  }
+
+  function resetVideo() {
+    decoding.clear();
+    waitingKey = true;
+  }
+
+  function newDecoder() {
+    return new VideoDecoder({
+      output: (frame) => {
+        const entry = decoding.get(frame.timestamp);
+        if (entry !== undefined) {
+          decoding.delete(frame.timestamp);
+          send({ t: "ack", seq: entry[0] });
+        }
+        if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
+          canvas.width = frame.displayWidth;
+          canvas.height = frame.displayHeight;
+        }
+        g2d.drawImage(frame, 0, 0);
+        const now = Date.now();
+        stats.age = now + clockOffset - frame.timestamp / 1000;
+        stats.frames.push(now);
+        frame.close();
+        veil.hidden = true;
+      },
+      error: (e) => {
+        decoder = null;
+        // A browser that cannot decode this stream fails the same way every time: stop there.
+        const now = Date.now();
+        decodeErrors = decodeErrors.filter((t) => t > now - 10000).concat(now);
+        if (e && e.name === "NotSupportedError") {
+          end(`This browser cannot decode the stream (${format ? format.codec : "H.264"}).`);
+        } else if (decodeErrors.length > 3) {
+          end("The stream could not be decoded. Open the device again.");
+        } else if (format) {
+          configure(format);
+          flushDecoding();
+        }
+      },
+    });
+  }
+
+  async function configure(f) {
+    format = f;
+    const config = {
+      codec: f.codec,
+      codedWidth: f.width,
+      codedHeight: f.height,
+      description: base64Bytes(f.description),
+      optimizeForLatency: true,
+    };
+    waitingKey = true;
+    try {
+      const support = await VideoDecoder.isConfigSupported(config);
+      if (!support.supported) {
+        end(`This browser cannot decode the stream (${f.codec}, ${f.width}×${f.height}).`);
+        return;
+      }
+    } catch {
+      end(`This browser cannot decode the stream (${f.codec}).`);
+      return;
+    }
+    if (format !== f || ended) return;
+    if (!decoder || decoder.state === "closed") decoder = newDecoder();
+    decoder.configure(config);
+    decoding.clear();
+  }
+
+  function onFrame(buf) {
+    const view = new DataView(buf);
+    const key = (view.getUint8(0) & 1) === 1;
+    const seq = view.getUint32(1);
+    const capturedUs = Number(view.getBigInt64(5));
+    stats.bytes.push([Date.now(), buf.byteLength]);
+    const ready = decoder && decoder.state === "configured";
+    if (ready && !key && decoder.decodeQueueSize >= MAX_DECODE_QUEUE) {
+      // The decoder is behind: drop up to the next keyframe rather than fall further behind.
+      waitingKey = true;
+      send({ t: "keyframe" });
+    }
+    if (!ready || (waitingKey && !key)) {
+      send({ t: "ack", seq });
+      return;
+    }
+    waitingKey = false;
+    decoding.set(capturedUs, [seq, performance.now()]);
+    decoder.decode(new EncodedVideoChunk({ type: key ? "key" : "delta", timestamp: capturedUs, data: new Uint8Array(buf, 13) }));
+  }
+
+  // A decoder that holds a frame for a second has stalled: let the stream go on.
+  setInterval(() => {
+    const oldest = decoding.values().next().value;
+    if (oldest && performance.now() - oldest[1] > 1000) flushDecoding();
+  }, 500);
 
   // ── stats overlay ──────────────────────────────────────────────────────
 
+  let statsOn = false;
+  let statsTimer = 0;
+
   function renderStats() {
-    if (!statsOn || !statsOverlay) return;
     const now = Date.now();
-    const oneSecAgo = now - 1000;
-    const recent = statsFrames.filter(f => f.time > oneSecAgo);
-    const fps = recent.length;
-    const last = statsFrames[statsFrames.length - 1];
-    const prev = statsFrames.length >= 2 ? statsFrames[statsFrames.length - 2] : null;
-    const gap = prev ? now - prev.time : 0;
-    const meanSize = statsFrames.length > 0 ? statsFrames.reduce((s, f) => s + f.size, 0) / statsFrames.length : 0;
-    const recentBytes = recent.reduce((s, f) => s + f.size, 0);
-    const bitrate = recentBytes * 8;
-    // A frame's age on the server's clock: capture → now, both in server time.
-    const age = last && last.captureTime > 0 ? Math.round(last.time + clockOffset - last.captureTime) : null;
-    const stalled = gap > 2000;
-    const res = frame.naturalWidth && frame.naturalHeight ? `${frame.naturalWidth}×${frame.naturalHeight}` : "—";
+    stats.frames = stats.frames.filter((t) => t > now - 1000);
+    stats.bytes = stats.bytes.filter(([t]) => t > now - 1000);
+    const bits = stats.bytes.reduce((s, [, n]) => s + n, 0) * 8;
     const lines = [
-      `FPS: ${fps}`,
-      `Frame: ${(meanSize / 1024).toFixed(1)} KiB`,
-      `Bitrate: ${(bitrate / 1e6).toFixed(2)} Mbit/s`,
-      `Resolution: ${res}`,
-      `Gap: ${gap} ms`,
+      `FPS: ${stats.frames.length}`,
+      `Bitrate: ${(bits / 1e6).toFixed(2)} Mbit/s`,
+      `Resolution: ${canvas.width}×${canvas.height}`,
+      `Codec: ${format ? format.codec : "—"}`,
+      `Round trip: ${rtt === null ? "—" : `${Math.round(rtt)} ms`}`,
+      `Frame age: ${stats.age === null ? "—" : `${Math.round(stats.age)} ms`}`,
+      `Decode queue: ${decoder ? decoder.decodeQueueSize : 0}`,
     ];
-    if (age !== null) lines.push(`Age: ${age} ms`);
-    if (stalled) lines.push("⚠ STALLED");
     statsOverlay.textContent = lines.join("\n");
   }
 
@@ -262,177 +355,225 @@
 
   $("stats-btn").addEventListener("click", toggleStats);
 
-  // ── input ──────────────────────────────────────────────────────────────
+  // ── touch ──────────────────────────────────────────────────────────────
 
-  // Inputs go one at a time, in order: a tap must land before the text typed after it.
-  let queue = Promise.resolve();
-  function send(input) {
-    if (!control || ended) return;
-    queue = queue.then(() => post(input));
-  }
-
-  async function post(input) {
-    if (ended) return;
-    const aspect = frame.naturalWidth && frame.naturalHeight ? frame.naturalWidth / frame.naturalHeight : null;
-    let resp;
-    try {
-      resp = await fetch("input", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "X-Seiji-View": "1" },
-        body: JSON.stringify({ input, aspect }),
-      });
-    } catch {
-      flash("Could not reach Seiji.", "error");
-      return;
-    }
-    if (resp.status === 200 && input.kind === "paste") {
-      const out = await resp.json().catch(() => ({}));
-      flash(out.via === "typed"
-        ? "Typed into the focused field (the device clipboard is not reachable; US keyboard characters only)."
-        : "Pasted into the focused field.");
-      return;
-    }
-    if (resp.ok) return;
-    const err = await errorOf(resp);
-    if (resp.status === 401 || resp.status === 410) {
-      end(err.message || "The viewer closed.");
-    } else {
-      flash(err.message || `Input failed (HTTP ${resp.status}).`, resp.status === 409 ? "warning" : "error");
-      if (resp.status === 409) refresh();
-    }
-  }
-
-  // Pointer position as 0-1 of the picture.
+  // Pointer position as 0-1 of the picture, kept inside it.
   function norm(ev) {
-    const r = frame.getBoundingClientRect();
+    const r = canvas.getBoundingClientRect();
     return {
       x: Math.min(1, Math.max(0, (ev.clientX - r.left) / r.width)),
       y: Math.min(1, Math.max(0, (ev.clientY - r.top) / r.height)),
-      px: ev.clientX - r.left,
-      py: ev.clientY - r.top,
     };
   }
 
-  function ripple(p) {
-    const dot = document.createElement("div");
-    dot.className = "touch";
-    const r = frame.getBoundingClientRect();
-    const s = screen.getBoundingClientRect();
-    dot.style.left = `${p.px + r.left - s.left}px`;
-    dot.style.top = `${p.py + r.top - s.top}px`;
-    screen.appendChild(dot);
-    setTimeout(() => dot.remove(), 450);
+  // A gesture that starts at a screen edge is a system gesture (home indicator, Notification Centre).
+  function edgeOf(p) {
+    if (p.y >= 0.97) return "bottom";
+    if (p.y <= 0.015) return "top";
+    if (p.x <= 0.015) return "left";
+    if (p.x >= 0.985) return "right";
+    return undefined;
   }
 
-  let down = null;
-  frame.addEventListener("pointerdown", (ev) => {
-    if (!control || ev.button !== 0) return;
-    screen.focus();
-    frame.setPointerCapture(ev.pointerId);
-    down = { p: norm(ev), t: performance.now() };
-  });
-  frame.addEventListener("pointerup", (ev) => {
-    if (!down) return;
-    const start = down;
-    down = null;
-    const p = norm(ev);
-    const ms = performance.now() - start.t;
-    const moved = Math.hypot(p.px - start.p.px, p.py - start.p.py);
-    if (moved < 8) {
-      ripple(p);
-      send({ kind: "tap", x: start.p.x, y: start.p.y, hold: ms >= 400 ? ms / 1000 : null });
-    } else {
-      ripple(p);
-      send({ kind: "swipe", x1: start.p.x, y1: start.p.y, x2: p.x, y2: p.y, duration: Math.min(2, Math.max(0.08, ms / 1000)) });
+  const fingerDot = $("finger");
+  function showFinger(p) {
+    if (!p) {
+      fingerDot.hidden = true;
+      return;
     }
-  });
-  frame.addEventListener("pointercancel", () => {
-    down = null;
-  });
+    const r = canvas.getBoundingClientRect();
+    const s = screen.getBoundingClientRect();
+    fingerDot.style.left = `${r.left - s.left + p.x * r.width}px`;
+    fingerDot.style.top = `${r.top - s.top + p.y * r.height}px`;
+    fingerDot.hidden = false;
+  }
 
-  // Wheel: one swipe per gesture, in the content's direction.
-  let wheel = 0;
-  let wheelTimer = 0;
-  let wheelAt = null;
-  frame.addEventListener(
+  // Moves are sent at most once per animation frame, always the latest point.
+  let moveAt = null;
+  let moveScheduled = false;
+  function queueMove(p) {
+    moveAt = p;
+    if (moveScheduled) return;
+    moveScheduled = true;
+    requestAnimationFrame(flushMove);
+  }
+  function flushMove() {
+    moveScheduled = false;
+    if (moveAt && (finger || wheel.active)) send({ t: "touch", phase: "move", x: moveAt.x, y: moveAt.y });
+    moveAt = null;
+  }
+
+  let finger = null;
+  canvas.addEventListener("pointerdown", (ev) => {
+    if (!control || ev.button !== 0 || finger) return;
+    ev.preventDefault();
+    screen.focus();
+    canvas.setPointerCapture(ev.pointerId);
+    endWheel();
+    const p = norm(ev);
+    finger = ev.pointerId;
+    send({ t: "touch", phase: "down", x: p.x, y: p.y, edge: edgeOf(p) });
+    showFinger(p);
+  });
+  canvas.addEventListener("pointermove", (ev) => {
+    if (ev.pointerId !== finger) return;
+    const p = norm(ev);
+    queueMove(p);
+    showFinger(p);
+  });
+  function lift(ev) {
+    if (ev.pointerId !== finger) return;
+    finger = null;
+    flushMove();
+    const p = norm(ev);
+    send({ t: "touch", phase: "up", x: p.x, y: p.y });
+    showFinger(null);
+  }
+  canvas.addEventListener("pointerup", lift);
+  canvas.addEventListener("pointercancel", lift);
+
+  // Wheel and trackpad scrolls become a drag that follows the deltas, lifted after a pause.
+  const wheel = { active: false, at: null, origin: null, timer: 0 };
+  function endWheel() {
+    clearTimeout(wheel.timer);
+    if (!wheel.active) return;
+    wheel.active = false;
+    flushMove();
+    send({ t: "touch", phase: "up", x: wheel.at.x, y: wheel.at.y });
+  }
+  canvas.addEventListener(
     "wheel",
     (ev) => {
-      if (!control) return;
+      if (!control || finger) return;
       ev.preventDefault();
-      wheel += ev.deltaY;
-      wheelAt = wheelAt || norm(ev);
-      clearTimeout(wheelTimer);
-      wheelTimer = setTimeout(() => {
-        const r = frame.getBoundingClientRect();
-        const dy = Math.max(-0.45, Math.min(0.45, -wheel / r.height));
-        const from = { x: wheelAt.x, y: Math.min(0.9, Math.max(0.1, wheelAt.y)) };
-        const to = { x: from.x, y: Math.min(0.95, Math.max(0.05, from.y + dy)) };
-        wheel = 0;
-        wheelAt = null;
-        if (Math.abs(to.y - from.y) > 0.02) send({ kind: "swipe", x1: from.x, y1: from.y, x2: to.x, y2: to.y, duration: 0.25 });
-      }, 120);
+      const r = canvas.getBoundingClientRect();
+      if (!wheel.active) {
+        const p = norm(ev);
+        wheel.origin = { x: Math.min(0.9, Math.max(0.1, p.x)), y: Math.min(0.85, Math.max(0.15, p.y)) };
+        wheel.at = { ...wheel.origin };
+        wheel.active = true;
+        send({ t: "touch", phase: "down", x: wheel.at.x, y: wheel.at.y });
+      }
+      const scale = ev.deltaMode === 1 ? 16 : ev.deltaMode === 2 ? r.height : 1;
+      const x = wheel.at.x - (ev.deltaX * scale) / r.width;
+      const y = wheel.at.y - (ev.deltaY * scale) / r.height;
+      if (x < 0.02 || x > 0.98 || y < 0.05 || y > 0.95) {
+        // Out of room: lift and start the next drag where this one began.
+        endWheel();
+      } else {
+        wheel.at = { x, y };
+        queueMove(wheel.at);
+      }
+      clearTimeout(wheel.timer);
+      wheel.timer = setTimeout(endWheel, 120);
     },
     { passive: false },
   );
 
-  // Keyboard: printable keys are batched into one `type`; a few keys map to HID codes.
-  const KEYS = { Enter: 40, Escape: 41, Backspace: 42, Tab: 43, ArrowRight: 79, ArrowLeft: 80, ArrowDown: 81, ArrowUp: 82 };
-  let typed = "";
-  let typeTimer = 0;
-  function flushTyped() {
-    clearTimeout(typeTimer);
-    if (typed) send({ kind: "type", text: typed });
-    typed = "";
+  // ── keyboard ───────────────────────────────────────────────────────────
+
+  // HID usages (page 7) of a US keyboard. A character is [usage, shift].
+  const SPECIAL = {
+    Enter: 40, Escape: 41, Backspace: 42, Tab: 43, Delete: 76,
+    ArrowRight: 79, ArrowLeft: 80, ArrowDown: 81, ArrowUp: 82,
+    Home: 74, End: 77, PageUp: 75, PageDown: 78,
+  };
+  const US = {};
+  for (let i = 0; i < 26; i++) {
+    US[String.fromCharCode(97 + i)] = [4 + i, false];
+    US[String.fromCharCode(65 + i)] = [4 + i, true];
   }
+  "1234567890".split("").forEach((c, i) => (US[c] = [30 + i, false]));
+  "!@#$%^&*()".split("").forEach((c, i) => (US[c] = [30 + i, true]));
+  const PAIRS = [[" ", 44], ["-", 45, "_"], ["=", 46, "+"], ["[", 47, "{"], ["]", 48, "}"], ["\\", 49, "|"],
+    [";", 51, ":"], ["'", 52, "\""], ["`", 53, "~"], [",", 54, "<"], [".", 55, ">"], ["/", 56, "?"]];
+  for (const [c, u, s] of PAIRS) {
+    US[c] = [u, false];
+    if (s) US[s] = [u, true];
+  }
+  const SHIFT = 225;
+  const GUI = 227;
+
+  // Characters a US keyboard cannot type (accents, emoji) go through the clipboard. While such
+  // text waits, later characters join it, so the order stays.
+  let text = "";
+  let textTimer = 0;
+  function flushText() {
+    clearTimeout(textTimer);
+    if (text) paste(text);
+    text = "";
+  }
+  // Sends a text input and remembers it for its answer; says so when it could not be sent.
+  function request(kind, t) {
+    const id = nextId++;
+    if (!send({ t: kind, id, text: t })) {
+      flash("Not connected: the text was not sent.", "error");
+      return false;
+    }
+    pending.set(id, kind);
+    return true;
+  }
+  function paste(t) {
+    request("paste", t);
+  }
+  function key(usage, mods) {
+    flushText();
+    send({ t: "key", usage, mods: mods || [] });
+  }
+
   screen.addEventListener("keydown", (ev) => {
     if (!control) return;
-    if (ev.metaKey && ev.shiftKey && ev.key.toLowerCase() === "h") {
+    const k = ev.key.toLowerCase();
+    if (ev.metaKey && ev.shiftKey && k === "h") {
       ev.preventDefault();
-      flushTyped();
-      send({ kind: "button", name: "home" });
-    } else if (ev.metaKey && ev.key.toLowerCase() === "l") {
+      flushText();
+      send({ t: "button", name: "home" });
+    } else if (ev.metaKey && k === "l") {
       ev.preventDefault();
-      flushTyped();
-      send({ kind: "button", name: "lock" });
-    } else if (ev.metaKey && ev.key.toLowerCase() === "s") {
+      flushText();
+      send({ t: "button", name: "lock" });
+    } else if (ev.metaKey && k === "s") {
       ev.preventDefault();
       save();
-    } else if (ev.metaKey && ev.shiftKey && ev.key.toLowerCase() === "v") {
+    } else if (ev.metaKey && ev.shiftKey && k === "v") {
       ev.preventDefault();
-      flushTyped();
+      flushText();
       doPaste();
-    } else if (ev.key.toLowerCase() === "i" && !ev.metaKey && !ev.ctrlKey && !ev.altKey && !ev.shiftKey) {
-      // Only toggle stats when the screen is focused and no modifier is held,
-      // and only when there is no active text input (no typed buffer).
-      if (typed === "") {
-        ev.preventDefault();
-        toggleStats();
-        return;
-      }
-    } else if (ev.metaKey || ev.ctrlKey || ev.altKey) {
+    } else if (ev.altKey && ev.code === "KeyI") {
+      ev.preventDefault();
+      toggleStats();
+    } else if (ev.metaKey && ["a", "c", "x", "z"].includes(k)) {
+      // Editing shortcuts go to the simulator; the browser keeps the rest.
+      ev.preventDefault();
+      key(US[k][0], ev.shiftKey ? [GUI, SHIFT] : [GUI]);
+    } else if (ev.metaKey || ev.ctrlKey) {
       // Leave the browser's own shortcuts alone.
-    } else if (KEYS[ev.key]) {
+    } else if (SPECIAL[ev.key]) {
       ev.preventDefault();
-      flushTyped();
-      send({ kind: "key", code: KEYS[ev.key] });
-    } else if (ev.key.length === 1) {
+      key(SPECIAL[ev.key], ev.shiftKey ? [SHIFT] : []);
+    } else if (ev.key.length === 1 || [...ev.key].length === 1) {
       ev.preventDefault();
-      typed += ev.key;
-      clearTimeout(typeTimer);
-      typeTimer = setTimeout(flushTyped, 180);
+      const us = US[ev.key];
+      if (us && !text) {
+        key(us[0], us[1] ? [SHIFT] : []);
+      } else {
+        text += ev.key;
+        clearTimeout(textTimer);
+        textTimer = setTimeout(flushText, 250);
+      }
     }
   });
   screen.addEventListener("paste", (ev) => {
     if (!control) return;
-    const text = ev.clipboardData && ev.clipboardData.getData("text/plain");
-    if (text) {
+    const t = ev.clipboardData && ev.clipboardData.getData("text/plain");
+    if (t) {
       ev.preventDefault();
-      flushTyped();
-      send({ kind: "type", text });
+      flushText();
+      paste(t);
     }
   });
 
-  // ── paste ──────────────────────────────────────────────────────────────
+  // ── paste box ──────────────────────────────────────────────────────────
 
   const pasteBox = $("paste-box");
   const pasteText = $("paste-text");
@@ -440,13 +581,12 @@
   async function doPaste() {
     // Try the Clipboard API first (needs a user gesture and permission).
     try {
-      const text = await navigator.clipboard.readText();
-      if (text) {
-        send({ kind: "paste", text });
+      const t = await navigator.clipboard.readText();
+      if (t) {
+        paste(t);
         return;
       }
     } catch { /* fall through to the text box */ }
-    // Fall back to showing a text area.
     pasteBox.hidden = false;
     pasteText.value = "";
     pasteText.focus();
@@ -455,19 +595,16 @@
   $("paste").addEventListener("click", doPaste);
 
   $("paste-send").addEventListener("click", () => {
-    const text = pasteText.value;
+    const t = pasteText.value;
     pasteBox.hidden = true;
-    if (text) {
-      send({ kind: "paste", text });
-    }
+    if (t) paste(t);
     screen.focus();
   });
 
   $("paste-type").addEventListener("click", () => {
-    const text = pasteText.value;
+    const t = pasteText.value;
     pasteBox.hidden = true;
-    if (text) {
-      send({ kind: "paste_and_type", text });
+    if (t && request("paste_and_type", t)) {
       flash("Typing pasted text…");
     }
     screen.focus();
@@ -478,28 +615,9 @@
     screen.focus();
   });
 
-  // ── preset picker ──────────────────────────────────────────────────────
-
-  $("preset").addEventListener("change", async (ev) => {
-    const value = ev.target.value;
-    try {
-      const resp = await fetch("preset", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "X-Seiji-View": "1" },
-        body: JSON.stringify({ preset: value }),
-      });
-      if (resp.ok) {
-        flash(`Preset: ${value}`);
-      } else {
-        const err = await errorOf(resp);
-        flash(err.message || "Could not change preset.", "error");
-      }
-    } catch {
-      flash("Could not reach Seiji.", "error");
-    }
-  });
-
   // ── toolbar ────────────────────────────────────────────────────────────
+
+  $("preset").addEventListener("change", (ev) => send({ t: "preset", name: ev.target.value }));
 
   function save() {
     const a = document.createElement("a");
@@ -509,8 +627,8 @@
     a.click();
     a.remove();
   }
-  $("home").addEventListener("click", () => send({ kind: "button", name: "home" }));
-  $("lock").addEventListener("click", () => send({ kind: "button", name: "lock" }));
+  $("home").addEventListener("click", () => send({ t: "button", name: "home" }));
+  $("lock").addEventListener("click", () => send({ t: "button", name: "lock" }));
   $("shot").addEventListener("click", save);
 
   refresh().then(connect);

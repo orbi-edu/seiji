@@ -253,12 +253,14 @@ impl Default for Xctest {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields, default)]
 pub struct Viewer {
-    /// Frames per second of the stream, 1-30.
+    /// The `seiji-sim` screen helper: captures and encodes the screen, sends touch and keys.
+    pub sim_bin: PathBuf,
+    /// Highest frames per second of the stream, 1-60.
     pub fps: u8,
     /// Frame scale, 0.1-1 (0.5 halves each side of the simulator's pixels).
     pub scale: f64,
-    /// JPEG quality, 1-100.
-    pub quality: u8,
+    /// Target H.264 bitrate in kilobits per second, 100-20000.
+    pub bitrate_kbps: u32,
     /// Open streams per lease.
     pub max_viewers_per_lease: usize,
     /// A viewer session lasts at most this long (and never past its lease).
@@ -267,7 +269,14 @@ pub struct Viewer {
 
 impl Default for Viewer {
     fn default() -> Self {
-        Self { fps: 10, scale: 0.5, quality: 70, max_viewers_per_lease: 4, session_hours: 12 }
+        Self {
+            sim_bin: PathBuf::from("/usr/local/bin/seiji-sim"),
+            fps: 30,
+            scale: 0.5,
+            bitrate_kbps: 2500,
+            max_viewers_per_lease: 4,
+            session_hours: 12,
+        }
     }
 }
 
@@ -410,13 +419,15 @@ impl Config {
             bail!("axe.stepTimeoutSeconds and xctest.timeoutSeconds must be > 0");
         }
         let v = &config.viewer;
-        if !(1..=30).contains(&v.fps)
+        if !(1..=60).contains(&v.fps)
             || !(0.1..=1.0).contains(&v.scale)
-            || !(1..=100).contains(&v.quality)
+            || !(100..=20_000).contains(&v.bitrate_kbps)
             || v.max_viewers_per_lease == 0
             || v.session_hours < 1
         {
-            bail!("viewer: fps 1-30, scale 0.1-1, quality 1-100, maxViewersPerLease and sessionHours must be > 0");
+            bail!(
+                "viewer: fps 1-60, scale 0.1-1, bitrateKbps 100-20000, maxViewersPerLease and sessionHours must be > 0"
+            );
         }
         if config.forward.max_per_lease == 0 {
             bail!("forward.maxPerLease must be > 0");

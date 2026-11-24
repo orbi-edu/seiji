@@ -25,7 +25,7 @@
     <button type="button" id="home" title="Home (⌘⇧H)" data-control>Home</button>
     <button type="button" id="lock" title="Lock (⌘L)" data-control>Lock</button>
     <button type="button" id="shot" title="Save a screenshot (⌘S)">Screenshot</button>
-    <button type="button" id="stats-btn" title="Stream info (I)">Stats</button>
+    <button type="button" id="stats-btn" title="Stream info (⌥I)">Stats</button>
   </div>
 </header>
 <div class="note" id="note" hidden></div>
@@ -40,7 +40,8 @@
 </div>
 <main class="stage" id="stage">
   <div class="screen" id="screen" tabindex="0" aria-label="Simulator screen">
-    <img id="frame" alt="Simulator screen" draggable="false">
+    <canvas id="frame" width="402" height="874" aria-label="Simulator screen"></canvas>
+    <div class="finger" id="finger" hidden></div>
     <div class="veil" id="veil">
       <p id="veil-text">Starting the stream…</p>
     </div>

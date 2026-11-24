@@ -1,11 +1,14 @@
-//! The live screen viewer: links, sessions, the shared stream, input and its guards.
+//! The live screen viewer: links, sessions, the shared H.264 stream over a WebSocket, input and
+//! its guards.
 
 mod common;
 
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
+use tokio_tungstenite::tungstenite::{self, client::IntoClientRequest};
 
 use common::*;
 
@@ -58,20 +61,134 @@ async fn admin_link(env: &Env, token: &str, lease: &str, body: Option<Value>) ->
     .unwrap()
 }
 
+type Socket = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// What the page receives.
+#[derive(Debug)]
+enum Msg {
+    Text(Value),
+    Frame { key: bool, seq: u32 },
+    Closed(u16, String),
+}
+
 impl View {
     async fn get(&self, path: &str) -> reqwest::Response {
         http().get(format!("{}{path}", self.base)).header("cookie", &self.cookie).send().await.unwrap()
     }
-    async fn input(&self, input: Value) -> reqwest::Response {
-        http()
-            .post(format!("{}input", self.base))
-            .header("cookie", &self.cookie)
-            .header("x-seiji-view", "1")
-            .json(&json!({ "input": input, "aspect": 402.0 / 874.0 }))
-            .send()
-            .await
-            .unwrap()
+
+    /// The page's WebSocket, from `origin` (the page's own origin when `None`).
+    async fn connect(&self, origin: Option<&str>) -> Result<Socket, u16> {
+        let mut req = format!("{}ws", self.base.replacen("http", "ws", 1)).into_client_request().unwrap();
+        let own = self.base.split("/view/").next().unwrap().to_string();
+        req.headers_mut().insert("cookie", self.cookie.parse().unwrap());
+        req.headers_mut().insert("origin", origin.unwrap_or(&own).parse().unwrap());
+        match tokio_tungstenite::connect_async(req).await {
+            Ok((ws, _)) => Ok(ws),
+            Err(tungstenite::Error::Http(resp)) => Err(resp.status().as_u16()),
+            Err(e) => panic!("{e}"),
+        }
     }
+
+    async fn ws(&self) -> Socket {
+        self.connect(None).await.unwrap()
+    }
+}
+
+async fn send(ws: &mut Socket, v: Value) {
+    ws.send(tungstenite::Message::text(v.to_string())).await.unwrap();
+}
+
+async fn next(ws: &mut Socket) -> Msg {
+    loop {
+        let m = tokio::time::timeout(Duration::from_secs(5), ws.next()).await.expect("nothing within 5 s");
+        match m {
+            Some(Ok(tungstenite::Message::Text(t))) => return Msg::Text(serde_json::from_str(&t).unwrap()),
+            Some(Ok(tungstenite::Message::Binary(b))) => {
+                return Msg::Frame { key: b[0] & 1 == 1, seq: u32::from_be_bytes(b[1..5].try_into().unwrap()) };
+            }
+            Some(Ok(tungstenite::Message::Close(f))) => {
+                return f.map_or(Msg::Closed(1005, String::new()), |f| {
+                    Msg::Closed(u16::from(f.code), f.reason.to_string())
+                });
+            }
+            Some(Ok(_)) => continue,
+            Some(Err(_)) | None => return Msg::Closed(1006, String::new()),
+        }
+    }
+}
+
+/// One deadline for a whole wait, however many unrelated messages arrive meanwhile.
+async fn within<T>(what: &str, wait: impl Future<Output = T>) -> T {
+    tokio::time::timeout(Duration::from_secs(10), wait).await.unwrap_or_else(|_| panic!("no {what} within 10 s"))
+}
+
+/// The next text message that is not a decoder setup, acknowledging frames on the way.
+async fn text(ws: &mut Socket) -> Value {
+    within("reply", async {
+        loop {
+            match next(ws).await {
+                Msg::Text(v) if v["t"] == "format" => {}
+                Msg::Text(v) => return v,
+                Msg::Frame { seq, .. } => send(ws, json!({"t": "ack", "seq": seq})).await,
+                Msg::Closed(code, why) => panic!("closed {code}: {why}"),
+            }
+        }
+    })
+    .await
+}
+
+/// The next decoder setup.
+async fn format(ws: &mut Socket) -> Value {
+    within("format", async {
+        loop {
+            match next(ws).await {
+                Msg::Text(v) if v["t"] == "format" => return v,
+                Msg::Closed(code, why) => panic!("closed {code}: {why}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+}
+
+/// The next frame, acknowledged; text messages on the way are skipped.
+async fn frame(ws: &mut Socket) -> (bool, u32) {
+    within("frame", async {
+        loop {
+            match next(ws).await {
+                Msg::Frame { key, seq } => {
+                    send(ws, json!({"t": "ack", "seq": seq})).await;
+                    return (key, seq);
+                }
+                Msg::Text(_) => {}
+                Msg::Closed(code, why) => panic!("closed {code}: {why}"),
+            }
+        }
+    })
+    .await
+}
+
+/// Waits until the socket closes; returns the close code.
+async fn closed(ws: &mut Socket) -> u16 {
+    within("close", async {
+        loop {
+            if let Msg::Closed(code, _) = next(ws).await {
+                return code;
+            }
+        }
+    })
+    .await
+}
+
+/// Waits until the fake device's log has `line`.
+async fn logged(env: &Env, line: &str) {
+    for _ in 0..100 {
+        if env.fake.log().iter().any(|l| l == line) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("{line:?} never logged: {:?}", env.fake.log());
 }
 
 #[tokio::test]
@@ -94,13 +211,17 @@ async fn a_link_opens_one_session_for_its_owner_only() {
     let view = open(&env, &token, &lease, true).await;
     let page = view.get("").await;
     assert_eq!(page.status(), 200);
-    assert!(page.headers()["content-security-policy"].to_str().unwrap().contains("default-src 'none'"));
+    let csp = page.headers()["content-security-policy"].to_str().unwrap().to_string();
+    assert!(csp.contains("default-src 'none'") && csp.contains("connect-src 'self' wss://127.0.0.1:"), "{csp}");
     assert!(page.text().await.unwrap().contains("/view/assets/viewer.js"));
 
     let anonymous = http().get(&view.base).send().await.unwrap();
     assert_eq!(anonymous.status(), 401);
     let forged = http().get(&view.base).header("cookie", "seiji_view=00").send().await.unwrap();
     assert_eq!(forged.status(), 401);
+    let no_cookie = View { base: view.base.clone(), cookie: "seiji_view=00".into() };
+    assert_eq!(no_cookie.connect(None).await.err(), Some(401));
+    assert_eq!(view.connect(Some("https://evil.example")).await.err(), Some(403), "a page on another site");
 
     let info: Value = view.get("info").await.json().await.unwrap();
     assert_eq!(info["lease_id"], lease);
@@ -164,20 +285,23 @@ async fn an_admin_lists_every_device_and_watches_any_of_them() {
     assert_eq!(info["lease_id"], lease);
     assert_eq!(info["user"], "bob");
     assert_eq!(info["control"], false);
-    assert_eq!(watcher.input(json!({"kind": "key", "code": 40})).await.status(), 403);
+    let mut watching = watcher.ws().await;
+    send(&mut watching, json!({"t": "key", "usage": 40})).await;
+    assert_eq!(text(&mut watching).await["code"], "view_only");
 
     // With control, the admin's input reaches bob's device.
     let l: Value = admin_link(&env, &alice, &lease, Some(json!({"control": true}))).await.json().await.unwrap();
     assert_eq!(l["control"], true);
     let driver = open_link(&env, &l).await;
-    assert_eq!(driver.input(json!({"kind": "key", "code": 40})).await.status(), 204);
-    assert!(env.fake.log().contains(&"key 40".to_string()), "{:?}", env.fake.log());
+    let mut driving = driver.ws().await;
+    send(&mut driving, json!({"t": "key", "usage": 40})).await;
+    logged(&env, "hid key 40 down").await;
 
     // Disabling the admin ends the admin's sessions; the owner's own session keeps working.
     let own = open(&env, &bob, &lease, false).await;
     env.pool.store.set_disabled("alice", true).unwrap();
     assert_eq!(watcher.get("info").await.status(), 401);
-    assert_eq!(driver.input(json!({"kind": "key", "code": 40})).await.status(), 401);
+    assert_eq!(closed(&mut driving).await, 4401, "the admin's socket ends within the recheck");
     assert_eq!(own.get("info").await.status(), 200);
 }
 
@@ -185,86 +309,129 @@ async fn an_admin_lists_every_device_and_watches_any_of_them() {
 async fn viewers_share_one_stream_until_the_lease_ends() {
     let env = setup_with(2, json!({"viewer": {"maxViewersPerLease": 2, "fps": 20}})).await;
     let (token, lease) = device(&env, "alice").await;
-    let a = open(&env, &token, &lease, false).await;
-    let b = open(&env, &token, &lease, false).await;
-    let c = open(&env, &token, &lease, false).await;
-
-    let mut s1 = a.get("stream").await;
-    assert_eq!(s1.status(), 200);
-    assert!(
-        s1.headers()["content-type"].to_str().unwrap().starts_with("multipart/x-mixed-replace; boundary=seijiframe")
+    let (a, b, c) = (
+        open(&env, &token, &lease, false).await,
+        open(&env, &token, &lease, false).await,
+        open(&env, &token, &lease, false).await,
     );
-    let first = tokio::time::timeout(Duration::from_secs(2), s1.chunk()).await.unwrap().unwrap().unwrap();
-    let first_str = String::from_utf8_lossy(&first);
-    assert!(
-        first_str.contains("--seijiframe\r\n")
-            && first_str.contains("Content-Type: image/jpeg")
-            && first_str.contains("X-Capture-Time:"),
-        "{first_str}"
-    );
-    let s2 = b.get("stream").await;
-    assert_eq!(s2.status(), 200);
-    assert_eq!(c.get("stream").await.status(), 429, "maxViewersPerLease");
-    assert_eq!(env.fake.streams_started.load(Ordering::SeqCst), 1, "one device stream for every viewer");
 
-    let user = env.pool.store.user_by_name("alice").unwrap().unwrap();
+    let mut s1 = a.ws().await;
+    let setup = format(&mut s1).await;
+    assert_eq!(setup["codec"], "avc1.64001f", "{setup}");
+    assert_eq!((setup["width"].as_u64(), setup["height"].as_u64()), (Some(402), Some(874)));
+    assert!(frame(&mut s1).await.0, "a viewer starts at a keyframe");
+    let mut s2 = b.ws().await;
+    assert_eq!(format(&mut s2).await["codec"], "avc1.64001f");
+    assert!(frame(&mut s2).await.0, "a joining viewer starts at a keyframe too");
+    assert_eq!(c.connect(None).await.err(), Some(429), "maxViewersPerLease");
+    assert_eq!(env.fake.streams_started.load(Ordering::SeqCst), 1, "one helper for every viewer");
+
     let c2 = client(&env, &token).await;
     assert!(!is_err(&call(&c2, "release_device", json!({"lease_id": lease})).await));
-    // The stream ends with the lease, and the session with it.
-    let rest =
-        tokio::time::timeout(Duration::from_secs(3), async { while let Ok(Some(_)) = s1.chunk().await {} }).await;
-    assert!(rest.is_ok(), "the stream should end when the lease is released");
+    assert_eq!(closed(&mut s1).await, 4410, "the stream ends with the lease");
     assert_eq!(a.get("info").await.status(), 410);
-    drop((s2, user));
 }
 
 #[tokio::test]
-async fn a_still_screen_still_reaches_every_viewer() {
-    // The host skips identical frames: on a screen that does not change, the stream holds one
-    // frame. A viewer that joins later must still get it, and an open stream must not go quiet.
+async fn a_still_screen_reaches_a_viewer_that_joins_later() {
+    // A static screen produces no frames; a viewer that joins asks for a keyframe and gets the
+    // current screen at once.
     let env = setup_with(2, json!({"viewer": {"maxViewersPerLease": 2}})).await;
     env.fake.still.store(true, Ordering::SeqCst);
     let (token, lease) = device(&env, "alice").await;
-    let a = open(&env, &token, &lease, false).await;
-    let mut s1 = a.get("stream").await;
-    let first = tokio::time::timeout(Duration::from_secs(2), s1.chunk()).await.unwrap().unwrap().unwrap();
-    assert!(String::from_utf8_lossy(&first).contains("--seijiframe\r\n"));
+    let mut s1 = open(&env, &token, &lease, false).await.ws().await;
+    assert!(frame(&mut s1).await.0);
 
-    let b = open(&env, &token, &lease, false).await;
-    let mut s2 = b.get("stream").await;
-    let joined = tokio::time::timeout(Duration::from_millis(500), s2.chunk()).await;
-    assert!(matches!(joined, Ok(Ok(Some(_)))), "a later viewer gets the current frame at once");
+    let mut s2 = open(&env, &token, &lease, false).await.ws().await;
+    let joined = tokio::time::timeout(Duration::from_millis(500), frame(&mut s2)).await;
+    assert!(matches!(joined, Ok((true, _))), "a later viewer gets a keyframe at once: {joined:?}");
 
-    let again = tokio::time::timeout(Duration::from_secs(2), s1.chunk()).await;
-    assert!(matches!(again, Ok(Ok(Some(_)))), "the last frame is repeated while the screen is still");
+    // A page that asks again right away (its decoder dropped frames) is inside the throttle; the
+    // request waits and still goes out, though the screen does not change.
+    send(&mut s2, json!({"t": "keyframe"})).await;
+    let again = tokio::time::timeout(Duration::from_secs(2), frame(&mut s2)).await;
+    assert!(matches!(again, Ok((true, _))), "a throttled keyframe request is retried: {again:?}");
 }
 
 #[tokio::test]
-async fn input_maps_to_points_and_respects_view_only_and_runs() {
+async fn a_slow_viewer_gets_no_stale_frames_and_resumes_at_a_keyframe() {
+    let env = setup_with(2, json!({"viewer": {"fps": 60}})).await;
+    let (token, lease) = device(&env, "alice").await;
+    let mut ws = open(&env, &token, &lease, false).await.ws().await;
+    format(&mut ws).await;
+
+    // Acknowledge nothing: frames queue up on the way, and past half a second the server stops
+    // sending instead of queueing more.
+    let started = std::time::Instant::now();
+    let mut frames = Vec::new();
+    let quiet = tokio::time::timeout(Duration::from_millis(1500), async {
+        loop {
+            if let Msg::Frame { seq, .. } = next(&mut ws).await {
+                frames.push((seq, started.elapsed()));
+            }
+        }
+    });
+    let _ = quiet.await;
+    let (last, last_at) = *frames.last().expect("frames before the stall");
+    assert!(frames.len() < 60, "{} frames for 1.5 s at 60 fps: they were not held back", frames.len());
+    assert!(last_at < Duration::from_millis(800), "a frame went out {last_at:?} into the stall");
+    // A congested viewer lowers the shared bitrate.
+    assert!(env.fake.log().iter().any(|l| l.starts_with("encode 60 0.5 1750000")), "{:?}", env.fake.log());
+
+    // Acknowledging catches up: the stream resumes at a keyframe.
+    send(&mut ws, json!({"t": "ack", "seq": last})).await;
+    let (key, seq) = frame(&mut ws).await;
+    assert!(key, "after a gap the next frame is a keyframe");
+    assert!(seq > last + 1, "frames were skipped, not queued");
+}
+
+#[tokio::test]
+async fn touches_keys_and_buttons_reach_the_device_in_order() {
     let env = setup(2).await;
     let (token, lease) = device(&env, "alice").await;
     let view = open(&env, &token, &lease, true).await;
+    let mut ws = view.ws().await;
 
-    assert_eq!(view.input(json!({"kind": "tap", "x": 0.5, "y": 0.5})).await.status(), 204);
-    assert_eq!(view.input(json!({"kind": "tap", "x": 0.1, "y": 0.2, "hold": 0.8})).await.status(), 204);
-    assert_eq!(view.input(json!({"kind": "type", "text": "hello"})).await.status(), 204);
-    assert_eq!(view.input(json!({"kind": "key", "code": 40})).await.status(), 204);
-    assert_eq!(view.input(json!({"kind": "button", "name": "home"})).await.status(), 204);
-    assert_eq!(env.fake.log()[..4], ["tap 201,437", "tap 40,175 hold 0.8", "type hello", "key 40"]);
+    send(&mut ws, json!({"t": "touch", "phase": "down", "x": 0.5, "y": 0.98, "edge": "bottom"})).await;
+    send(&mut ws, json!({"t": "touch", "phase": "move", "x": 0.5, "y": 0.6})).await;
+    // The viewer's own finger holds the device; the page does not show that as busy.
+    logged(&env, "touch move 0.50,0.60").await;
+    let info: Value = view.get("info").await.json().await.unwrap();
+    assert_eq!(info["busy"], false);
+    send(&mut ws, json!({"t": "touch", "phase": "up", "x": 0.5, "y": 0.4})).await;
+    send(&mut ws, json!({"t": "key", "usage": 4, "mods": [225]})).await;
+    send(&mut ws, json!({"t": "button", "name": "home"})).await;
+    send(&mut ws, json!({"t": "type", "id": 7, "text": "hello"})).await;
+    let done = text(&mut ws).await;
+    assert_eq!(done, json!({"t": "done", "id": 7}));
+    let log: Vec<String> = env.fake.log().into_iter().filter(|l| !l.starts_with("encode")).collect();
+    assert_eq!(
+        log,
+        [
+            "touch down 0.50,0.98 edge bottom",
+            "touch move 0.50,0.60",
+            "touch up 0.50,0.40",
+            "hid key 225 down",
+            "hid key 4 down",
+            "hid key 4 up",
+            "hid key 225 up",
+            "hid button home down",
+            "hid button home up",
+            "type hello",
+        ]
+    );
 
-    assert_eq!(view.input(json!({"kind": "tap", "x": 2, "y": 0.5})).await.status(), 400);
-    let csrf = http()
-        .post(format!("{}input", view.base))
-        .header("cookie", &view.cookie)
-        .json(&json!({"input": {"kind": "key", "code": 40}}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(csrf.status(), 400, "input needs the X-Seiji-View header");
+    send(&mut ws, json!({"t": "touch", "phase": "down", "x": 2, "y": 0.5})).await;
+    assert_eq!(text(&mut ws).await["code"], "bad_request");
+    send(&mut ws, json!({"t": "key", "usage": 4, "mods": [4]})).await;
+    assert_eq!(text(&mut ws).await["code"], "bad_request", "mods are modifier usages only");
 
-    let watcher = open(&env, &token, &lease, false).await;
-    let refused = watcher.input(json!({"kind": "key", "code": 40})).await;
-    assert_eq!(refused.status(), 403);
+    let mut watcher = open(&env, &token, &lease, false).await.ws().await;
+    send(&mut watcher, json!({"t": "touch", "phase": "down", "x": 0.5, "y": 0.5})).await;
+    send(&mut watcher, json!({"t": "touch", "phase": "move", "x": 0.5, "y": 0.6})).await;
+    send(&mut watcher, json!({"t": "button", "name": "home"})).await;
+    assert_eq!(text(&mut watcher).await["code"], "view_only");
+    assert_eq!(text(&mut watcher).await["code"], "view_only", "once for the gesture, once for the button");
 
     // A run holds the device: input waits for it instead of interleaving with its steps.
     let c = client(&env, &token).await;
@@ -272,12 +439,29 @@ async fn input_maps_to_points_and_respects_view_only_and_runs() {
         call(&c, "run_actions", json!({"record_video": false, "actions": [{"sleep": {"seconds": 3}}]})).await
     });
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let busy = view.input(json!({"kind": "key", "code": 40})).await;
-    assert_eq!(busy.status(), 409);
+    send(&mut ws, json!({"t": "touch", "phase": "down", "x": 0.5, "y": 0.5})).await;
+    assert_eq!(text(&mut ws).await["code"], "busy");
     let info: Value = view.get("info").await.json().await.unwrap();
     assert_eq!(info["busy"], true);
     assert!(!is_err(&run.await.unwrap()));
-    assert_eq!(view.input(json!({"kind": "key", "code": 40})).await.status(), 204);
+    send(&mut ws, json!({"t": "key", "usage": 40})).await;
+    logged(&env, "hid key 40 up").await;
+}
+
+#[tokio::test]
+async fn a_finger_left_down_is_lifted_when_the_page_goes_away() {
+    let env = setup(2).await;
+    let (token, lease) = device(&env, "alice").await;
+    let mut ws = open(&env, &token, &lease, true).await.ws().await;
+    send(&mut ws, json!({"t": "touch", "phase": "down", "x": 0.3, "y": 0.3})).await;
+    send(&mut ws, json!({"t": "touch", "phase": "move", "x": 0.3, "y": 0.7})).await;
+    logged(&env, "touch move 0.30,0.70").await;
+    drop(ws);
+    logged(&env, "touch up 0.30,0.70").await;
+
+    // And the device is free for the agent again.
+    let c = client(&env, &token).await;
+    assert!(!is_err(&call(&c, "inspect_screen", json!({})).await));
 }
 
 #[tokio::test]
@@ -295,57 +479,64 @@ async fn agents_share_a_view_only_link() {
 async fn paste_puts_text_on_pasteboard_and_respects_guards() {
     let env = setup(2).await;
     let (token, lease) = device(&env, "alice").await;
-    let ctrl = open(&env, &token, &lease, true).await;
-    let watcher = open(&env, &token, &lease, false).await;
+    let mut ctrl = open(&env, &token, &lease, true).await.ws().await;
+    let mut watcher = open(&env, &token, &lease, false).await.ws().await;
 
     // Paste: the device clipboard, then Cmd+V into the focused field.
-    let pasted = ctrl.input(json!({"kind": "paste", "text": "olá clipboard"})).await;
-    assert_eq!(pasted.status(), 200);
-    assert_eq!(pasted.json::<serde_json::Value>().await.unwrap(), json!({"via": "pasted"}));
+    send(&mut ctrl, json!({"t": "paste", "id": 1, "text": "olá clipboard"})).await;
+    assert_eq!(text(&mut ctrl).await, json!({"t": "done", "id": 1, "via": "pasted"}));
     let log = env.fake.log();
     let at = log.iter().position(|l| l.ends_with("pasteboard:olá clipboard")).expect("clipboard set");
-    assert_eq!(log[at + 1], "key-combo [227]+25", "{log:?}");
+    assert_eq!(log[at + 1..at + 5], ["hid key 227 down", "hid key 25 down", "hid key 25 up", "hid key 227 up"]);
 
     // Without a reachable pasteboard the text is typed, and the page is told so.
     env.fake.no_pasteboard.store(true, Ordering::SeqCst);
-    let typed = ctrl.input(json!({"kind": "paste", "text": "olá"})).await;
-    assert_eq!(typed.status(), 200);
-    assert_eq!(typed.json::<serde_json::Value>().await.unwrap(), json!({"via": "typed"}));
+    send(&mut ctrl, json!({"t": "paste", "id": 2, "text": "olá"})).await;
+    assert_eq!(text(&mut ctrl).await, json!({"t": "done", "id": 2, "via": "typed"}));
     assert!(env.fake.log().iter().any(|l| l == "type olá"), "{:?}", env.fake.log());
     env.fake.no_pasteboard.store(false, Ordering::SeqCst);
 
     // Paste and type goes through the typing path.
-    assert_eq!(ctrl.input(json!({"kind": "paste_and_type", "text": "typed text"})).await.status(), 204);
+    send(&mut ctrl, json!({"t": "paste_and_type", "id": 3, "text": "typed text"})).await;
+    assert_eq!(text(&mut ctrl).await, json!({"t": "done", "id": 3}));
     assert!(env.fake.log().iter().any(|l| l == "type typed text"), "{:?}", env.fake.log());
 
     // View-only cannot paste.
-    assert_eq!(watcher.input(json!({"kind": "paste", "text": "no"})).await.status(), 403);
+    send(&mut watcher, json!({"t": "paste", "id": 4, "text": "no"})).await;
+    assert_eq!(text(&mut watcher).await["code"], "view_only");
 
-    // Empty or over-limit text fails.
-    assert_eq!(ctrl.input(json!({"kind": "paste", "text": ""})).await.status(), 400);
-    let big = "x".repeat(10_001);
-    assert_eq!(ctrl.input(json!({"kind": "paste", "text": big})).await.status(), 400);
+    // Empty or over-limit text fails, and the error names the input.
+    send(&mut ctrl, json!({"t": "paste", "id": 5, "text": ""})).await;
+    let e = text(&mut ctrl).await;
+    assert_eq!((e["code"].as_str(), e["id"].as_u64()), (Some("bad_request"), Some(5)));
+    send(&mut ctrl, json!({"t": "paste", "id": 6, "text": "x".repeat(10_001)})).await;
+    assert_eq!(text(&mut ctrl).await["code"], "bad_request");
 }
 
 #[tokio::test]
-async fn stats_endpoint_returns_stream_data() {
+async fn presets_and_stats_describe_the_shared_stream() {
     let env = setup_with(2, json!({"viewer": {"fps": 20}})).await;
     let (token, lease) = device(&env, "alice").await;
-    let view = open(&env, &token, &lease, false).await;
-
-    // Start the stream so the hub exists.
-    let mut stream = view.get("stream").await;
-    assert_eq!(stream.status(), 200);
-    // Read at least one frame.
-    let _ = tokio::time::timeout(Duration::from_secs(2), stream.chunk()).await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    let view = open(&env, &token, &lease, true).await;
+    let mut ws = view.ws().await;
+    frame(&mut ws).await;
+    frame(&mut ws).await;
 
     let stats: Value = view.get("stats").await.json().await.unwrap();
     assert!(stats["stream"]["total_frames"].as_u64().unwrap() > 0, "{stats}");
-    assert!(stats["stream"]["fps"].as_f64().unwrap() > 0.0, "{stats}");
     assert_eq!(stats["preset"], "balanced");
-    assert!(stats["opts"]["fps"].as_u64().is_some());
-    assert!(stats["opts"]["scale"].as_f64().is_some());
+    assert_eq!(stats["opts"], json!({"fps": 20, "scale": 0.5, "bitrate": 2_500_000}));
+
+    send(&mut ws, json!({"t": "preset", "name": "sharp"})).await;
+    let reply = text(&mut ws).await;
+    assert_eq!(reply["preset"], "sharp");
+    logged(&env, "encode 20 0.8 5000000").await;
+    let info: Value = view.get("info").await.json().await.unwrap();
+    assert_eq!(info["preset"], "sharp");
+
+    let mut watcher = open(&env, &token, &lease, false).await.ws().await;
+    send(&mut watcher, json!({"t": "preset", "name": "smooth"})).await;
+    assert_eq!(text(&mut watcher).await["code"], "view_only");
 
     // Without a session the endpoint fails.
     assert_eq!(http().get(format!("{}stats", view.base)).send().await.unwrap().status(), 401);
@@ -357,8 +548,8 @@ async fn configure_device_sets_pasteboard() {
     let (token, _lease) = device(&env, "alice").await;
     let c = client(&env, &token).await;
     let r = call(&c, "configure_device", json!({"pasteboard": "agent text"})).await;
-    assert!(!is_err(&r), "{}", text(&r));
-    assert!(text(&r).contains("pasteboard"), "{}", text(&r));
+    assert!(!is_err(&r), "{}", common::text(&r));
+    assert!(common::text(&r).contains("pasteboard"), "{}", common::text(&r));
     assert!(env.fake.log().iter().any(|l| l.contains("pasteboard:agent text")), "{:?}", env.fake.log());
 
     // Empty pasteboard fails.

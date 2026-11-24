@@ -264,8 +264,23 @@ impl Runner {
     }
 
     fn spawn_job(&self, account: &Account, spec: &CmdSpec, stdout: Stdio, stderr: Stdio) -> Result<Job> {
+        self.spawn_job_with(account, spec, None, stdout, stderr)
+    }
+
+    /// `stdin` overrides the spec's stdin (a file, or nothing).
+    fn spawn_job_with(
+        &self,
+        account: &Account,
+        spec: &CmdSpec,
+        stdin: Option<Stdio>,
+        stdout: Stdio,
+        stderr: Stdio,
+    ) -> Result<Job> {
         let pidfile = matches!(self.mode, IsolationMode::OsUser).then(|| self.pidfile());
         let mut cmd = self.command(account, spec, pidfile.as_deref())?;
+        if let Some(stdin) = stdin {
+            cmd.stdin(stdin);
+        }
         cmd.stdout(stdout).stderr(stderr);
         let child = cmd.spawn().with_context(|| format!("spawning {}", spec.program.display()))?;
         let pgid = match pidfile {
@@ -366,12 +381,18 @@ impl Runner {
         Ok(FileCopy { bytes, truncated, code: status.code(), stderr })
     }
 
-    /// Starts a long-running command whose stdout the caller reads (a screen stream). Its stderr
-    /// is discarded.
-    pub fn spawn_piped(&self, account: &Account, spec: CmdSpec) -> Result<(Job, tokio::process::ChildStdout)> {
-        let mut job = self.spawn_job(account, &spec, Stdio::piped(), Stdio::null())?;
+    /// Starts a long-running command the caller talks to (the screen helper): its stdin, stdout
+    /// and stderr are pipes.
+    pub fn spawn_duplex(
+        &self,
+        account: &Account,
+        spec: CmdSpec,
+    ) -> Result<(Job, tokio::process::ChildStdin, tokio::process::ChildStdout, tokio::process::ChildStderr)> {
+        let mut job = self.spawn_job_with(account, &spec, Some(Stdio::piped()), Stdio::piped(), Stdio::piped())?;
+        let stdin = job.child.stdin.take().context("no stdin pipe")?;
         let stdout = job.child.stdout.take().context("no stdout pipe")?;
-        Ok((job, stdout))
+        let stderr = job.child.stderr.take().context("no stderr pipe")?;
+        Ok((job, stdin, stdout, stderr))
     }
 
     /// Starts a long-running command with output appended to `log`.

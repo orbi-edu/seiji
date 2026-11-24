@@ -6,52 +6,93 @@
 //! The link carries a one-time ticket that lives 60 s. Opening it trades the ticket for a
 //! session: a random id in the path and a random secret in an `HttpOnly`, `SameSite=Strict`
 //! cookie scoped to that path. Every request checks the session, its user (and the admin who
-//! asked for a link to another user's lease) and that the lease is still the user's and ready.
-//! One AXe stream per lease fans out to all its viewers and stops when the last one leaves or the
-//! lease ends.
+//! asked for a link to another user's lease) and that the lease is still the user's and ready;
+//! the page's WebSocket checks them again every 2 s. One `seiji-sim` helper per lease encodes the
+//! screen as H.264 for all its viewers and takes their touches and keys over one persistent HID
+//! connection; it stops when the last viewer leaves or the lease ends.
 
-use std::collections::HashMap;
-use std::convert::Infallible;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use axum::{
     Json, Router,
-    body::Body,
-    extract::{Path, State},
+    extract::{
+        Path, State,
+        ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
+    },
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::get,
 };
 use bytes::Bytes;
+use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::sync::watch;
+use tokio::sync::{OwnedMutexGuard, broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
-use crate::actions::{HwButton, SwipeArgs, TapArgs};
 use crate::config::Platform;
-use crate::devices::{DeviceCtx, DeviceOp, Frame, StreamOpts, UiInput};
+use crate::devices::{
+    DeviceCtx, DeviceOp, Edge, ScreenButton, ScreenCommand, ScreenEvent, ScreenFormat, StreamOpts, TouchPhase, UiInput,
+    VideoFrame,
+};
 use crate::pool::{LeaseRuntime, Pool};
 use crate::store::{Lease, LeaseStatus, User, now};
 
 const TICKET_SECONDS: i64 = 60;
 const COOKIE: &str = "seiji_view";
-const BOUNDARY: &str = "seijiframe";
 /// A watched lease counts as used: the stream touches it this often.
 const TOUCH_EVERY: Duration = Duration::from_secs(60);
 /// How often the stream logs its stats for the operator.
 const STATS_LOG_EVERY: Duration = Duration::from_secs(30);
 const MAX_TEXT: usize = 10_000;
-/// A still screen's last frame is sent again this often (the page flags a stall after 2 s).
-const FRAME_REPEAT: Duration = Duration::from_secs(1);
 /// HID usage codes for Paste: Left Command + V.
 const CMD: u8 = 227;
 const KEY_V: u8 = 25;
 /// How long input waits for the device before it answers busy.
 const INPUT_WAIT: Duration = Duration::from_secs(1);
+/// A page that reads nothing for this long is gone: its socket closes.
+const SEND_TIMEOUT: Duration = Duration::from_secs(5);
+/// A WebSocket checks its session (user, lease, cookie) this often.
+const RECHECK_EVERY: Duration = Duration::from_secs(2);
+/// A viewer is congested when its oldest unacknowledged frame is older than its base round trip
+/// plus this: frames are queueing on the way. Seiji then skips frames for it and resumes at a
+/// keyframe, so the picture stays this close to live on a slow link.
+const QUEUE_BUDGET: Duration = Duration::from_millis(200);
+/// The base round trip before the first acknowledgement, and the most frames in flight anyway.
+const FIRST_RTT: Duration = Duration::from_millis(300);
+const MAX_IN_FLIGHT: usize = 60;
+/// The base round trip is the lowest seen in this long.
+const RTT_WINDOW: Duration = Duration::from_secs(10);
+/// Keyframe requests to the helper are at least this far apart.
+const KEYFRAME_GAP: Duration = Duration::from_millis(500);
+/// A finger left down this long without a move is lifted, and the device is free again.
+const GESTURE_IDLE: Duration = Duration::from_secs(10);
+/// How long a hardware button is held.
+const BUTTON_HOLD: Duration = Duration::from_millis(60);
+/// Viewer inputs touch the lease at most this often.
+const INPUT_TOUCH_EVERY: Duration = Duration::from_secs(5);
+/// The largest message a page may send (a paste of `MAX_TEXT` bytes, JSON-escaped).
+const MAX_CLIENT_MESSAGE: usize = 64 * 1024;
+/// Format and frames a slow viewer may fall behind before it resyncs at a keyframe. With
+/// helper messages of at most 4 MiB, one hub holds at most 128 MiB of video.
+const VIDEO_BUFFER: usize = 32;
+/// Adaptive bitrate: a congested viewer cuts the bitrate to 70 %, at most every 2 s and never
+/// below 20 % of the preset; after 4 s without congestion it grows 15 % every 2 s.
+const RATE_DOWN: f64 = 0.7;
+const RATE_UP: f64 = 1.15;
+const RATE_FLOOR: f64 = 0.2;
+const RATE_STEP: Duration = Duration::from_secs(2);
+const RATE_CALM: Duration = Duration::from_secs(4);
+/// WebSocket close codes the page acts on: open a new link, or the device is gone.
+const CLOSE_EXPIRED: u16 = 4401;
+const CLOSE_GONE: u16 = 4410;
+const CLOSE_INTERNAL: u16 = 1011;
+/// The binary video message: flags, frame number, capture time, then the AVCC sample.
+const FRAME_HEADER: usize = 13;
 
 const PAGE: &str = include_str!("viewer/index.html");
 const SCRIPT: &str = include_str!("viewer/viewer.js");
@@ -76,7 +117,7 @@ struct Session {
     expires: i64,
 }
 
-/// Per-stream counters updated by a stats subscriber on the watch channel.
+/// Per-stream counters for the stats route and the log.
 struct StreamStats {
     started_at_ms: i64,
     frame_count: AtomicU64,
@@ -95,26 +136,225 @@ pub enum StreamPreset {
 
 impl StreamPreset {
     fn opts(self, cfg: &crate::config::Viewer) -> StreamOpts {
+        let bitrate = cfg.bitrate_kbps * 1000;
         match self {
-            StreamPreset::Smooth => StreamOpts { fps: 15, scale: 0.3, quality: 50 },
-            StreamPreset::Balanced => StreamOpts { fps: cfg.fps, scale: cfg.scale, quality: cfg.quality },
-            StreamPreset::Sharp => StreamOpts { fps: 5, scale: 0.8, quality: 85 },
+            StreamPreset::Smooth => StreamOpts { fps: cfg.fps, scale: cfg.scale.min(0.35), bitrate: bitrate / 2 },
+            StreamPreset::Balanced => StreamOpts { fps: cfg.fps, scale: cfg.scale, bitrate },
+            StreamPreset::Sharp => {
+                StreamOpts { fps: cfg.fps, scale: cfg.scale.max(0.8), bitrate: (bitrate * 2).min(20_000_000) }
+            }
         }
     }
 }
 
-struct Hub {
-    tx: watch::Sender<Option<Frame>>,
-    cancel: CancellationToken,
-    /// Cancels only the current AXe stream; a child of `cancel`.  Replaced on each restart.
-    stream_cancel: StdMutex<CancellationToken>,
-    opts: StdMutex<StreamOpts>,
-    preset: StdMutex<StreamPreset>,
-    stats: Arc<StreamStats>,
+/// What a viewer receives: a decoder setup, or one frame. Both are built once for all viewers.
+#[derive(Clone)]
+enum Video {
+    Format(Arc<str>),
+    Frame(Arc<Encoded>),
 }
 
-/// Tickets, sessions and the one stream per lease. In memory: a restart ends every lease, and
-/// with it every viewer.
+struct Encoded {
+    /// The hub's frame number; viewers acknowledge it.
+    seq: u32,
+    key: bool,
+    /// The whole binary WebSocket message.
+    message: Bytes,
+}
+
+/// The bitrate the helper encodes at, adapted to the slowest viewer.
+struct Rate {
+    preset: StreamPreset,
+    target: StreamOpts,
+    bitrate: u32,
+    changed_at: Instant,
+    congested_at: Option<Instant>,
+}
+
+/// One helper per watched lease, shared by its viewers.
+struct Hub {
+    /// Input and control for the running helper; `None` between restarts.
+    commands: StdMutex<Option<mpsc::Sender<ScreenCommand>>>,
+    video: broadcast::Sender<Video>,
+    /// The latest decoder setup, for viewers that join.
+    format: StdMutex<Option<Arc<str>>>,
+    cancel: CancellationToken,
+    viewers: AtomicUsize,
+    /// Viewer inputs that hold the lease's op lock: the page does not call that busy.
+    holding: AtomicUsize,
+    next_seq: AtomicU64,
+    rate: StdMutex<Rate>,
+    keyframe_at: StdMutex<Option<Instant>>,
+    /// A keyframe was asked for inside `KEYFRAME_GAP`, or the helper was not there to take it.
+    keyframe_pending: AtomicBool,
+    stats: StreamStats,
+}
+
+impl Hub {
+    fn new(cancel: CancellationToken, cfg: &crate::config::Viewer) -> Self {
+        let target = StreamPreset::Balanced.opts(cfg);
+        Self {
+            commands: StdMutex::new(None),
+            video: broadcast::channel(VIDEO_BUFFER).0,
+            format: StdMutex::new(None),
+            cancel,
+            viewers: AtomicUsize::new(0),
+            holding: AtomicUsize::new(0),
+            next_seq: AtomicU64::new(0),
+            rate: StdMutex::new(Rate {
+                preset: StreamPreset::Balanced,
+                target,
+                bitrate: target.bitrate,
+                // The first congestion may cut the bitrate at once.
+                changed_at: Instant::now().checked_sub(RATE_STEP).unwrap_or_else(Instant::now),
+                congested_at: None,
+            }),
+            keyframe_at: StdMutex::new(None),
+            keyframe_pending: AtomicBool::new(false),
+            stats: StreamStats {
+                started_at_ms: now_ms(),
+                frame_count: AtomicU64::new(0),
+                frame_bytes: AtomicU64::new(0),
+                last_frame_at_ms: AtomicI64::new(0),
+            },
+        }
+    }
+
+    /// Hands a command to the helper; `false` when no helper runs (it is restarting) or its
+    /// queue is full.
+    fn send(&self, cmd: ScreenCommand) -> bool {
+        match &*self.commands.lock().expect("commands mutex") {
+            Some(tx) => tx.try_send(cmd).is_ok(),
+            None => false,
+        }
+    }
+
+    /// Hands every command to the helper, or none of them (a key press must not arrive in part).
+    fn send_all(&self, cmds: Vec<ScreenCommand>) -> bool {
+        let guard = self.commands.lock().expect("commands mutex");
+        let Some(tx) = &*guard else { return false };
+        if tx.capacity() < cmds.len() {
+            return false;
+        }
+        cmds.into_iter().all(|c| tx.try_send(c).is_ok())
+    }
+
+    /// Waits until the helper has every command sent so far (at most `INPUT_WAIT`).
+    async fn sync(&self) -> Result<(), ViewError> {
+        let (done, wait) = tokio::sync::oneshot::channel();
+        if self.send(ScreenCommand::Sync(done)) && matches!(tokio::time::timeout(INPUT_WAIT, wait).await, Ok(Ok(()))) {
+            return Ok(());
+        }
+        Err(helper_missing())
+    }
+
+    fn opts(&self) -> StreamOpts {
+        let rate = self.rate.lock().expect("rate mutex");
+        StreamOpts { bitrate: rate.bitrate, ..rate.target }
+    }
+
+    /// Asks for a keyframe. A request within `KEYFRAME_GAP` of the last one stays pending and
+    /// goes out when the gap has passed (`flush_keyframe`), so a still screen still gets it.
+    fn keyframe(&self, force: bool) {
+        let mut at = self.keyframe_at.lock().expect("keyframe mutex");
+        if force || at.is_none_or(|t| t.elapsed() >= KEYFRAME_GAP) {
+            *at = Some(Instant::now());
+            self.keyframe_pending.store(!self.send(ScreenCommand::Keyframe), Ordering::SeqCst);
+        } else {
+            self.keyframe_pending.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn flush_keyframe(&self) {
+        if self.keyframe_pending.load(Ordering::SeqCst) {
+            self.keyframe(false);
+        }
+    }
+
+    /// A viewer could not keep up: lower the bitrate.
+    fn congested(&self) {
+        let opts = {
+            let mut rate = self.rate.lock().expect("rate mutex");
+            rate.congested_at = Some(Instant::now());
+            let floor = (f64::from(rate.target.bitrate) * RATE_FLOOR) as u32;
+            if rate.changed_at.elapsed() < RATE_STEP || rate.bitrate <= floor {
+                return;
+            }
+            rate.bitrate = ((f64::from(rate.bitrate) * RATE_DOWN) as u32).max(floor);
+            rate.changed_at = Instant::now();
+            StreamOpts { bitrate: rate.bitrate, ..rate.target }
+        };
+        self.send(ScreenCommand::Encode(opts));
+    }
+
+    /// Called every second: grow the bitrate back toward the preset while nobody is congested.
+    fn recover(&self) {
+        let opts = {
+            let mut rate = self.rate.lock().expect("rate mutex");
+            let calm = rate.congested_at.is_none_or(|t| t.elapsed() >= RATE_CALM);
+            if !calm || rate.changed_at.elapsed() < RATE_STEP || rate.bitrate >= rate.target.bitrate {
+                return;
+            }
+            rate.bitrate = ((f64::from(rate.bitrate) * RATE_UP) as u32).min(rate.target.bitrate);
+            rate.changed_at = Instant::now();
+            StreamOpts { bitrate: rate.bitrate, ..rate.target }
+        };
+        self.send(ScreenCommand::Encode(opts));
+    }
+
+    fn set_preset(&self, preset: StreamPreset, cfg: &crate::config::Viewer) -> StreamOpts {
+        let opts = preset.opts(cfg);
+        {
+            let mut rate = self.rate.lock().expect("rate mutex");
+            *rate =
+                Rate { preset, target: opts, bitrate: opts.bitrate, changed_at: Instant::now(), congested_at: None };
+        }
+        self.send(ScreenCommand::Encode(opts));
+        opts
+    }
+
+    fn on_event(&self, event: ScreenEvent, lease_id: &str) {
+        match event {
+            ScreenEvent::Ready => tracing::debug!(lease = %lease_id, "screen helper ready"),
+            ScreenEvent::Warning(w) => tracing::warn!(lease = %lease_id, "seiji-sim: {w}"),
+            ScreenEvent::Format(f) => {
+                let text: Arc<str> = format_message(&f).into();
+                *self.format.lock().expect("format mutex") = Some(text.clone());
+                let _ = self.video.send(Video::Format(text));
+            }
+            ScreenEvent::Frame(f) => {
+                self.stats.frame_count.fetch_add(1, Ordering::Relaxed);
+                self.stats.frame_bytes.fetch_add(f.data.len() as u64, Ordering::Relaxed);
+                self.stats.last_frame_at_ms.store(f.captured_us / 1000, Ordering::Relaxed);
+                let seq = self.next_seq.fetch_add(1, Ordering::Relaxed) as u32;
+                let _ = self.video.send(Video::Frame(Arc::new(frame_message(seq, &f))));
+            }
+        }
+    }
+}
+
+fn format_message(f: &ScreenFormat) -> String {
+    serde_json::json!({
+        "t": "format",
+        "codec": f.codec,
+        "width": f.width,
+        "height": f.height,
+        "description": f.description,
+    })
+    .to_string()
+}
+
+fn frame_message(seq: u32, f: &VideoFrame) -> Encoded {
+    let mut out = Vec::with_capacity(FRAME_HEADER + f.data.len());
+    out.push(u8::from(f.key));
+    out.extend_from_slice(&seq.to_be_bytes());
+    out.extend_from_slice(&f.captured_us.to_be_bytes());
+    out.extend_from_slice(&f.data);
+    Encoded { seq, key: f.key, message: Bytes::from(out) }
+}
+
+/// Tickets, sessions and the one helper per watched lease. In memory: a restart ends every
+/// lease, and with it every viewer.
 #[derive(Default)]
 pub struct Viewers {
     tickets: StdMutex<HashMap<String, Ticket>>,
@@ -167,6 +407,8 @@ pub enum ViewError {
     ViewOnly,
     /// Too many viewers on one lease.
     Full(usize),
+    /// A WebSocket from a page on another site.
+    CrossOrigin,
     Bad(String),
     Internal(anyhow::Error),
 }
@@ -177,15 +419,15 @@ impl From<anyhow::Error> for ViewError {
     }
 }
 
-impl IntoResponse for ViewError {
-    fn into_response(self) -> Response {
-        let (status, code, message) = match self {
+impl ViewError {
+    fn parts(&self) -> (StatusCode, &'static str, String) {
+        match self {
             ViewError::Unauthorized => (
                 StatusCode::UNAUTHORIZED,
                 "expired",
                 "This viewer link expired. Open the device again from Tern.".into(),
             ),
-            ViewError::Gone(why) => (StatusCode::GONE, "gone", why),
+            ViewError::Gone(why) => (StatusCode::GONE, "gone", why.clone()),
             ViewError::Busy => {
                 (StatusCode::CONFLICT, "busy", "A run is using the device. Input works again when it ends.".into())
             }
@@ -193,14 +435,49 @@ impl IntoResponse for ViewError {
             ViewError::Full(n) => {
                 (StatusCode::TOO_MANY_REQUESTS, "full", format!("This device already has {n} viewers open."))
             }
-            ViewError::Bad(why) => (StatusCode::BAD_REQUEST, "bad_request", why),
+            ViewError::CrossOrigin => {
+                (StatusCode::FORBIDDEN, "cross_origin", "The viewer only accepts its own page.".into())
+            }
+            ViewError::Bad(why) => (StatusCode::BAD_REQUEST, "bad_request", why.clone()),
             ViewError::Internal(e) => (StatusCode::INTERNAL_SERVER_ERROR, "internal", format!("{e:#}")),
+        }
+    }
+
+    /// The error as a WebSocket message; `id` names the input it answers.
+    fn message(&self, id: Option<u32>) -> Message {
+        let (_, code, message) = self.parts();
+        let mut v = serde_json::json!({ "t": "error", "code": code, "message": message });
+        if let Some(id) = id {
+            v["id"] = id.into();
+        }
+        text(v)
+    }
+
+    /// The close frame that ends a WebSocket for this error.
+    fn close(&self) -> CloseFrame {
+        let (_, _, message) = self.parts();
+        let code = match self {
+            ViewError::Unauthorized => CLOSE_EXPIRED,
+            ViewError::Gone(_) => CLOSE_GONE,
+            _ => CLOSE_INTERNAL,
         };
+        // A close reason holds at most 123 bytes.
+        CloseFrame { code, reason: crate::exec::head(&message, 120).to_string().into() }
+    }
+}
+
+impl IntoResponse for ViewError {
+    fn into_response(self) -> Response {
+        let (status, code, message) = self.parts();
         let mut resp =
             (status, Json(serde_json::json!({ "error": { "code": code, "message": message } }))).into_response();
         no_store(resp.headers_mut());
         resp
     }
+}
+
+fn text(v: serde_json::Value) -> Message {
+    Message::Text(v.to_string().into())
 }
 
 fn no_store(h: &mut HeaderMap) {
@@ -284,7 +561,10 @@ impl Pool {
     }
 
     fn viewing(&self, sid: &str, headers: &HeaderMap) -> Result<Viewing, ViewError> {
-        let secret = cookie(headers).ok_or(ViewError::Unauthorized)?;
+        self.check_session(sid, cookie(headers).ok_or(ViewError::Unauthorized)?)
+    }
+
+    fn check_session(&self, sid: &str, secret: &str) -> Result<Viewing, ViewError> {
         let (user_id, requester_id, lease_id, control) = {
             let sessions = self.viewers.sessions.lock().expect("sessions mutex");
             let s = sessions.get(sid).ok_or(ViewError::Unauthorized)?;
@@ -319,33 +599,6 @@ impl Pool {
         let rt = self.runtime_of(&v.lease.id).ok_or_else(|| ViewError::Gone("The device is being released.".into()))?;
         Ok((self.ctx(&v.lease, self.account(&v.user)?), rt))
     }
-
-    /// The screen size in points: cached per lease, read again when the picture's aspect ratio
-    /// changes (a rotation).
-    async fn screen_points(
-        &self,
-        ctx: &DeviceCtx,
-        rt: &LeaseRuntime,
-        aspect: Option<f64>,
-    ) -> anyhow::Result<(f64, f64)> {
-        let cached = *rt.screen.lock().expect("screen mutex");
-        if let Some((w, h)) = cached
-            && aspect.is_none_or(|a| ((w / h) - a).abs() / a < 0.03)
-        {
-            return Ok((w, h));
-        }
-        let tree = self.devices.describe_ui(ctx).await?;
-        let size = crate::actions::nodes(&tree)
-            .into_iter()
-            .filter_map(|n| {
-                let f = n.get("frame")?;
-                Some((f.get("width")?.as_f64()?, f.get("height")?.as_f64()?))
-            })
-            .find(|(w, h)| *w > 0.0 && *h > 0.0)
-            .context("the accessibility tree has no screen size")?;
-        *rt.screen.lock().expect("screen mutex") = Some(size);
-        Ok(size)
-    }
 }
 
 fn cookie(headers: &HeaderMap) -> Option<&str> {
@@ -357,275 +610,623 @@ fn cookie(headers: &HeaderMap) -> Option<&str> {
         .find_map(|c| c.trim().strip_prefix(COOKIE)?.strip_prefix('='))
 }
 
-// ---- input ----
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum ViewerInput {
-    /// Normalized coordinates (0-1 of the picture); `hold` seconds makes a long press.
-    Tap {
-        x: f64,
-        y: f64,
-        hold: Option<f64>,
-    },
-    Swipe {
-        x1: f64,
-        y1: f64,
-        x2: f64,
-        y2: f64,
-        duration: Option<f64>,
-    },
-    Type {
-        text: String,
-    },
-    /// HID usage code (40 Return, 42 Backspace, 43 Tab, 41 Escape).
-    Key {
-        code: u8,
-    },
-    Button {
-        name: HwButton,
-    },
-    /// Put text on the simulator clipboard (`axe clipboard copy`) and press Cmd+V into the
-    /// focused field; typed instead when the clipboard cannot be set.
-    Paste {
-        text: String,
-    },
-    /// Type the text character by character (like `Type`), for fields that refuse paste.
-    PasteAndType {
-        text: String,
-    },
+/// A browser names the page that opens a WebSocket in `Origin`; it must be this host, so a page
+/// on another site cannot drive the device with the person's cookie. A request without `Origin`
+/// does not come from a browser page.
+fn same_origin(headers: &HeaderMap) -> bool {
+    let Some(origin) = headers.get(header::ORIGIN) else { return true };
+    let host = headers.get(header::HOST).and_then(|h| h.to_str().ok());
+    let origin = origin.to_str().ok().and_then(|o| o.strip_prefix("https://").or_else(|| o.strip_prefix("http://")));
+    matches!((origin, host), (Some(o), Some(h)) if o.eq_ignore_ascii_case(h))
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct InputRequest {
-    pub input: ViewerInput,
-    /// Width / height of the picture the page shows, to notice rotations.
-    pub aspect: Option<f64>,
+// ---- the helper of a lease ----
+
+/// One viewer of a hub. Dropping it ends the hub with its last viewer.
+struct Joined {
+    pool: Arc<Pool>,
+    lease_id: String,
+    hub: Arc<Hub>,
 }
 
-fn unit(v: f64) -> Result<f64, ViewError> {
-    if (0.0..=1.0).contains(&v) { Ok(v) } else { Err(ViewError::Bad("coordinates must be between 0 and 1".into())) }
-}
-
-fn tap(x: f64, y: f64, hold: Option<f64>) -> TapArgs {
-    TapArgs {
-        id: None,
-        label: None,
-        value: None,
-        element_type: None,
-        x: Some(x),
-        y: Some(y),
-        count: None,
-        hold_seconds: hold,
-        timeout_seconds: None,
+impl Drop for Joined {
+    fn drop(&mut self) {
+        // Under the hubs lock, so a viewer that joins now either sees this hub alive or makes a new one.
+        let mut hubs = self.pool.viewers.hubs.lock().expect("hubs mutex");
+        if self.hub.viewers.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.hub.cancel.cancel();
+            if hubs.get(&self.lease_id).is_some_and(|h| Arc::ptr_eq(h, &self.hub)) {
+                hubs.remove(&self.lease_id);
+            }
+        }
     }
 }
 
-impl Pool {
-    /// Applies one input. `Some(via)` for a paste: `"pasteboard"`, or `"typed"` when the
-    /// device pasteboard could not be reached and the text was typed instead.
-    async fn viewer_input(&self, v: &Viewing, req: InputRequest) -> Result<Option<&'static str>, ViewError> {
-        if !v.control {
-            return Err(ViewError::ViewOnly);
-        }
-        let (ctx, rt) = self.viewer_ctx(v)?;
-        // A run (or another viewer's input) holds the device: wait briefly, then give up rather
-        // than interleave with a run's steps.
-        let _op = tokio::time::timeout(INPUT_WAIT, rt.op.clone().lock_owned()).await.map_err(|_| ViewError::Busy)?;
-        let mut scratch = None;
-        let mut via = None;
-        // Paste puts the text on the device clipboard (AXe) and presses Cmd+V into the focused
-        // field, so any character goes through; everything else goes through AXe input.
-        let result = match req.input {
-            ViewerInput::Paste { text } => {
-                if text.is_empty() || text.len() > MAX_TEXT {
-                    return Err(ViewError::Bad(format!("text must be 1-{MAX_TEXT} bytes")));
-                }
-                let file = self.config.data_dir.join("run").join(format!("{}.txt", uuid::Uuid::new_v4().simple()));
-                std::fs::write(&file, &text).context("writing pasteboard text")?;
-                scratch = Some(file.clone());
-                match self.devices.device_op(&ctx, &DeviceOp::Pasteboard { text_file: file.clone() }).await {
-                    Ok(_) => {
-                        via = Some("pasted");
-                        self.devices.ui(&ctx, &UiInput::KeyCombo { modifiers: vec![CMD], key: KEY_V }).await
-                    }
-                    // Without a clipboard, type it: US keyboard characters only.
-                    Err(e) => {
-                        tracing::warn!(lease = %v.lease.id, error = %e, "clipboard unavailable, typing instead");
-                        via = Some("typed");
-                        self.devices.ui(&ctx, &UiInput::Type { text_file: file }).await
-                    }
-                }
-            }
-            other => {
-                let input = match other {
-                    ViewerInput::Tap { x, y, hold } => {
-                        let (w, h) = self.screen_points(&ctx, &rt, req.aspect).await?;
-                        let hold = hold.filter(|s| *s >= 0.35).map(|s| s.min(10.0));
-                        UiInput::Tap(tap(unit(x)? * w, unit(y)? * h, hold))
-                    }
-                    ViewerInput::Swipe { x1, y1, x2, y2, duration } => {
-                        let (w, h) = self.screen_points(&ctx, &rt, req.aspect).await?;
-                        UiInput::Swipe(SwipeArgs {
-                            from: [unit(x1)? * w, unit(y1)? * h],
-                            to: [unit(x2)? * w, unit(y2)? * h],
-                            duration_seconds: Some(duration.unwrap_or(0.3).clamp(0.05, 5.0)),
-                        })
-                    }
-                    ViewerInput::Type { text } | ViewerInput::PasteAndType { text } => {
-                        if text.is_empty() || text.len() > MAX_TEXT {
-                            return Err(ViewError::Bad(format!("text must be 1-{MAX_TEXT} bytes")));
-                        }
-                        let file =
-                            self.config.data_dir.join("run").join(format!("{}.txt", uuid::Uuid::new_v4().simple()));
-                        std::fs::write(&file, text).context("writing typed text")?;
-                        scratch = Some(file.clone());
-                        UiInput::Type { text_file: file }
-                    }
-                    ViewerInput::Key { code } => UiInput::Key(code),
-                    ViewerInput::Button { name } => UiInput::Button(name),
-                    ViewerInput::Paste { .. } => unreachable!(),
-                };
-                self.devices.ui(&ctx, &input).await
-            }
-        };
-        if let Some(f) = scratch {
-            let _ = std::fs::remove_file(f);
-        }
-        result?;
-        self.store.touch_lease(&v.lease.id, now())?;
-        Ok(via)
-    }
-}
-
-// ---- stream ----
-
-/// Subscribes to the lease's frames, starting its stream when it is the first viewer.
-fn subscribe(pool: &Arc<Pool>, v: &Viewing) -> Result<watch::Receiver<Option<Frame>>, ViewError> {
-    let (ctx, rt) = pool.viewer_ctx(v)?;
+/// Joins the lease's hub, starting its helper for the first viewer.
+fn join(
+    pool: &Arc<Pool>,
+    ctx: &DeviceCtx,
+    rt: &LeaseRuntime,
+) -> Result<(Joined, broadcast::Receiver<Video>), ViewError> {
     let max = pool.config.viewer.max_viewers_per_lease;
     let mut hubs = pool.viewers.hubs.lock().expect("hubs mutex");
-    if let Some(hub) = hubs.get(&v.lease.id)
+    if let Some(hub) = hubs.get(&ctx.lease_id)
         && !hub.cancel.is_cancelled()
     {
-        // Count only external subscribers (exclude the stats watcher).
-        if hub.tx.receiver_count() > max {
+        if hub.viewers.load(Ordering::SeqCst) >= max {
             return Err(ViewError::Full(max));
         }
-        let mut rx = hub.tx.subscribe();
-        rx.mark_changed();
-        return Ok(rx);
+        hub.viewers.fetch_add(1, Ordering::SeqCst);
+        let rx = hub.video.subscribe();
+        hub.keyframe(true);
+        let joined = Joined { pool: pool.clone(), lease_id: ctx.lease_id.clone(), hub: hub.clone() };
+        return Ok((joined, rx));
     }
-    let (tx, rx) = watch::channel(None);
-    let initial_cancel = rt.cancel.child_token();
-    let initial_opts = StreamPreset::Balanced.opts(&pool.config.viewer);
-    let stats = Arc::new(StreamStats {
-        started_at_ms: now_ms(),
-        frame_count: AtomicU64::new(0),
-        frame_bytes: AtomicU64::new(0),
-        last_frame_at_ms: AtomicI64::new(0),
-    });
-    let hub = Arc::new(Hub {
-        tx,
-        cancel: initial_cancel,
-        stream_cancel: StdMutex::new(rt.cancel.child_token()),
-        opts: StdMutex::new(initial_opts),
-        preset: StdMutex::new(StreamPreset::Balanced),
-        stats: stats.clone(),
-    });
-    hubs.insert(v.lease.id.clone(), hub.clone());
+    let hub = Arc::new(Hub::new(rt.cancel.child_token(), &pool.config.viewer));
+    hub.viewers.store(1, Ordering::SeqCst);
+    let rx = hub.video.subscribe();
+    hubs.insert(ctx.lease_id.clone(), hub.clone());
     drop(hubs);
-
-    // Stats subscriber: counts every frame that reaches the watch channel.
-    let mut stats_rx = hub.tx.subscribe();
-    let stats_for_watcher = stats.clone();
-    tokio::spawn(async move {
-        while stats_rx.changed().await.is_ok() {
-            let frame = stats_rx.borrow_and_update().clone();
-            if let Some(f) = frame {
-                stats_for_watcher.frame_count.fetch_add(1, Ordering::Relaxed);
-                stats_for_watcher.frame_bytes.fetch_add(f.jpeg.len() as u64, Ordering::Relaxed);
-                stats_for_watcher.last_frame_at_ms.store(f.captured_at_ms, Ordering::Relaxed);
-            }
-        }
-    });
-
-    // Ends the stream when the last viewer leaves; keeps a watched lease from idling out;
-    // logs stats every 30 s.
-    let watcher = hub.clone();
-    let (store, lease_id) = (pool.store.clone(), v.lease.id.clone());
-    let lease_id2 = lease_id.clone();
-    tokio::spawn(async move {
-        let mut touch = tokio::time::interval(TOUCH_EVERY);
-        let mut log = tokio::time::interval(STATS_LOG_EVERY);
-        touch.tick().await;
-        log.tick().await;
-        loop {
-            tokio::select! {
-                _ = watcher.tx.closed() => break,
-                _ = watcher.cancel.cancelled() => break,
-                _ = touch.tick() => {
-                    let _ = store.touch_lease(&lease_id, now());
-                }
-                _ = log.tick() => {
-                    let st = &watcher.stats;
-                    let count = st.frame_count.load(Ordering::Relaxed);
-                    let bytes = st.frame_bytes.load(Ordering::Relaxed);
-                    // Subtract 1 for the stats watcher itself.
-                    let subscribers = watcher.tx.receiver_count().saturating_sub(1);
-                    let elapsed_s = (now_ms() - st.started_at_ms).max(1) as f64 / 1000.0;
-                    let fps = count as f64 / elapsed_s;
-                    let mean_bytes = bytes.checked_div(count).unwrap_or(0);
-                    tracing::info!(
-                        lease = %lease_id2,
-                        capture_fps = format!("{fps:.1}"),
-                        mean_frame_bytes = mean_bytes,
-                        total_frames = count,
-                        subscribers,
-                        "stream stats"
-                    );
-                }
-            }
-        }
-        watcher.cancel.cancel();
-    });
-
-    let pool = pool.clone();
-    let lease_id = v.lease.id.clone();
-    tokio::spawn(async move {
-        while !hub.cancel.is_cancelled() {
-            let opts = *hub.opts.lock().expect("opts mutex");
-            let sc = hub.cancel.child_token();
-            *hub.stream_cancel.lock().expect("stream_cancel mutex") = sc.clone();
-            if let Err(e) = pool.devices.stream(&ctx, &opts, &hub.tx, &sc).await {
-                tracing::warn!(lease = %lease_id, "screen stream: {e:#}");
-            }
-            // The stream process ended on its own: start it again while someone watches.
-            tokio::select! {
-                _ = hub.cancel.cancelled() => {}
-                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
-            }
-        }
-        let mut hubs = pool.viewers.hubs.lock().expect("hubs mutex");
-        if hubs.get(&lease_id).is_some_and(|h| Arc::ptr_eq(h, &hub)) {
-            hubs.remove(&lease_id);
-        }
-    });
-    Ok(rx)
+    tokio::spawn(run_hub(pool.clone(), ctx.clone(), hub.clone()));
+    Ok((Joined { pool: pool.clone(), lease_id: ctx.lease_id.clone(), hub }, rx))
 }
 
-fn part(frame: &Frame) -> Bytes {
-    let hdr = format!(
-        "--{BOUNDARY}\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\nX-Capture-Time: {}\r\n\r\n",
-        frame.jpeg.len(),
-        frame.captured_at_ms
-    );
-    let mut out = Vec::with_capacity(hdr.len() + frame.jpeg.len() + 2);
-    out.extend_from_slice(hdr.as_bytes());
-    out.extend_from_slice(&frame.jpeg);
-    out.extend_from_slice(b"\r\n");
-    Bytes::from(out)
+/// Runs the helper while anyone watches (again 1 s after it ends), keeps the lease from idling
+/// out, adapts the bitrate and logs stats.
+async fn run_hub(pool: Arc<Pool>, ctx: DeviceCtx, hub: Arc<Hub>) {
+    let lease_id = ctx.lease_id.clone();
+    let ticker = {
+        let (hub, store, lease_id) = (hub.clone(), pool.store.clone(), lease_id.clone());
+        tokio::spawn(async move {
+            let mut touch = tokio::time::interval(TOUCH_EVERY);
+            let mut log = tokio::time::interval(STATS_LOG_EVERY);
+            let mut rate = tokio::time::interval(Duration::from_secs(1));
+            let mut keyframes = tokio::time::interval(KEYFRAME_GAP / 2);
+            touch.tick().await;
+            log.tick().await;
+            loop {
+                tokio::select! {
+                    _ = hub.cancel.cancelled() => break,
+                    _ = touch.tick() => { let _ = store.touch_lease(&lease_id, now()); }
+                    _ = rate.tick() => hub.recover(),
+                    _ = keyframes.tick() => hub.flush_keyframe(),
+                    _ = log.tick() => {
+                        let st = &hub.stats;
+                        let count = st.frame_count.load(Ordering::Relaxed);
+                        let bytes = st.frame_bytes.load(Ordering::Relaxed);
+                        let elapsed_s = (now_ms() - st.started_at_ms).max(1) as f64 / 1000.0;
+                        tracing::info!(
+                            lease = %lease_id,
+                            fps = format!("{:.1}", count as f64 / elapsed_s),
+                            kbps = (bytes as f64 * 8.0 / elapsed_s / 1000.0) as u64,
+                            bitrate = hub.opts().bitrate,
+                            total_frames = count,
+                            viewers = hub.viewers.load(Ordering::Relaxed),
+                            "stream stats"
+                        );
+                    }
+                }
+            }
+        })
+    };
+    while !hub.cancel.is_cancelled() {
+        let (cmd_tx, cmd_rx) = mpsc::channel(1024);
+        let (ev_tx, mut ev_rx) = mpsc::channel(64);
+        *hub.commands.lock().expect("commands mutex") = Some(cmd_tx);
+        let pump = async {
+            while let Some(event) = ev_rx.recv().await {
+                hub.on_event(event, &lease_id);
+            }
+        };
+        let (result, ()) = tokio::join!(pool.devices.screen(&ctx, hub.opts(), cmd_rx, ev_tx, &hub.cancel), pump);
+        *hub.commands.lock().expect("commands mutex") = None;
+        if let Err(e) = result {
+            tracing::warn!(lease = %lease_id, "screen stream: {e:#}");
+        }
+        tokio::select! {
+            _ = hub.cancel.cancelled() => {}
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+        }
+    }
+    ticker.abort();
+    let mut hubs = pool.viewers.hubs.lock().expect("hubs mutex");
+    if hubs.get(&lease_id).is_some_and(|h| Arc::ptr_eq(h, &hub)) {
+        hubs.remove(&lease_id);
+    }
+}
+
+// ---- a viewer's WebSocket ----
+
+/// What the page sends. Points are fractions (0-1) of the picture.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "t", rename_all = "snake_case", deny_unknown_fields)]
+enum ClientMsg {
+    /// The last frame the page received.
+    Ack {
+        seq: u32,
+    },
+    /// Echoed back with the server's clock, for the round trip and the frame age.
+    Ping {
+        at: f64,
+    },
+    /// The page's decoder dropped frames (it fell behind, or was reset): start over at a keyframe.
+    Keyframe,
+    Preset {
+        name: StreamPreset,
+    },
+    Touch {
+        phase: TouchPhase,
+        x: f64,
+        y: f64,
+        #[serde(default)]
+        edge: Option<Edge>,
+    },
+    /// A HID usage pressed with modifier usages (224-231) held.
+    Key {
+        usage: u8,
+        #[serde(default)]
+        mods: Vec<u8>,
+    },
+    Button {
+        name: ScreenButton,
+    },
+    /// Type the text (AXe, US keyboard characters).
+    Type {
+        id: u32,
+        text: String,
+    },
+    /// Put the text on the simulator clipboard and press Cmd+V; typed when the clipboard
+    /// cannot be set.
+    Paste {
+        id: u32,
+        text: String,
+    },
+    /// Type the text character by character, for fields that refuse paste.
+    PasteAndType {
+        id: u32,
+        text: String,
+    },
+}
+
+/// Which frames a viewer gets: all of them while it keeps up, then none until a keyframe once
+/// frames queue up on the way to it.
+struct Flow {
+    /// Frames sent and not yet acknowledged, oldest first, with when they were sent.
+    in_flight: VecDeque<(u32, Instant)>,
+    /// The lowest round trip in the current window, and when the window started.
+    base_rtt: Option<(Duration, Instant)>,
+    need_key: bool,
+    /// Congested: ask for a keyframe once the queue drains.
+    resync: bool,
+}
+
+impl Flow {
+    fn new() -> Self {
+        Self { in_flight: VecDeque::new(), base_rtt: None, need_key: true, resync: false }
+    }
+
+    /// How old the oldest unacknowledged frame may get.
+    fn limit(&self) -> Duration {
+        self.base_rtt.map_or(FIRST_RTT, |(rtt, _)| rtt) + QUEUE_BUDGET
+    }
+
+    fn queued(&self) -> bool {
+        self.in_flight.len() >= MAX_IN_FLIGHT
+            || self.in_flight.front().is_some_and(|(_, at)| at.elapsed() > self.limit())
+    }
+
+    fn admit(&mut self, f: &Encoded, hub: &Hub) -> bool {
+        if self.queued() {
+            hub.congested();
+            self.need_key = true;
+            self.resync = true;
+            return false;
+        }
+        if self.need_key && !f.key {
+            if !self.resync {
+                hub.keyframe(false);
+            }
+            return false;
+        }
+        self.need_key = false;
+        self.resync = false;
+        self.in_flight.push_back((f.seq, Instant::now()));
+        true
+    }
+
+    fn ack(&mut self, seq: u32, hub: &Hub) {
+        if let Some(pos) = self.in_flight.iter().position(|(s, _)| *s == seq) {
+            let rtt = self.in_flight[pos].1.elapsed();
+            self.in_flight.drain(..=pos);
+            self.base_rtt = match self.base_rtt {
+                Some((base, since)) if rtt >= base && since.elapsed() < RTT_WINDOW => Some((base, since)),
+                _ => Some((rtt, Instant::now())),
+            };
+        }
+        if self.resync && !self.queued() && self.in_flight.len() <= 1 {
+            self.resync = false;
+            hub.keyframe(false);
+        }
+    }
+}
+
+/// A viewer's WebSocket and what it holds.
+struct Live {
+    pool: Arc<Pool>,
+    sid: String,
+    secret: String,
+    control: bool,
+    ctx: DeviceCtx,
+    rt: Arc<LeaseRuntime>,
+    joined: Joined,
+}
+
+impl Live {
+    /// Why the stream ended for this viewer.
+    fn ended(&self) -> CloseFrame {
+        match self.pool.check_session(&self.sid, &self.secret) {
+            Err(e) => e.close(),
+            Ok(_) => ViewError::Gone("The device is being released.".into()).close(),
+        }
+    }
+}
+
+/// Sends one message; `false` when the socket is gone or the page has not read for
+/// `SEND_TIMEOUT`, so a stalled page cannot hold off the session checks for long.
+async fn put(sink: &mut futures_util::stream::SplitSink<WebSocket, Message>, m: Message) -> bool {
+    matches!(tokio::time::timeout(SEND_TIMEOUT, sink.send(m)).await, Ok(Ok(())))
+}
+
+async fn session(live: Live, mut video: broadcast::Receiver<Video>, socket: WebSocket) {
+    let (mut sink, mut stream) = socket.split();
+    let hub = live.joined.hub.clone();
+    let (out_tx, mut out_rx) = mpsc::channel::<Message>(64);
+    let (in_tx, in_rx) = mpsc::channel::<ClientMsg>(1024);
+    let input = Input {
+        pool: live.pool.clone(),
+        ctx: live.ctx.clone(),
+        rt: live.rt.clone(),
+        hub: hub.clone(),
+        gesture: None,
+        touched: None,
+    };
+    let stop = CancellationToken::new();
+    let input = tokio::spawn(run_input(input, in_rx, out_tx, stop.clone()));
+    let mut flow = Flow::new();
+    // The format may be in the cache and in the channel both: send each one once.
+    let mut sent_format = hub.format.lock().expect("format mutex").clone();
+    let mut close = None;
+    if let Some(f) = &sent_format
+        && !put(&mut sink, Message::Text(f.to_string().into())).await
+    {
+        close = Some(None);
+    }
+    let mut recheck = tokio::time::interval(RECHECK_EVERY);
+    recheck.tick().await;
+    while close.is_none() {
+        tokio::select! {
+            v = video.recv() => match v {
+                Ok(Video::Format(f)) => {
+                    if !sent_format.as_ref().is_some_and(|s| Arc::ptr_eq(s, &f)) {
+                        flow.need_key = true;
+                        if !put(&mut sink, Message::Text(f.to_string().into())).await {
+                            close = Some(None);
+                        }
+                        sent_format = Some(f);
+                    }
+                }
+                Ok(Video::Frame(f)) => {
+                    if flow.admit(&f, &hub) && !put(&mut sink, Message::Binary(f.message.clone())).await {
+                        close = Some(None);
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    // A format may have been among the messages it missed.
+                    let current = hub.format.lock().expect("format mutex").clone();
+                    if let Some(f) = current
+                        && !sent_format.as_ref().is_some_and(|s| Arc::ptr_eq(s, &f))
+                    {
+                        if !put(&mut sink, Message::Text(f.to_string().into())).await {
+                            close = Some(None);
+                        }
+                        sent_format = Some(f);
+                    }
+                    flow.need_key = true;
+                    hub.keyframe(false);
+                }
+                Err(broadcast::error::RecvError::Closed) => close = Some(Some(live.ended())),
+            },
+            m = stream.next() => match m {
+                Some(Ok(Message::Text(t))) => {
+                    let reply = match serde_json::from_str::<ClientMsg>(&t) {
+                        Ok(ClientMsg::Ack { seq }) => {
+                            flow.ack(seq, &hub);
+                            None
+                        }
+                        Ok(ClientMsg::Ping { at }) => Some(text(serde_json::json!({ "t": "pong", "at": at, "server_ms": now_ms() }))),
+                        Ok(ClientMsg::Keyframe) => {
+                            flow.need_key = true;
+                            hub.keyframe(false);
+                            None
+                        }
+                        Ok(ClientMsg::Preset { .. } | ClientMsg::Touch { .. } | ClientMsg::Key { .. } | ClientMsg::Button { .. } | ClientMsg::Type { .. } | ClientMsg::Paste { .. } | ClientMsg::PasteAndType { .. })
+                            if !live.control => view_only(&t),
+                        Ok(ClientMsg::Preset { name }) => {
+                            let opts = hub.set_preset(name, &live.pool.config.viewer);
+                            Some(text(serde_json::json!({ "t": "preset", "preset": name, "opts": opts })))
+                        }
+                        Ok(msg) => in_tx.try_send(msg).err().map(|_| ViewError::Busy.message(None)),
+                        Err(e) => Some(ViewError::Bad(format!("invalid message: {e}")).message(None)),
+                    };
+                    if let Some(r) = reply
+                        && !put(&mut sink, r).await
+                    {
+                        close = Some(None);
+                    }
+                }
+                Some(Ok(Message::Close(_)) | Err(_)) | None => close = Some(None),
+                Some(Ok(_)) => {}
+            },
+            Some(m) = out_rx.recv() => {
+                if !put(&mut sink, m).await {
+                    close = Some(None);
+                }
+            }
+            _ = recheck.tick() => {
+                if let Err(e) = live.pool.check_session(&live.sid, &live.secret) {
+                    close = Some(Some(e.close()));
+                }
+            }
+            _ = hub.cancel.cancelled() => close = Some(Some(live.ended())),
+        }
+    }
+    // Queued input is dropped: nothing more reaches the device once the page is gone or its
+    // session is revoked. The input task still lifts a finger that is down.
+    stop.cancel();
+    drop(in_tx);
+    drop(out_rx);
+    if let Some(Some(frame)) = close {
+        let _ = put(&mut sink, Message::Close(Some(frame))).await;
+    }
+    let _ = input.await;
+}
+
+/// A view-only page is told once per gesture, not for every move.
+fn view_only(msg: &str) -> Option<Message> {
+    let quiet = msg.contains(r#""phase":"move""#) || msg.contains(r#""phase":"up""#);
+    (!quiet).then(|| ViewError::ViewOnly.message(None))
+}
+
+/// The lease's op lock, held for one input or one gesture.
+struct Held {
+    _op: OwnedMutexGuard<()>,
+    hub: Arc<Hub>,
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.hub.holding.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Waits briefly for the device: a run (or another viewer's gesture) holds it, else.
+async fn hold(rt: &LeaseRuntime, hub: &Arc<Hub>) -> Result<Held, ViewError> {
+    let op = tokio::time::timeout(INPUT_WAIT, rt.op.clone().lock_owned()).await.map_err(|_| ViewError::Busy)?;
+    if rt.cancel.is_cancelled() {
+        return Err(ViewError::Gone("The device is being released.".into()));
+    }
+    hub.holding.fetch_add(1, Ordering::SeqCst);
+    Ok(Held { _op: op, hub: hub.clone() })
+}
+
+/// A finger that is down: it holds the device until it lifts.
+struct Gesture {
+    _held: Held,
+    x: f64,
+    y: f64,
+    at: Instant,
+}
+
+fn point(x: f64, y: f64) -> Result<(), ViewError> {
+    if (0.0..=1.0).contains(&x) && (0.0..=1.0).contains(&y) {
+        Ok(())
+    } else {
+        Err(ViewError::Bad("coordinates must be between 0 and 1".into()))
+    }
+}
+
+/// One viewer's input, applied in order: touches, keys and buttons through the helper, text
+/// through AXe.
+struct Input {
+    pool: Arc<Pool>,
+    ctx: DeviceCtx,
+    rt: Arc<LeaseRuntime>,
+    hub: Arc<Hub>,
+    gesture: Option<Gesture>,
+    touched: Option<Instant>,
+}
+
+impl Input {
+    /// Lifts a finger that is still down, and frees the device once the helper has the lift, so
+    /// a run that takes the device next never finds the finger down.
+    async fn lift(&mut self) {
+        if let Some(g) = self.gesture.take() {
+            self.hub.send(ScreenCommand::Touch { phase: TouchPhase::Up, x: g.x, y: g.y, edge: None });
+            let _ = self.hub.sync().await;
+        }
+    }
+
+    async fn apply(&mut self, msg: ClientMsg) -> Option<Message> {
+        let id = match &msg {
+            ClientMsg::Type { id, .. } | ClientMsg::Paste { id, .. } | ClientMsg::PasteAndType { id, .. } => Some(*id),
+            _ => None,
+        };
+        let reply = match self.apply_inner(msg).await {
+            Ok(r) => r,
+            Err(e) => Some(e.message(id)),
+        };
+        if self.touched.is_none_or(|t| t.elapsed() >= INPUT_TOUCH_EVERY) {
+            self.touched = Some(Instant::now());
+            let _ = self.pool.store.touch_lease(&self.ctx.lease_id, now());
+        }
+        reply
+    }
+
+    async fn apply_inner(&mut self, msg: ClientMsg) -> Result<Option<Message>, ViewError> {
+        if !matches!(msg, ClientMsg::Touch { phase: TouchPhase::Move | TouchPhase::Up, .. }) {
+            self.lift().await;
+        }
+        let hub = self.hub.clone();
+        match msg {
+            ClientMsg::Touch { phase: TouchPhase::Down, x, y, edge } => {
+                point(x, y)?;
+                let held = hold(&self.rt, &hub).await?;
+                delivered(hub.send(ScreenCommand::Touch { phase: TouchPhase::Down, x, y, edge }))?;
+                self.gesture = Some(Gesture { _held: held, x, y, at: Instant::now() });
+            }
+            ClientMsg::Touch { phase, x, y, .. } => {
+                point(x, y)?;
+                // Without a finger down (it was refused as busy, or timed out) there is nothing to move.
+                if let Some(g) = self.gesture.as_mut() {
+                    hub.send(ScreenCommand::Touch { phase, x, y, edge: None });
+                    (g.x, g.y, g.at) = (x, y, Instant::now());
+                    if phase == TouchPhase::Up {
+                        // The device stays held until the helper has the lift.
+                        let _ = hub.sync().await;
+                        self.gesture = None;
+                    }
+                }
+            }
+            ClientMsg::Key { usage, mods } => {
+                if mods.len() > 4 || mods.iter().any(|m| !(224..=231).contains(m)) {
+                    return Err(ViewError::Bad("mods must be up to 4 modifier usages (224-231)".into()));
+                }
+                let _held = hold(&self.rt, &hub).await?;
+                delivered(press(&hub, usage, &mods))?;
+                hub.sync().await?;
+            }
+            ClientMsg::Button { name } => {
+                let _held = hold(&self.rt, &hub).await?;
+                delivered(hub.send(ScreenCommand::Button { button: name, down: true }))?;
+                tokio::time::sleep(BUTTON_HOLD).await;
+                hub.send(ScreenCommand::Button { button: name, down: false });
+                hub.sync().await?;
+            }
+            ClientMsg::Type { id, text } | ClientMsg::PasteAndType { id, text } => {
+                let _held = hold(&self.rt, &hub).await?;
+                hub.sync().await?;
+                self.typed(&text).await?;
+                return Ok(Some(done(id, None)));
+            }
+            ClientMsg::Paste { id, text } => {
+                let _held = hold(&self.rt, &hub).await?;
+                hub.sync().await?;
+                let via = self.pasted(&text).await?;
+                return Ok(Some(done(id, Some(via))));
+            }
+            ClientMsg::Ack { .. } | ClientMsg::Ping { .. } | ClientMsg::Keyframe | ClientMsg::Preset { .. } => {}
+        }
+        Ok(None)
+    }
+
+    /// Writes `text` to a daemon-owned scratch file (never a command line) and runs `f` on it.
+    async fn with_text_file<T>(
+        &self,
+        text: &str,
+        f: impl AsyncFnOnce(std::path::PathBuf) -> Result<T, ViewError>,
+    ) -> Result<T, ViewError> {
+        if text.is_empty() || text.len() > MAX_TEXT {
+            return Err(ViewError::Bad(format!("text must be 1-{MAX_TEXT} bytes")));
+        }
+        let file = self.pool.config.data_dir.join("run").join(format!("{}.txt", uuid::Uuid::new_v4().simple()));
+        std::fs::write(&file, text).context("writing the text")?;
+        let result = f(file.clone()).await;
+        let _ = std::fs::remove_file(&file);
+        result
+    }
+
+    /// AXe types the text: US keyboard characters only.
+    async fn typed(&self, text: &str) -> Result<(), ViewError> {
+        self.with_text_file(text, async |file| {
+            Ok(self.pool.devices.ui(&self.ctx, &UiInput::Type { text_file: file }).await?)
+        })
+        .await
+    }
+
+    /// The text goes on the simulator clipboard (AXe) and Cmd+V pastes it into the focused field,
+    /// so any character goes through. Without a clipboard, it is typed. Returns where it went.
+    async fn pasted(&self, text: &str) -> Result<&'static str, ViewError> {
+        self.with_text_file(text, async |file| {
+            match self.pool.devices.device_op(&self.ctx, &DeviceOp::Pasteboard { text_file: file.clone() }).await {
+                Ok(_) => {
+                    // The clipboard alone is not a paste: report it only once Cmd+V is with the helper.
+                    delivered(press(&self.hub, KEY_V, &[CMD]))?;
+                    self.hub.sync().await?;
+                    Ok("pasted")
+                }
+                Err(e) => {
+                    tracing::warn!(lease = %self.ctx.lease_id, error = %e, "clipboard unavailable, typing instead");
+                    self.pool.devices.ui(&self.ctx, &UiInput::Type { text_file: file }).await?;
+                    Ok("typed")
+                }
+            }
+        })
+        .await
+    }
+}
+
+/// A key press with modifiers held: modifiers down in order, the key down and up, modifiers up
+/// in reverse. All of it goes to the helper, or none; `false` for none.
+fn press(hub: &Hub, usage: u8, mods: &[u8]) -> bool {
+    let mut keys: Vec<ScreenCommand> = mods.iter().map(|m| ScreenCommand::Key { usage: *m, down: true }).collect();
+    keys.push(ScreenCommand::Key { usage, down: true });
+    keys.push(ScreenCommand::Key { usage, down: false });
+    keys.extend(mods.iter().rev().map(|m| ScreenCommand::Key { usage: *m, down: false }));
+    hub.send_all(keys)
+}
+
+fn delivered(sent: bool) -> Result<(), ViewError> {
+    if sent { Ok(()) } else { Err(helper_missing()) }
+}
+
+fn helper_missing() -> ViewError {
+    ViewError::Internal(anyhow::anyhow!("the screen helper did not take the input; try again"))
+}
+
+fn done(id: u32, via: Option<&str>) -> Message {
+    let mut v = serde_json::json!({ "t": "done", "id": id });
+    if let Some(via) = via {
+        v["via"] = via.into();
+    }
+    text(v)
+}
+
+/// Runs until the page goes away (`stop`): what is still queued then is dropped, not applied.
+async fn run_input(
+    mut input: Input,
+    mut rx: mpsc::Receiver<ClientMsg>,
+    out: mpsc::Sender<Message>,
+    stop: CancellationToken,
+) {
+    loop {
+        let idle = input.gesture.as_ref().map(|g| tokio::time::Instant::from_std(g.at + GESTURE_IDLE));
+        let msg = tokio::select! {
+            biased;
+            _ = stop.cancelled() => break,
+            _ = async { tokio::time::sleep_until(idle.expect("checked")).await }, if idle.is_some() => {
+                input.lift().await;
+                continue;
+            }
+            m = rx.recv() => m,
+        };
+        let Some(msg) = msg else { break };
+        if let Some(reply) = input.apply(msg).await
+            && out.send(reply).await.is_err()
+        {
+            break;
+        }
+    }
+    input.lift().await;
 }
 
 // ---- routes ----
@@ -678,15 +1279,19 @@ async fn page(State(pool): State<Arc<Pool>>, Path(sid): Path<String>, headers: H
     if let Err(e) = pool.viewing(&sid, &headers) {
         return page_error(e);
     }
+    // `connect-src 'self'` does not cover WebSockets in every browser: name this host's ws URLs.
+    let host = headers
+        .get(header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .filter(|h| h.bytes().all(|b| b.is_ascii_alphanumeric() || b".-:[]".contains(&b)));
+    let connect = host.map_or("'self'".to_string(), |h| format!("'self' wss://{h} ws://{h}"));
+    let csp = format!(
+        "default-src 'none'; img-src 'self' blob:; script-src 'self'; style-src 'self'; connect-src {connect}; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+    );
     let mut resp = axum::response::Html(PAGE).into_response();
     let h = resp.headers_mut();
     no_store(h);
-    h.insert(
-        header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static(
-            "default-src 'none'; img-src 'self' blob:; script-src 'self'; style-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
-        ),
-    );
+    h.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_str(&csp).expect("ascii"));
     resp
 }
 
@@ -701,6 +1306,10 @@ async fn asset(Path(name): Path<String>) -> Response {
     resp
 }
 
+fn hub_of(pool: &Pool, lease_id: &str) -> Option<Arc<Hub>> {
+    pool.viewers.hubs.lock().expect("hubs mutex").get(lease_id).cloned()
+}
+
 async fn info(
     State(pool): State<Arc<Pool>>,
     Path(sid): Path<String>,
@@ -709,17 +1318,12 @@ async fn info(
     let v = pool.viewing(&sid, &headers)?;
     let (_, rt) = pool.viewer_ctx(&v)?;
     let model = pool.config.ios.as_ref().and_then(|i| i.models.get(&v.lease.model));
-    let hubs = pool.viewers.hubs.lock().expect("hubs mutex");
-    let (viewers, preset, opts) = if let Some(hub) = hubs.get(&v.lease.id) {
-        let viewers = hub.tx.receiver_count().saturating_sub(1); // exclude stats watcher
-        let preset = *hub.preset.lock().expect("preset mutex");
-        let opts = *hub.opts.lock().expect("opts mutex");
-        (viewers, Some(preset), Some(opts))
-    } else {
-        (0, None, None)
-    };
-    drop(hubs);
-    let busy = rt.op.try_lock().is_err();
+    let hub = hub_of(&pool, &v.lease.id);
+    // The viewers' own touches hold the op lock too; only someone else's hold is busy.
+    let holding = hub.as_ref().map_or(0, |h| h.holding.load(Ordering::SeqCst));
+    let busy = rt.op.try_lock().is_err() && holding == 0;
+    let preset = hub.as_ref().map(|h| h.rate.lock().expect("rate mutex").preset);
+    let opts = hub.as_ref().map(|h| h.opts());
     let mut resp = Json(serde_json::json!({
         "lease_id": v.lease.id,
         "user": v.user.name,
@@ -731,12 +1335,10 @@ async fn info(
         "ends_at_latest": v.lease.started_at + v.user.quota.max_lease_minutes * 60,
         "control": v.control,
         "busy": busy,
-        "viewers": viewers,
-        "fps": opts.map_or(pool.config.viewer.fps, |o| o.fps),
+        "viewers": hub.as_ref().map_or(0, |h| h.viewers.load(Ordering::SeqCst)),
         "app": rt.app.lock().expect("app mutex").clone(),
         "preset": preset,
-        "stream_opts": opts.map(|o| serde_json::json!({"fps": o.fps, "scale": o.scale, "quality": o.quality})),
-        // Lets the page correct `X-Capture-Time` for its own clock when it shows a frame's age.
+        "stream_opts": opts,
         "server_time_ms": now_ms(),
     }))
     .into_response();
@@ -750,126 +1352,47 @@ async fn stats(
     headers: HeaderMap,
 ) -> Result<Response, ViewError> {
     let v = pool.viewing(&sid, &headers)?;
-    let hubs = pool.viewers.hubs.lock().expect("hubs mutex");
-    let hub = hubs.get(&v.lease.id).ok_or_else(|| ViewError::Gone("No active stream.".into()))?;
+    let hub = hub_of(&pool, &v.lease.id).ok_or_else(|| ViewError::Gone("No active stream.".into()))?;
     let st = &hub.stats;
-    let started_at_ms = st.started_at_ms;
     let count = st.frame_count.load(Ordering::Relaxed);
     let bytes = st.frame_bytes.load(Ordering::Relaxed);
-    let subscribers = hub.tx.receiver_count().saturating_sub(1);
-    let last_frame_ms = st.last_frame_at_ms.load(Ordering::Relaxed);
-    let preset = *hub.preset.lock().expect("preset mutex");
-    let opts = *hub.opts.lock().expect("opts mutex");
-    drop(hubs);
-    let elapsed_s = (now_ms() - started_at_ms).max(1) as f64 / 1000.0;
-    let fps = count as f64 / elapsed_s;
-    let mean_bytes = bytes.checked_div(count).unwrap_or(0);
+    let elapsed_s = (now_ms() - st.started_at_ms).max(1) as f64 / 1000.0;
+    let preset = hub.rate.lock().expect("rate mutex").preset;
     let mut resp = Json(serde_json::json!({
         "stream": {
-            "started_at_ms": started_at_ms,
-            "fps": (fps * 10.0).round() / 10.0,
-            "mean_frame_bytes": mean_bytes,
+            "started_at_ms": st.started_at_ms,
+            "fps": (count as f64 / elapsed_s * 10.0).round() / 10.0,
+            "kbps": (bytes as f64 * 8.0 / elapsed_s / 1000.0).round(),
+            "mean_frame_bytes": bytes.checked_div(count).unwrap_or(0),
             "total_frames": count,
             "total_bytes": bytes,
-            "subscribers": subscribers,
-            "last_frame_at_ms": last_frame_ms,
+            "viewers": hub.viewers.load(Ordering::SeqCst),
+            "last_frame_at_ms": st.last_frame_at_ms.load(Ordering::Relaxed),
         },
         "preset": preset,
-        "opts": {"fps": opts.fps, "scale": opts.scale, "quality": opts.quality},
+        "opts": hub.opts(),
     }))
     .into_response();
     no_store(resp.headers_mut());
     Ok(resp)
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PresetRequest {
-    preset: StreamPreset,
-}
-
-async fn preset(
+/// `GET /view/s/{sid}/ws`: the stream (H.264 frames out) and the input (touches, keys, text in).
+async fn ws(
     State(pool): State<Arc<Pool>>,
     Path(sid): Path<String>,
     headers: HeaderMap,
-    body: axum::body::Bytes,
+    upgrade: WebSocketUpgrade,
 ) -> Result<Response, ViewError> {
-    if headers.get("x-seiji-view").and_then(|v| v.to_str().ok()) != Some("1") {
-        return Err(ViewError::Bad("missing X-Seiji-View header".into()));
+    if !same_origin(&headers) {
+        return Err(ViewError::CrossOrigin);
     }
-    let v = pool.viewing(&sid, &headers)?;
-    if !v.control {
-        return Err(ViewError::ViewOnly);
-    }
-    let req: PresetRequest =
-        serde_json::from_slice(&body).map_err(|e| ViewError::Bad(format!("invalid preset: {e}")))?;
-    let new_opts = req.preset.opts(&pool.config.viewer);
-    let hubs = pool.viewers.hubs.lock().expect("hubs mutex");
-    let hub = hubs.get(&v.lease.id).ok_or_else(|| ViewError::Gone("No active stream.".into()))?;
-    *hub.opts.lock().expect("opts mutex") = new_opts;
-    *hub.preset.lock().expect("preset mutex") = req.preset;
-    // Cancel only the AXe stream; the spawn loop will restart with the new opts.
-    hub.stream_cancel.lock().expect("stream_cancel mutex").cancel();
-    drop(hubs);
-    let mut resp = Json(serde_json::json!({
-        "preset": req.preset,
-        "opts": {"fps": new_opts.fps, "scale": new_opts.scale, "quality": new_opts.quality},
-    }))
-    .into_response();
-    no_store(resp.headers_mut());
-    Ok(resp)
-}
-
-async fn stream(
-    State(pool): State<Arc<Pool>>,
-    Path(sid): Path<String>,
-    headers: HeaderMap,
-) -> Result<Response, ViewError> {
-    let v = pool.viewing(&sid, &headers)?;
-    let mut rx = subscribe(&pool, &v)?;
-    // Identical frames are not sent again, so a screen that does not change produces no new
-    // frame: a viewer that joins (or reconnects) gets the current one at once, and the last
-    // frame is repeated every FRAME_REPEAT so the page and proxies see a live stream.
-    rx.mark_changed();
-    let frames = futures_util::stream::unfold(rx, |mut rx| async move {
-        loop {
-            // Ok(Err): the stream ended (the lease went away or the last viewer left).
-            if let Ok(changed) = tokio::time::timeout(FRAME_REPEAT, rx.changed()).await {
-                changed.ok()?;
-            }
-            let frame = rx.borrow_and_update().clone();
-            if let Some(f) = frame {
-                return Some((Ok::<_, Infallible>(part(&f)), rx));
-            }
-        }
-    });
-    let mut resp = Body::from_stream(frames).into_response();
-    let h = resp.headers_mut();
-    h.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_str(&format!("multipart/x-mixed-replace; boundary={BOUNDARY}")).expect("ascii"),
-    );
-    no_store(h);
-    Ok(resp)
-}
-
-async fn input(
-    State(pool): State<Arc<Pool>>,
-    Path(sid): Path<String>,
-    headers: HeaderMap,
-    body: axum::body::Bytes,
-) -> Result<Response, ViewError> {
-    // A cross-site form cannot set this header, and `SameSite=Strict` keeps the cookie home.
-    if headers.get("x-seiji-view").and_then(|v| v.to_str().ok()) != Some("1") {
-        return Err(ViewError::Bad("missing X-Seiji-View header".into()));
-    }
-    let v = pool.viewing(&sid, &headers)?;
-    let req: InputRequest = serde_json::from_slice(&body).map_err(|e| ViewError::Bad(format!("invalid input: {e}")))?;
-    let mut resp = match pool.viewer_input(&v, req).await? {
-        // A paste says where the text went, so the page can tell the person.
-        Some(via) => Json(serde_json::json!({ "via": via })).into_response(),
-        None => StatusCode::NO_CONTENT.into_response(),
-    };
+    let secret = cookie(&headers).ok_or(ViewError::Unauthorized)?.to_string();
+    let v = pool.check_session(&sid, &secret)?;
+    let (ctx, rt) = pool.viewer_ctx(&v)?;
+    let (joined, video) = join(&pool, &ctx, &rt)?;
+    let live = Live { pool: pool.clone(), sid, secret, control: v.control, ctx, rt, joined };
+    let mut resp = upgrade.max_message_size(MAX_CLIENT_MESSAGE).on_upgrade(move |socket| session(live, video, socket));
     no_store(resp.headers_mut());
     Ok(resp)
 }
@@ -902,8 +1425,6 @@ pub fn routes() -> Router<Arc<Pool>> {
         .route("/view/s/{sid}/", get(page))
         .route("/view/s/{sid}/info", get(info))
         .route("/view/s/{sid}/stats", get(stats))
-        .route("/view/s/{sid}/stream", get(stream))
-        .route("/view/s/{sid}/input", post(input))
-        .route("/view/s/{sid}/preset", post(preset))
+        .route("/view/s/{sid}/ws", get(ws))
         .route("/view/s/{sid}/screenshot.jpg", get(screenshot))
 }

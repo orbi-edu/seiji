@@ -126,14 +126,19 @@ The panel polls `budget_status` every 3 s and `list_runs` every 10 s while the R
 | You do | The device gets |
 |---|---|
 | Click | A tap where you clicked |
-| Hold for 400 ms or more | A long press |
-| Drag | A swipe along the drag |
-| Scroll the wheel | One swipe per gesture |
-| Type | The text, through AXe |
-| Enter, Esc, Backspace, Tab, arrows | The matching key |
+| Hold | A long press, as long as you hold |
+| Drag | A finger that follows the pointer while you drag: lists scroll and pages turn under it |
+| Drag from the bottom edge | The home gesture (Face ID devices) |
+| Scroll the wheel or trackpad | A drag along the scroll, lifted when you stop |
+| Type | The keys, as a hardware keyboard with a US layout. Characters that layout has no key for (accents, emoji) are pasted |
+| Enter, Esc, Backspace, Tab, Delete, arrows, Home, End | The matching key |
+| ⌘A, ⌘C, ⌘X, ⌘Z | The same shortcut on the device |
 | Paste (⌘V) | The clipboard's text |
 | ⌘⇧H, ⌘L | Home, Lock |
 | ⌘S, or **Screenshot** | A JPEG download of the screen |
+| ⌥I, or **Stats** | The stream's fps, bitrate, round trip and frame age |
+
+The screen is H.264 video decoded in the browser (WebCodecs), up to 30 frames a second. A dot shows where your finger is at once, before the device answers. On a slow link the picture skips frames rather than falling behind, and the bitrate drops until the link recovers.
 
 The dot in the toolbar is green while the stream is live, amber while a run uses the device, and red when the device is gone. While a run holds the device, the screen keeps playing but input waits: a tap answers "A run is using the device" instead of mixing with the run's steps.
 
@@ -192,7 +197,8 @@ Non-admin users do not see the Users tab or any admin data. The server enforces 
 - One viewer link opens one viewer session. A session lasts `viewer.sessionHours` (12 h by default) and never past its lease. Open the device again from the panel to get a new link.
 - A lease takes at most `viewer.maxViewersPerLease` open screens (4 by default).
 - Watching a device keeps it from idle release: the stream counts as activity once a minute. It does not stop the maximum lease length.
-- Typed text goes through AXe's `type`, with its limits on characters.
+- Pasted and typed text goes through AXe (about a second); the screen's keys go through Seiji's HID connection at once.
+- The browser must support WebCodecs: Tern, and current Chrome, Edge, Safari and Firefox do.
 
 ## How it works
 
@@ -201,17 +207,18 @@ sequenceDiagram
     participant P as Seiji panel (Tern host)
     participant W as Tern window
     participant S as seiji serve
-    participant A as axe stream-video
+    participant A as seiji-sim
     P->>S: POST /v1/leases/{id}/viewer (bearer)
     S-->>P: /view/open/{ticket}, valid 60 s
     P->>W: open the link (route)
     W->>S: GET /view/open/{ticket} in the browser block
     S-->>W: cookie for /view/s/{sid}, 303 to the page
-    W->>S: GET /view/s/{sid}/stream
-    S->>A: start one stream for the lease
-    A-->>S: JPEG frames
-    S-->>W: multipart/x-mixed-replace
-    W->>S: POST /view/s/{sid}/input (tap, swipe, type)
+    W->>S: WebSocket /view/s/{sid}/ws
+    S->>A: start one helper for the lease
+    A-->>S: H.264 frames
+    S-->>W: frames (W acknowledges each one)
+    W->>S: touch down, move, up; keys; text
+    S->>A: touches and keys on its HID connection
 ```
 
 The token never reaches the browser. The panel uses it to ask for a one-time ticket; the browser trades the ticket for a session cookie scoped to that session's path. Every request checks the session, the user and the lease. For the full model, read [security.md](security.md#the-viewer). For the endpoints, read [mcp.md](mcp.md). For the settings, read [configuration.md](configuration.md#viewer).

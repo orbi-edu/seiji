@@ -55,7 +55,8 @@ flowchart LR
 | Auth middleware | Reads `Authorization: Bearer <token>`, looks up the SHA-256 of the token, refuses a missing, unknown or disabled token with `401`, and puts the user into the request as `AuthedUser`. | `src/http.rs` |
 | MCP service | rmcp `StreamableHttpService` with `NeverSessionManager`, legacy session mode off and SSE responses with 15 s keepalive comments: every POST is handled on its own, the response starts as `text/event-stream` immediately and sends keepalive comments while the tool runs, so a TLS proxy never times out on idle reads. It checks the `Host` header against `listen.allowedHosts`. A factory builds one `SeijiMcp` for each request. | `src/http.rs`, `src/mcp.rs` |
 | `SeijiMcp` | The 23 tools and the server instructions. Reads the caller from `AuthedUser` and turns each `Pool` result into a tool result. Caches the Maestro cheat sheet for the process. | `src/mcp.rs` |
-| Viewer | Viewer links, tickets and viewer sessions (in memory), the `/view/…` routes, one shared AXe `stream-video` process per watched lease fanned out to every viewer through a watch channel, and input mapped to AXe taps, swipes, typing, keys and buttons under the lease's op lock. The page (`index.html`, `viewer.js`, `viewer.css`) is embedded in the binary. | `src/viewer.rs`, `src/viewer/` |
+| Viewer | Viewer links, tickets and viewer sessions (in memory), the `/view/…` routes and the page's WebSocket, one shared `seiji-sim` helper per watched lease whose H.264 frames fan out to every viewer through a broadcast channel with per-viewer flow control, and input: touches, keys and buttons to the helper's persistent HID connection, text through AXe, under the lease's op lock. The page (`index.html`, `viewer.js`, `viewer.css`) is embedded in the binary. | `src/viewer.rs`, `src/viewer/` |
+| Screen helper | `seiji-sim`, a Swift tool built on the host: reads the simulator's framebuffer IOSurface, encodes H.264 with VideoToolbox, and sends touches, keys and buttons through one `SimDeviceLegacyHIDClient`. It speaks framed messages on stdout and JSON lines on stdin, and runs as the user's account through `Runner`. | `sim/` |
 | Tunnel | `seiji forward`: admits a tunnel for the caller's `ready` lease (`forward.enabled`, `forward.maxPerLease`), listens on a new port on `127.0.0.1`, and carries each connection to it over the WebSocket in OPEN, DATA and CLOSE frames. Touches the lease every 60 s and closes with it. The client end dials only its one local port. | `src/forward.rs` |
 | `Pool` | Admission, acquire and release, lease operations under the op lock, budget and models views, downloads, the reaper, recovery and shutdown. Holds the admission lock and the in-memory runtime of each lease (op lock, cancellation token, installed app). | `src/pool.rs` |
 | Runs | The `Pool` methods for runs: `record` and `record_locked` (quota, run dirs, captures, engine, crash collection, failure screenshot, copy, manifest), the engines `actions`, `flow` and `xctest`, the device tools (`device_op`, `logs`), and `list_runs`, `run_manifest`, `run_file`, `run_url`. | `src/runs.rs` |
@@ -304,7 +305,7 @@ sequenceDiagram
   participant H as http.rs
   participant V as viewer.rs (Pool)
   participant R as Runner
-  participant X as AXe
+  participant X as seiji-sim
 
   A->>H: share_screen, or POST /v1/leases/LEASE/viewer (bearer)
   H->>V: create_viewer(user, lease, control)
@@ -314,27 +315,31 @@ sequenceDiagram
   V->>V: remove the ticket, make a session, keep SHA-256 of its secret
   V-->>U: 303 to /view/s/SID/, Set-Cookie seiji_view (Path=/view/s/SID)
   U->>V: GET /view/s/SID/ and /info (cookie)
-  U->>V: GET /view/s/SID/stream (cookie)
+  U->>V: GET /view/s/SID/ws (cookie, Origin of this host)
   alt first viewer of the lease
-    V->>R: axe stream-video --udid=UDID --format=raw (as the user's account)
-    R->>X: start
+    V->>R: seiji-sim session --udid UDID --fps --scale --bitrate (as the user's account)
+    R->>X: start, stdin and stdout piped
   end
+  X-->>V: format (codec, size, avcC)
+  V-->>U: format, to every viewer of the lease
   loop each frame
-    X-->>V: 4-byte length, JPEG
-    V-->>U: one multipart part, to every viewer of the lease
+    X-->>V: H.264 sample (AVCC), keyframe flag, capture time
+    V-->>U: binary frame, unless this viewer is congested
+    U-->>V: ack seq
   end
-  U->>V: POST /view/s/SID/input, X-Seiji-View 1 (cookie)
-  V->>V: wait up to 1 s for the op lock, else 409 busy
-  V->>R: axe tap, swipe, type, key or button
-  V->>V: touch_lease
-  V-->>U: 204
+  U->>V: touch down (x, y)
+  V->>V: wait up to 1 s for the op lock, else busy; hold it until touch up
+  V->>X: one JSON line on stdin per touch, key or button
+  U->>V: touch move, touch up
+  V->>X: move, up; release the op lock
 ```
 
-- One AXe process serves every viewer of a lease. A tokio watch channel holds the newest frame, so a slow viewer skips frames and never queues them. Identical frames (static screen) are skipped at the capture side to save bandwidth. A frame over 16 MiB ends the stream. Each frame carries a `captured_at_ms` timestamp (Unix ms when the daemon received it from AXe).
-- The stream starts with the first viewer and stops when the last one leaves or the lease ends: its cancellation token is a child of the lease's. If AXe exits while someone watches, Seiji starts it again after 1 s.
-- While someone watches, Seiji touches the lease every 60 s, so a watched device is not released as idle. Every 30 s, Seiji logs a structured line with the stream's capture fps, mean frame bytes and subscriber count.
-- Input takes the lease's op lock like a tool call, so it never interleaves with a run. Taps and swipes map the picture's fractions to points with the screen size from the root frame of the accessibility tree, cached per lease. The `paste` input puts text on the simulator clipboard with `axe clipboard copy` and presses Cmd+V into the focused field, so any character goes through; when the clipboard cannot be set, it types the text (US keyboard characters only). The `paste_and_type` input types it character by character through AXe.
-- A controller can pick a quality preset (`smooth`, `balanced`, `sharp`) that restarts the AXe stream with new fps, scale and quality. The preset applies to the shared stream for all viewers. `GET /view/s/{sid}/stats` and a toggleable overlay in the page show per-frame stats (received fps, frame size, bitrate, resolution, frame age, stalled indicator).
+- One helper process serves every viewer of a lease. A tokio broadcast channel carries each format and frame, built once, to every viewer. A viewer that falls behind the channel, or whose oldest unacknowledged frame is older than its base round trip plus 200 ms, skips frames until it catches up and resumes at a keyframe. Congestion also cuts the shared bitrate (see [mcp.md](mcp.md#the-stream)).
+- The helper's output is untrusted (it runs as the tenant): Seiji checks the framing, a message is at most 4 MiB, and a `format` must have an `avc1.` codec, sizes of 2–8192 and a base64 record. The shared buffer keeps at most 32 messages, so one watched lease holds at most 128 MiB of video.
+- The stream starts with the first viewer and stops when the last one leaves or the lease ends: its cancellation token is a child of the lease's. If the helper exits while someone watches, Seiji starts it again after 1 s.
+- While someone watches, Seiji touches the lease every 60 s, so a watched device is not released as idle. Every 30 s, Seiji logs a structured line with the stream's fps, kbit/s, bitrate and viewer count.
+- Input takes the lease's op lock like a tool call, so it never interleaves with a run; a gesture holds it from touch down to touch up. Each viewer's input runs in order in its own task, apart from the video, so a slow input never stalls the picture. Touches, keys and buttons go to the helper's persistent HID connection; text goes through AXe (`type`, and `paste`: `axe clipboard copy` and then Cmd+V through the helper). Before AXe types, Seiji waits until the helper has the inputs sent before.
+- A controller can pick a quality preset (`smooth`, `balanced`, `sharp`) that changes the helper's fps, scale and bitrate without a restart. The preset applies to the shared stream for all viewers. `GET /view/s/{sid}/stats` and a toggleable overlay in the page show stream stats (fps, bitrate, resolution, codec, round trip, frame age).
 - Tickets and sessions live in memory. The reaper prunes expired ones every 15 s.
 
 ## Evidence data flow
@@ -379,7 +384,7 @@ Under `shared`, the tenant run dir is in `<dataDir>/tenants/<user>/leases/<lease
 
 With `isolation.mode: "os_user"`, the daemon account never runs a device command itself. Each command goes through this chain:
 
-1. The Runner starts `/usr/bin/sudo -n <isolation.helper> exec-as <tenant account> [--pidfile <file>] [--cwd <dir>] --env PATH=<path> [--env KEY=VALUE ...] -- <program> <args...>`. `-n` makes sudo fail instead of asking for a password. The sudo process leads a new process group. Its stdin is either nothing or a file that the daemon opened (this is how builds, flows, typed text and push payloads reach the tenant account). Its stdout is a pipe, or a file that the daemon opened (the log stream of a run).
+1. The Runner starts `/usr/bin/sudo -n <isolation.helper> exec-as <tenant account> [--pidfile <file>] [--cwd <dir>] --env PATH=<path> [--env KEY=VALUE ...] -- <program> <args...>`. `-n` makes sudo fail instead of asking for a password. The sudo process leads a new process group. Its stdin is nothing, a file that the daemon opened (this is how builds, flows, typed text and push payloads reach the tenant account), or a pipe that the daemon writes JSON lines to (the viewer's screen helper). Its stdout is a pipe, or a file that the daemon opened (the log stream of a run).
 2. sudo allows only `/usr/local/bin/seiji exec-as *` and `/usr/local/bin/seiji kill-as *` for `seiji`, with `env_reset`.
 3. `exec-as` runs as root. It refuses to run unless the effective uid is 0 ("must run as root (through sudo)"). It validates the tenant account (see [security.md](security.md#root-helper-invariants)): it exists, its uid is 501 or higher, it is in `seiji-tenants`, and it is not in the admin group (gid 80).
 4. `exec-as` replaces itself with `/bin/launchctl asuser <uid> <own binary> exec-drop <tenant account> ...` and the same arguments. The command now runs in the tenant account's per-user launchd domain, where that account's CoreSimulatorService lives.
@@ -546,6 +551,10 @@ On iOS, Seiji drives the screen with [AXe](https://github.com/cameroncooke/AXe) 
 - AXe answers in JSON with typed error codes (for example `elementNotFound`), so a failed step has a precise error, and `describe-ui` gives the accessibility tree that selectors and failure trees use.
 - AXe arguments use the `--key=value` form, so a label that starts with `-` never becomes a flag. Typed text never reaches the command line: `axe type --stdin` reads it from a daemon-owned file.
 - `simctl` and `xcodebuild` are Apple's own tools. Video, logs, crash reports, device settings and XCUITest results use the formats that iOS developers already read (`.mp4`, unified log, `.ips`, `.xcresult`).
+
+### A screen helper for the viewer, not AXe
+
+AXe starts a process for each input, loads the simulator frameworks and reads the screen's orientation through accessibility each time: about 1.2 s per tap on an M5. That is fine for an agent's steps and too slow for a person dragging a list. Its `stream-video` for simulators is JPEG only. The viewer uses `seiji-sim` (`sim/`) instead: one process per watched lease keeps a `SimDeviceLegacyHIDClient` open (a touch line on stdin reaches the HID in under 1 ms) and encodes the framebuffer as H.264 with VideoToolbox (about 2–3 Mbit/s at 30 fps for half the pixels of an iPhone, where JPEG needs several times more). It talks to the private frameworks the way [idb](https://github.com/facebook/idb) and [serve-sim](https://github.com/expo/serve-sim) do. AXe still types text, sets the clipboard and drives every agent step.
 
 The cost: AXe drives the simulator through Apple's private accessibility and HID frameworks. It supports Xcode 26 and 27, and a new Xcode can break it until AXe ships a fix. `seiji doctor` runs `axe --version` and an accessibility read, so an operator sees the break before users do. Not verified on a real host: AXe and `recordVideo` as a tenant account through `exec-as` (`seiji doctor <user>` checks both), and the exact JSON shape of `xcresulttool get test-results tests` (the parser is tolerant: a shape it does not know gives no step records, not an error).
 

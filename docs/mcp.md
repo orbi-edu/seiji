@@ -1782,7 +1782,7 @@ The tunnel ends when the client closes the WebSocket, the WebSocket breaks, the 
 
 ## Viewer routes
 
-The viewer shows a lease's screen live in a browser or in Tern, and can send input to it. It works on iOS simulators only. [tern.md](tern.md) covers its use. [security.md](security.md#the-viewer) covers the ticket, the cookie and every check. [configuration.md](configuration.md#viewer) covers the frame rate, scale, quality and limits.
+The viewer shows a lease's screen live in a browser or in Tern, and can send input to it. It works on iOS simulators only. [tern.md](tern.md) covers its use. [security.md](security.md#the-viewer) covers the ticket, the cookie and every check. [configuration.md](configuration.md#viewer) covers the frame rate, scale, bitrate and limits.
 
 These routes take no bearer token. `GET /view/open/{ticket}` trades a ticket (single use, 60 s) for a viewer session: it answers `303` to `/view/s/{sid}/` and sets the `seiji_view` cookie, scoped to `/view/s/<sid>`. Every other route needs that cookie.
 
@@ -1791,61 +1791,71 @@ These routes take no bearer token. `GET /view/open/{ticket}` trades a ticket (si
 | `GET /view/open/{ticket}` | `303` to the page with the session cookie. A used or expired ticket gets a `401` HTML page |
 | `GET /view/s/{sid}/` | The viewer page |
 | `GET /view/assets/viewer.js`, `GET /view/assets/viewer.css` | The page's script and style, embedded in the binary |
-| `GET /view/s/{sid}/info` | JSON: `lease_id`, `user`, `model`, `device_type`, `runtime`, `udid`, `started_at`, `ends_at_latest`, `control`, `busy` (a run holds the device), `viewers`, `fps`, `app`, `preset`, `stream_opts` |
-| `GET /view/s/{sid}/stats` | JSON: `stream` (server-side capture stats: `started_at_ms`, `fps`, `mean_frame_bytes`, `total_frames`, `total_bytes`, `subscribers`, `last_frame_at_ms`), `preset`, `opts` (`fps`, `scale`, `quality`) |
-| `GET /view/s/{sid}/stream` | `multipart/x-mixed-replace; boundary=seijiframe`, one JPEG part per frame. Each part carries `Content-Type`, `Content-Length` and `X-Capture-Time` (Unix ms when the daemon received the frame) headers |
-| `POST /view/s/{sid}/input` | `204`. Needs the header `X-Seiji-View: 1` |
-| `POST /view/s/{sid}/preset` | JSON with the applied `preset` and `opts`. Needs `X-Seiji-View: 1` and a control session. Body: `{"preset": "smooth"|"balanced"|"sharp"}`. Restarts the stream with the new quality/fps/scale |
+| `GET /view/s/{sid}/info` | JSON: `lease_id`, `user`, `model`, `device_type`, `runtime`, `udid`, `started_at`, `ends_at_latest`, `control`, `busy` (a run holds the device), `viewers`, `app`, `preset`, `stream_opts` (`fps`, `scale`, `bitrate`), `server_time_ms` |
+| `GET /view/s/{sid}/stats` | JSON: `stream` (`started_at_ms`, `fps`, `kbps`, `mean_frame_bytes`, `total_frames`, `total_bytes`, `viewers`, `last_frame_at_ms`), `preset`, `opts` (`fps`, `scale`, `bitrate` now) |
+| `GET /view/s/{sid}/ws` | The WebSocket of the page: the stream out, the input in (below). The `Origin` header, when present, must name this host |
 | `GET /view/s/{sid}/screenshot.jpg` | A JPEG download of the screen |
 
-Errors are JSON, `{"error": {"code": "<code>", "message": "<text>"}}`:
+Errors are JSON, `{"error": {"code": "<code>", "message": "<text>"}}`. On the WebSocket they are text messages `{"t": "error", "code", "message"}`, with the `id` of the input they answer when it has one:
 
 | Status | `code` | Cause |
 |---|---|---|
 | `401` | `expired` | No session, a wrong cookie, an expired session, or a disabled or removed user. Open a new link |
 | `410` | `gone` | The lease was released, or is booting or being released |
-| `409` | `busy` | Input while a run or another input holds the device. Input waits up to 1 s for the lease's operation lock |
+| `409` | `busy` | Input while a run or another viewer's gesture holds the device. Input waits up to 1 s for the lease's operation lock |
 | `403` | `view_only` | Input or a preset change in a view-only session |
+| `403` | `cross_origin` | A WebSocket from a page on another site |
 | `429` | `full` | The lease already has `viewer.maxViewersPerLease` streams |
-| `400` | `bad_request` | No `X-Seiji-View: 1` header, or a bad input/preset body |
+| `400` | `bad_request` | A bad message, coordinates outside 0–1, or text outside 1–10 000 bytes |
+
+The WebSocket closes with code `4401` when the session expires or its user (or the admin who opened it) is disabled or removed, and `4410` when the lease ends. The reason is the message above. Seiji checks the session again every 2 s.
 
 ### The stream
 
-Seiji runs one `axe stream-video --format=raw` process for each watched lease and sends its frames to every viewer. A slow viewer skips frames; it never queues them. Identical frames (static screen) are skipped at the capture side to save bandwidth. The process starts with the first viewer and stops when the last one leaves or the lease ends. If AXe exits while someone watches, Seiji starts it again after 1 s. While someone watches, Seiji touches the lease every 60 s, so a watched device is not released as idle. Every 30 s, Seiji logs a structured line with the stream's capture fps, mean frame bytes and subscriber count.
+Seiji runs one [`seiji-sim`](configuration.md#viewer) helper for each watched lease, as the user's account. It reads the simulator's framebuffer, encodes it as H.264 with VideoToolbox (no B-frames, a keyframe on request and every 2 s while the screen moves) and keeps one HID connection open for input. A static screen produces no frames. The helper starts with the first viewer and stops when the last one leaves or the lease ends. If it exits while someone watches, Seiji starts it again after 1 s. While someone watches, Seiji touches the lease every 60 s, so a watched device is not released as idle. Every 30 s, Seiji logs a structured line with the stream's fps, kbit/s, bitrate and viewer count.
 
-Each MJPEG part includes an `X-Capture-Time` header (Unix milliseconds). The viewer page reads the stream with `fetch()` and parses the multipart parts to extract per-frame capture timestamps and display a stats overlay.
+The server sends:
+
+- A text message `{"t": "format", "codec": "avc1.PPCCLL", "width", "height", "description": "<base64 avcC>"}` before the first frame and after a size change: the arguments of WebCodecs `VideoDecoder.configure`.
+- One binary message for each frame: 1 byte of flags (bit 0: keyframe), the frame number (4 bytes, big-endian), the capture time in Unix microseconds (8 bytes, big-endian), then the sample in AVCC form (a 4-byte length before each NAL unit).
+- `{"t": "pong", "at", "server_ms"}` for each ping, `{"t": "preset", "preset", "opts"}` after a preset change, and `{"t": "done", "id", "via"}` after a text input.
+
+The page acknowledges each frame with `{"t": "ack", "seq": <frame number>}` once it has shown it (a frame it skips, once it skipped it), so a slow decoder holds the stream back like a slow link. A viewer whose oldest unacknowledged frame is older than its lowest round trip of the last 10 s plus 200 ms (or 60 frames are in flight) is congested: Seiji sends it no more frames until it catches up, then asks the helper for a keyframe and resumes there. So a slow link shows a recent picture with gaps, never a growing delay. A joining viewer gets the current format and a keyframe at once; a viewer that fell behind the shared buffer gets the current format again if it missed one. A page that reads nothing for 5 s is closed, and input still queued for it is dropped.
+
+A congested viewer also lowers the shared bitrate to 70 %, at most every 2 s and never below 20 % of the preset. After 4 s without congestion the bitrate grows 15 % every 2 s, back to the preset.
 
 ### Quality presets
 
-A controller can pick a quality preset from the toolbar. Presets apply to the shared stream (all viewers see the change). The last controller's choice restarts the AXe capture with new options.
+A controller can pick a quality preset from the toolbar: `{"t": "preset", "name": "smooth" | "balanced" | "sharp"}`. Presets apply to the shared stream (all viewers see the change) without restarting it.
 
-| Preset | `fps` | `scale` | `quality` |
+| Preset | `fps` | `scale` | `bitrate` |
 |---|---|---|---|
-| `smooth` | 15 | 0.3 | 50 |
-| `balanced` | config default | config default | config default |
-| `sharp` | 5 | 0.8 | 85 |
+| `smooth` | `viewer.fps` | `viewer.scale`, at most 0.35 | half of `viewer.bitrateKbps` |
+| `balanced` | `viewer.fps` | `viewer.scale` | `viewer.bitrateKbps` |
+| `sharp` | `viewer.fps` | `viewer.scale`, at least 0.8 | twice `viewer.bitrateKbps`, at most 20 Mbit/s |
 
 ### Input
 
-The body of `POST /view/s/{sid}/input` is `{"input": {...}, "aspect": <width / height>}`. `aspect` is optional: the picture's aspect ratio. `x` and `y` are fractions (0 to 1) of the picture. Seiji maps them to points with the screen size from the root frame of the accessibility tree. It caches the size for each lease and reads it again when `aspect` differs by more than 3 % (a rotation).
+The page sends text messages, each a JSON object with `t`. Points are fractions (0 to 1) of the picture, top left at (0, 0). Touches, keys and buttons go through the helper's HID connection, one message at a time and in order; text goes through AXe.
 
-| `kind` | Fields | Effect |
+| `t` | Fields | Effect |
 |---|---|---|
-| `tap` | `x`, `y`, `hold` (optional, seconds) | A tap. A `hold` of 0.35 s or more is a long press, at most 10 s |
-| `swipe` | `x1`, `y1`, `x2`, `y2`, `duration` (optional, 0.05–5 s, default 0.3) | A swipe |
-| `type` | `text` (1–10 000 bytes) | Types the text through `axe type --stdin`, from a scratch file in `<dataDir>/run/` that Seiji deletes after the input |
-| `key` | `code` | One HID key (usage code) |
-| `button` | `name` | A hardware button, for example `home` or `lock` |
-| `paste` | `text` (1–10 000 bytes) | Puts the text on the simulator clipboard (`axe clipboard copy`) and presses Cmd+V into the focused field, so accents and emoji go through. If the clipboard cannot be set, types the text instead (US keyboard characters only). Answers `200 {"via": "pasted"}` or `200 {"via": "typed"}` |
-| `paste_and_type` | `text` (1–10 000 bytes) | Types the text character by character (same as `type`), for fields that refuse paste |
+| `touch` | `phase` (`down`, `move`, `up`), `x`, `y`, `edge` (optional on `down`: `top`, `bottom`, `left`, `right`) | A finger. `down` takes the lease's operation lock and holds it until `up`, so a run cannot interleave with the gesture. A finger left down 10 s without a move, or when the page goes away, is lifted. `edge` marks a system gesture from that screen edge (the home indicator, Notification Centre) |
+| `key` | `usage` (HID page 7), `mods` (optional, up to 4 of 224–231) | Presses the key with the modifiers held |
+| `button` | `name` (`home`, `lock`) | A hardware button |
+| `type` | `id`, `text` (1–10 000 bytes) | Types the text through `axe type --stdin`, from a scratch file in `<dataDir>/run/` that Seiji deletes after the input (US keyboard characters only). Answers `done` |
+| `paste` | `id`, `text` (1–10 000 bytes) | Puts the text on the simulator clipboard (`axe clipboard copy`) and presses Cmd+V, so accents and emoji go through. If the clipboard cannot be set, types the text instead. Answers `done` with `via`: `pasted` or `typed` |
+| `paste_and_type` | `id`, `text` (1–10 000 bytes) | Types the text (same as `type`), for fields that refuse paste |
+| `preset` | `name` | See [Quality presets](#quality-presets) |
+| `ack` | `seq` | The last frame shown (or skipped) |
+| `keyframe` | | The page dropped frames (its decoder fell behind or was reset): start over at a keyframe. Also allowed in a view-only session |
+| `ping` | `at` | Echoed back in a `pong` |
 
-Each input restarts the idle timer. Viewer input is not recorded as a run.
+Input restarts the idle timer. Viewer input is not recorded as a run.
 
 ```json
-{"input": {"kind": "tap", "x": 0.5, "y": 0.5}, "aspect": 0.46}
+{"t": "touch", "phase": "down", "x": 0.5, "y": 0.5}
 ```
-
-On a 402×874 screen, this tap lands at (201, 437).
 
 ## Client setup
 

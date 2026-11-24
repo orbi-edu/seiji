@@ -462,6 +462,12 @@ async fn doctor(config: Config, name: &str, platform: Platform) -> Result<()> {
         step("axe --version");
         let spec = CmdSpec::new(&config.axe.bin).arg("--version");
         print!("{}", runner.run(&account, spec, Duration::from_secs(30), &never).await?.check("axe --version")?.text());
+        step("seiji-sim --version");
+        let spec = CmdSpec::new(&config.viewer.sim_bin).arg("--version");
+        print!(
+            "{}",
+            runner.run(&account, spec, Duration::from_secs(30), &never).await?.check("seiji-sim --version")?.text()
+        );
     }
 
     let model =
@@ -502,6 +508,8 @@ async fn doctor(config: Config, name: &str, platform: Platform) -> Result<()> {
             let count = seiji::actions::nodes(&tree).len();
             anyhow::ensure!(count > 0, "simulator returned an empty accessibility tree");
             println!("{count} elements");
+            step("screen session (seiji-sim: capture, H.264, HID)");
+            println!("{}", screen_session(&devices, &ctx, &config.viewer).await?);
             step("video and log capture (3 s)");
             let dir = ctx.dir().join("doctor");
             let mkdir = CmdSpec::new("/bin/mkdir").arg("-p").arg(&dir);
@@ -535,4 +543,46 @@ async fn doctor(config: Config, name: &str, platform: Platform) -> Result<()> {
         platform.as_str()
     );
     Ok(())
+}
+
+/// Starts the viewer's screen helper as the tenant and waits for its first keyframe.
+async fn screen_session(devices: &HostDevices, ctx: &DeviceCtx, viewer: &seiji::config::Viewer) -> Result<String> {
+    use seiji::devices::{ScreenEvent, StreamOpts};
+    let opts = StreamOpts { fps: viewer.fps, scale: viewer.scale, bitrate: viewer.bitrate_kbps * 1000 };
+    let (_commands, rx) = tokio::sync::mpsc::channel(8);
+    let (tx, mut events) = tokio::sync::mpsc::channel(64);
+    let stop = CancellationToken::new();
+    let started = std::time::Instant::now();
+    let wait = async {
+        let mut format = None;
+        while let Some(event) = events.recv().await {
+            match event {
+                ScreenEvent::Format(f) => format = Some(f),
+                ScreenEvent::Frame(f) if f.key => {
+                    let setup = format.context("a frame came before the format")?;
+                    return Ok(format!(
+                        "{} {}x{}, first keyframe {} bytes after {:.1}s",
+                        setup.codec,
+                        setup.width,
+                        setup.height,
+                        f.data.len(),
+                        started.elapsed().as_secs_f64()
+                    ));
+                }
+                ScreenEvent::Warning(w) => println!("warning: {w}"),
+                _ => {}
+            }
+        }
+        bail!("seiji-sim stopped before its first keyframe")
+    };
+    let (run, result) = tokio::join!(devices.screen(ctx, opts, rx, tx, &stop), async {
+        let r = tokio::time::timeout(Duration::from_secs(20), wait).await;
+        stop.cancel();
+        r.context("no keyframe within 20 s")?
+    });
+    match (run, result) {
+        (_, Ok(summary)) => Ok(summary),
+        (Err(e), Err(_)) => Err(e),
+        (Ok(()), Err(e)) => Err(e),
+    }
 }

@@ -58,7 +58,7 @@ Seiji reads one JSON file, `seiji.json`. This document is the reference for ever
 | `maestro.flowTimeoutSeconds` (when `maestro` is set), `appRetentionHours` and `maxBuildsPerUser` are above 0 | `maestro.flowTimeoutSeconds, appRetentionHours and maxBuildsPerUser must be > 0` |
 | `evidence.retentionHours`, `evidence.maxRunSeconds`, `evidence.maxSteps`, `evidence.maxRunBytes` and `evidence.maxBytesPerUser` are above 0 | `evidence.retentionHours, maxRunSeconds, maxSteps, maxRunBytes and maxBytesPerUser must be > 0` |
 | `axe.stepTimeoutSeconds` and `xctest.timeoutSeconds` are above 0 | `axe.stepTimeoutSeconds and xctest.timeoutSeconds must be > 0` |
-| `viewer.fps` is within 1–30, `viewer.scale` within 0.1–1, `viewer.quality` within 1–100, and `viewer.maxViewersPerLease` and `viewer.sessionHours` are above 0 | `viewer: fps 1-30, scale 0.1-1, quality 1-100, maxViewersPerLease and sessionHours must be > 0` |
+| `viewer.fps` is within 1–60, `viewer.scale` within 0.1–1, `viewer.bitrateKbps` within 100–20000, and `viewer.maxViewersPerLease` and `viewer.sessionHours` are above 0 | `viewer: fps 1-60, scale 0.1-1, bitrateKbps 100-20000, maxViewersPerLease and sessionHours must be > 0` |
 | `forward.maxPerLease` is above 0 | `forward.maxPerLease must be > 0` |
 | `listen.publicUrl`, when set, starts with `https://` or `http://` | `listen.publicUrl must start with https:// or http://` |
 | Every name in `adminUsers` is a valid user name (1–32 chars of `[a-z0-9-]`) | `adminUsers: "<name>" is not a valid user name (1-32 chars of [a-z0-9-])` |
@@ -262,13 +262,16 @@ Optional section. The viewer shows a lease's screen live in a browser or in Tern
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `viewer.fps` | integer | `10` | Frames per second of the stream. 1–30. |
+| `viewer.simBin` | path | `"/usr/local/bin/seiji-sim"` | The screen helper, built from `sim/` ([install.md](install.md#3-build-and-install-the-binary)). Under `os_user` every tenant account must be able to read and run it. |
+| `viewer.fps` | integer | `30` | Highest frames per second of the stream. A still screen sends none. 1–60. |
 | `viewer.scale` | number | `0.5` | Frame scale. `0.5` halves each side of the simulator's pixels. 0.1–1. |
-| `viewer.quality` | integer | `70` | JPEG quality of each frame. 1–100. |
+| `viewer.bitrateKbps` | integer | `2500` | Target H.264 bitrate in kbit/s, for the `balanced` preset. A congested viewer lowers it for a while ([mcp.md](mcp.md#the-stream)). 100–20000. |
 | `viewer.maxViewersPerLease` | integer | `4` | Viewer pages that may stream one lease at the same time. One more gets `429` `full`. Above 0. |
 | `viewer.sessionHours` | integer | `12` | Longest life of a viewer session (and of its cookie). A session also ends when its lease ends. Above 0. |
 
-Seiji runs one AXe process for each watched lease, however many viewers watch it: `<axe.bin> stream-video --udid=<udid> --format=raw --fps=<fps> --quality=<quality> --scale=<scale>`, through `Runner` as the user's account. It starts with the first viewer and stops when the last one leaves or the lease ends. Higher `fps`, `scale` and `quality` cost more CPU and bandwidth for each watched lease.
+Seiji runs one helper process for each watched lease, however many viewers watch it: `<viewer.simBin> session --udid <udid> --fps <fps> --scale <scale> --bitrate <bits per second>`, through `Runner` as the user's account. It starts with the first viewer and stops when the last one leaves or the lease ends. It also carries the viewers' touches, keys and buttons. Higher `fps`, `scale` and `bitrateKbps` cost more bandwidth for each viewer; encoding runs on the Mac's media engine.
+
+Before this version the viewer streamed JPEG and took `viewer.quality`. That key no longer exists: remove it from `seiji.json`, or the config does not load.
 
 ## `forward`
 
@@ -371,9 +374,10 @@ This is [`deploy/seiji.example.json`](../deploy/seiji.example.json): ten seats, 
     "timeoutSeconds": 3600
   },
   "viewer": {
-    "fps": 10,
+    "simBin": "/usr/local/bin/seiji-sim",
+    "fps": 30,
     "scale": 0.5,
-    "quality": 70,
+    "bitrateKbps": 2500,
     "maxViewersPerLease": 4,
     "sessionHours": 12
   },

@@ -9,7 +9,7 @@ All Seiji documents use these terms with these meanings only. [concepts.md](conc
 | **Admission** | The atomic check under the admission lock (budget, concurrency, capacity, ports) that creates a `booting` lease, or fails at once because Seiji has no queue. |
 | **Admission lock** | The in-process lock of `seiji serve` that makes admission atomic, so two calls cannot both take the last slot. |
 | **AVD** | An Android Virtual Device in `android.avdHome`; each Android model names one, and emulators start it with `-read-only` so all leases share it unchanged. |
-| **AXe** | The third-party CLI ([cameroncooke/AXe](https://github.com/cameroncooke/AXe), `axe.bin`) that taps, types, swipes and reads the accessibility tree of an iOS simulator through Apple's private accessibility and HID frameworks; `run_actions`, `inspect_screen` on iOS and the viewer use it. |
+| **AXe** | The third-party CLI ([cameroncooke/AXe](https://github.com/cameroncooke/AXe), `axe.bin`) that taps, types, swipes and reads the accessibility tree of an iOS simulator through Apple's private accessibility and HID frameworks; `run_actions`, `inspect_screen` on iOS and the viewer's text input use it. |
 | **Budget** | The monthly device-minutes of a user (`monthlyMinutes`), counted per UTC calendar month. |
 | **Budget (unlimited)** | When `monthlyUnlimited` is true, admission and the reaper skip the monthly budget check. The numeric `monthlyMinutes` is preserved for switching back, and usage is still metered. |
 | **Build** | An app file that a user uploaded (`POST /v1/apps`) or that Seiji downloaded (`install_app` with `url`), with the id `a_<12 hex>`, kept `appRetentionHours`, at most `maxBuildsPerUser` per user. |
@@ -48,7 +48,8 @@ All Seiji documents use these terms with these meanings only. [concepts.md](conc
 | **Token** | A user's credential, `sj_` plus 43 URL-safe base64 characters, sent as `Authorization: Bearer <token>` and stored only as its SHA-256. |
 | **Tunnel** | What `seiji forward` opens: a WebSocket to `GET /v1/leases/{lease_id}/forward` that carries every connection the device makes to its device address to one port on the developer's machine, such as Metro on `8081`; it ends with the client or the lease. |
 | **User** | A Seiji account with a token and a quota: a row in the `users` table. |
-| **Viewer** | The live view of a lease's iOS simulator screen in a browser or in Tern (`/view/…`), which can also send taps, swipes, typing and buttons; one AXe stream per lease serves every viewer of it. |
+| **Screen helper** | `seiji-sim` (`viewer.simBin`, source in `sim/`): one process per watched lease, run as the user's account, that encodes the simulator's screen as H.264 and sends the viewers' touches, keys and buttons over one persistent HID connection. |
+| **Viewer** | The live view of a lease's iOS simulator screen in a browser or in Tern (`/view/…`), which can also send touches, keys, text and buttons; one screen helper per lease serves every viewer of it over the page's WebSocket. |
 | **Viewer link** | The one-time URL `<publicUrl>/view/open/<ticket>` from `share_screen` (view-only by default), `POST /v1/leases/{lease_id}/viewer` (control by default) or, for an admin, `POST /v1/admin/leases/{lease_id}/viewer` (view-only by default), valid 60 s. |
 | **Viewer session** | What an opened viewer link becomes: a session id and a secret in the `seiji_view` cookie, kept in memory as a SHA-256, view-only or with control, ending at `viewer.sessionHours`, at the lease's end or at a daemon restart. |
 | **Workspace** | The root of a user's files on the host: `~<tenant account>/seiji` under `os_user`, `<dataDir>/tenants/<user>` under `shared`. |
