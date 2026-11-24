@@ -267,8 +267,20 @@ local function user_devices(state: any, A: any, u: any): Node
 		end
 		table.insert(rows, ui.node("row", { key = key_of(d.lease_id), gap = "sm", align = "center", wrap = true }, parts))
 	end
+	local err = state.errs.admin_leases
+	local loaded = type(state.data.admin_leases) == "table"
 	if #rows == 0 then
-		table.insert(rows, h.with(h.muted("No devices."), { key = "none" }))
+		-- "No devices" only after a list came back; a failed first read says why instead.
+		if loaded then
+			table.insert(rows, h.with(h.muted("No devices."), { key = "none" }))
+		elseif err then
+			table.insert(rows, h.with(ui.text({ ui.span("Could not load devices: " .. err, "error") }), { key = "err" }))
+		else
+			table.insert(rows, h.with(h.muted("Loading devices…"), { key = "loading" }))
+		end
+	end
+	if loaded and err then
+		table.insert(rows, h.with(h.muted("Could not refresh: " .. err), { key = "stale" }))
 	end
 	return h.card("devices", { ui.span("Devices", "strong") }, rows)
 end

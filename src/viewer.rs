@@ -2,11 +2,13 @@
 //! block, or any browser).
 //!
 //! A user with a token asks for a viewer link (`POST /v1/leases/{id}/viewer` or the
-//! `share_screen` tool). The link carries a one-time ticket that lives 60 s. Opening it trades the
-//! ticket for a session: a random id in the path and a random secret in an `HttpOnly`,
-//! `SameSite=Strict` cookie scoped to that path. Every request checks the session, its user and
-//! that the lease is still the user's and ready. One AXe stream per lease fans out to all its
-//! viewers and stops when the last one leaves or the lease ends.
+//! `share_screen` tool), or an admin for any user's lease (`POST /v1/admin/leases/{id}/viewer`).
+//! The link carries a one-time ticket that lives 60 s. Opening it trades the ticket for a
+//! session: a random id in the path and a random secret in an `HttpOnly`, `SameSite=Strict`
+//! cookie scoped to that path. Every request checks the session, its user (and the admin who
+//! asked for a link to another user's lease) and that the lease is still the user's and ready.
+//! One AXe stream per lease fans out to all its viewers and stops when the last one leaves or the
+//! lease ends.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -59,7 +61,7 @@ struct Ticket {
     /// The lease's owner: the session acts as this user's account.
     user_id: i64,
     /// Who asked for the link: the owner, or an admin.
-    viewer_id: i64,
+    requester_id: i64,
     lease_id: String,
     control: bool,
     expires: i64,
@@ -68,7 +70,7 @@ struct Ticket {
 struct Session {
     secret_sha256: String,
     user_id: i64,
-    viewer_id: i64,
+    requester_id: i64,
     lease_id: String,
     control: bool,
     expires: i64,
@@ -222,7 +224,8 @@ impl Pool {
     }
 
     /// A one-time link to any user's ready iOS lease, for an admin. The session acts as the
-    /// lease's owner and ends when the admin loses admin access or is disabled.
+    /// lease's owner. For another user's lease it also ends when the admin is disabled or
+    /// removed; on the admin's own lease it is the owner's session like any other.
     pub fn create_admin_viewer(&self, admin: &User, lease_id: &str, control: bool) -> anyhow::Result<ViewerLink> {
         let admin = self.fresh_user(admin)?;
         if !self.config.admin_users.contains(&admin.name) {
@@ -234,7 +237,7 @@ impl Pool {
         Ok(link)
     }
 
-    fn issue_ticket(&self, viewer_id: i64, lease: Lease, control: bool) -> anyhow::Result<ViewerLink> {
+    fn issue_ticket(&self, requester_id: i64, lease: Lease, control: bool) -> anyhow::Result<ViewerLink> {
         if lease.platform != Platform::Ios {
             anyhow::bail!("the screen viewer supports iOS simulators only for now");
         }
@@ -243,7 +246,7 @@ impl Pool {
             ticket.clone(),
             Ticket {
                 user_id: lease.user_id,
-                viewer_id,
+                requester_id,
                 lease_id: lease.id.clone(),
                 control,
                 expires: now() + TICKET_SECONDS,
@@ -271,7 +274,7 @@ impl Pool {
             Session {
                 secret_sha256: sha256_hex(&secret),
                 user_id: t.user_id,
-                viewer_id: t.viewer_id,
+                requester_id: t.requester_id,
                 lease_id: t.lease_id,
                 control: t.control,
                 expires: now() + lifetime,
@@ -282,18 +285,18 @@ impl Pool {
 
     fn viewing(&self, sid: &str, headers: &HeaderMap) -> Result<Viewing, ViewError> {
         let secret = cookie(headers).ok_or(ViewError::Unauthorized)?;
-        let (user_id, viewer_id, lease_id, control) = {
+        let (user_id, requester_id, lease_id, control) = {
             let sessions = self.viewers.sessions.lock().expect("sessions mutex");
             let s = sessions.get(sid).ok_or(ViewError::Unauthorized)?;
             if s.expires <= now() || s.secret_sha256 != sha256_hex(secret) {
                 return Err(ViewError::Unauthorized);
             }
-            (s.user_id, s.viewer_id, s.lease_id.clone(), s.control)
+            (s.user_id, s.requester_id, s.lease_id.clone(), s.control)
         };
         let user = self.store.user_by_id(user_id)?.filter(|u| !u.disabled).ok_or(ViewError::Unauthorized)?;
-        if viewer_id != user_id {
+        if requester_id != user_id {
             self.store
-                .user_by_id(viewer_id)?
+                .user_by_id(requester_id)?
                 .filter(|a| !a.disabled && self.config.admin_users.contains(&a.name))
                 .ok_or(ViewError::Unauthorized)?;
         }

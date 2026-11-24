@@ -134,6 +134,25 @@ async fn an_admin_lists_every_device_and_watches_any_of_them() {
     assert_eq!(admin_link(&env, &alice, "l_000000000000", None).await.status(), 404);
     assert_eq!(admin_link(&env, &alice, &lease, Some(json!({"role": "x"}))).await.status(), 400);
 
+    // A disabled owner's lease, or one still booting, gets no admin link.
+    env.pool.store.set_disabled("bob", true).unwrap();
+    assert_eq!(admin_link(&env, &alice, &lease, None).await.status(), 404);
+    env.pool.store.set_disabled("bob", false).unwrap();
+    add_user(&env, "carol", QUOTA);
+    let carol = env.pool.store.user_by_name("carol").unwrap().unwrap();
+    env.fake.hang_boot.store(true, Ordering::SeqCst);
+    let pool = env.pool.clone();
+    let acquire = tokio::spawn(async move { pool.acquire(&carol, seiji::config::Platform::Ios, None).await });
+    env.fake.boot_entered.notified().await;
+    let booting = env.pool.store.active_leases().unwrap().into_iter().find(|l| l.id != lease).unwrap().id;
+    let resp = admin_link(&env, &alice, &booting, None).await;
+    assert_eq!(resp.status(), 404);
+    let refused: Value = resp.json().await.unwrap();
+    assert!(refused["error"].as_str().unwrap().contains("still booting"), "{refused}");
+    assert!(env.pool.release(&booting, "released").await.unwrap());
+    assert!(acquire.await.unwrap().is_err());
+    env.fake.hang_boot.store(false, Ordering::SeqCst);
+
     // View-only by default: the session shows bob's device and refuses input.
     let resp = admin_link(&env, &alice, &lease, None).await;
     assert_eq!(resp.status(), 200);

@@ -258,7 +258,7 @@ Optional section.
 
 ## `viewer`
 
-Optional section. The viewer shows a lease's screen live in a browser or in Tern, and can send taps, swipes, typing and buttons to it ([tern.md](tern.md), [security.md](security.md#the-viewer)). It works on iOS simulators only. A viewer link comes from `share_screen` or `POST /v1/leases/{lease_id}/viewer` ([mcp.md](mcp.md)).
+Optional section. The viewer shows a lease's screen live in a browser or in Tern, and can send taps, swipes, typing and buttons to it ([tern.md](tern.md), [security.md](security.md#the-viewer)). It works on iOS simulators only. A viewer link comes from `share_screen`, `POST /v1/leases/{lease_id}/viewer`, or for an admin `POST /v1/admin/leases/{lease_id}/viewer` ([mcp.md](mcp.md)).
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|

@@ -315,6 +315,12 @@ async fn admin_watches_another_users_device_from_the_users_tab() {
     t.click_badge("Copy link").await;
     t.wait_text("Copied a view-only link to bob's iphone-16", "sf-dock").await;
 
+    // Control opens a screen with control.
+    t.click_badge("Control").await;
+    t.wait_for("the screen taking focus", ".tn-pane.dim .sf-main", |s| !s.is_empty()).await;
+    t.ctl(&["click", ".tn-pane.dim .sf-main"]).await;
+    t.wait_text("Opening the screen of bob's iphone-16 beside this panel.", "sf-dock").await;
+
     assert_eq!(t.plugin_errors(), Vec::<String>::new());
     let _ = t.ctl(&["quit"]).await;
     let _ = tokio::time::timeout(Duration::from_secs(5), t.child.wait()).await;

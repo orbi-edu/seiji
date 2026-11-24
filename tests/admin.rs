@@ -60,6 +60,11 @@ async fn admin_endpoints_deny_unauthenticated_and_non_admin() {
         .await
         .unwrap();
     assert_eq!(no_token_put.status(), 401);
+    let no_token_leases = http().get(format!("{}/v1/admin/leases", env.url)).send().await.unwrap();
+    assert_eq!(no_token_leases.status(), 401);
+    let no_token_viewer =
+        http().post(format!("{}/v1/admin/leases/l_000000000000/viewer", env.url)).send().await.unwrap();
+    assert_eq!(no_token_viewer.status(), 401);
 
     // Non-admin -> 403.
     let bob_list = get_admin_users(&env.url, &bob_token).await;

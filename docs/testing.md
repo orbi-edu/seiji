@@ -63,7 +63,7 @@ CI (`.github/workflows/ci.yml`) runs on `macos-15` with `RUSTFLAGS=-D warnings`.
 | `tests/e2e.rs` | Leases, budgets, uploads, the reaper and `run_flow`. Real HTTP server, real MCP client, real SQLite and real `Pool` |
 | `tests/admin.rs` | Admin authorization (401/403), admin listing, admin PUT limits, `/v1/me` `is_admin`, unlimited budget admission and metering, zero-vs-unlimited, concurrency/capacity/time enforcement with unlimited budgets, CLI partial update preservation, and the SQLite migration |
 | `tests/runs.rs` | Recorded runs (`run_actions`, `run_xctest`), evidence files and hashes, the HTTP downloads, the evidence quota and retention, and the native device tools |
-| `tests/viewer.rs` | The viewer: viewer links and tickets, the session cookie, the page's CSP, the shared stream, input, and `share_screen` |
+| `tests/viewer.rs` | The viewer: viewer links (the owner's, an admin's, `share_screen`) and tickets, the session cookie, the page's CSP, the shared stream, input |
 | `tests/forward.rs` | `seiji forward`: the tunnel end to end over a real WebSocket, its refusals, and the real CLI pointing the app at the tunnel |
 | `tests/tern.rs` | The Tern plugin in a headless Tern (`tern serve`), with the real `seiji` CLI. Skips when `tern` is not on `PATH` |
 | `src/actions.rs` | Unit tests of selectors, `render_tree` and action validation |
@@ -96,7 +96,7 @@ Each test starts its own server on `127.0.0.1` and a free port. Tests that need 
 | Test | What it checks |
 |---|---|
 | `me_reflects_admin_status` | `GET /v1/me` returns `is_admin: true` for a user in `adminUsers` and `is_admin: false` for others. The quota includes `monthlyUnlimited` |
-| `admin_endpoints_deny_unauthenticated_and_non_admin` | No token gets `401` on both admin endpoints. A non-admin user gets `403`. An admin user gets `200` on the listing |
+| `admin_endpoints_deny_unauthenticated_and_non_admin` | No token gets `401` on every admin endpoint (`users`, `limits`, `leases`, the admin viewer link). A non-admin user gets `403`. An admin user gets `200` on the listing |
 | `admin_lists_users_with_capacity_and_usage` | The response contains all users with correct `monthly_minutes`, `monthly_unlimited`, `max_concurrent`, `max_lease_minutes`, `idle_minutes`, `used_minutes`, `active_devices`, `disabled` and `is_admin`. `capacity` and `in_use` match the server config |
 | `admin_updates_limits_and_persists` | A PUT changes `monthly_minutes`, `monthly_unlimited` and `max_concurrent`. The response carries the new values and preserves `max_lease_minutes` and `idle_minutes`. The database reflects the change |
 | `admin_update_rejects_bad_input_and_unknown_user` | Missing fields, negative `monthly_minutes`, zero `max_concurrent`, unknown fields and a nonexistent user id all return the correct 4xx status |
@@ -125,11 +125,12 @@ Each test starts with `ready_device`: a new user acquires an iOS device, uploads
 
 ### `tests/viewer.rs`
 
-Each test acquires an iOS device for a new user. The first three open viewer links with `POST /v1/leases/{lease_id}/viewer`; the last one uses `share_screen`.
+Each test acquires an iOS device for a new user and opens viewer links with `POST /v1/leases/{lease_id}/viewer`; the admin test uses `POST /v1/admin/leases/{lease_id}/viewer`, and `agents_share_a_view_only_link` uses `share_screen`.
 
 | Test | What it checks |
 |---|---|
 | `a_link_opens_one_session_for_its_owner_only` | `POST /v1/leases/{lease_id}/viewer` without a token gets `401`, and with Bob's token on Alice's lease `404`. Alice's link has `control: true` and `expires_in: 60`. The ticket opens once: `303`, then `401`. The page has a CSP with `default-src 'none'` and loads `/view/assets/viewer.js`. A request without the cookie, or with the forged cookie `seiji_view=00`, gets `401`. `info` returns the lease, `model: "iphone-16"`, `control: true` and `busy: false` |
+| `an_admin_lists_every_device_and_watches_any_of_them` | `GET /v1/admin/leases` is admin only and lists Bob's lease with `user: "bob"`. A non-admin gets `403` on the admin link, the owner route refuses the admin with `404`, an unknown lease gets `404`, a bad body `400`. A disabled owner's lease and a lease still booting get `404`. The admin link is view-only by default; its session shows Bob's device and refuses input. With `control: true` the admin's input reaches the device. Disabling the admin ends the admin's sessions, while Bob's own session keeps working |
 | `viewers_share_one_stream_until_the_lease_ends` | With `viewer.maxViewersPerLease: 2`, the stream is `multipart/x-mixed-replace; boundary=seijiframe`, and its first part is a `Content-Type: image/jpeg` frame. A second viewer streams too; a third gets `429`. The device layer started one stream for all viewers (`streams_started` is 1). After `release_device`, the stream ends and `info` gets `410` |
 | `input_maps_to_points_and_respects_view_only_and_runs` | A tap at `0.5, 0.5` reaches the device as `tap 201,437` on the fake's 402×874 screen. A tap with `hold: 0.8` is a long press. `type`, `key` and `button` inputs give `204`. A tap at `x: 2` gets `400`. Input without `X-Seiji-View` gets `400`. A view-only session gets `403`. While a `run_actions` call holds the device, input gets `409` and `info` shows `busy: true`; after the run, input works again |
 | `agents_share_a_view_only_link` | `share_screen` with no arguments returns `control: false`, and its link opens with `303` |
@@ -155,6 +156,7 @@ The test runs `tern serve` headless, with `tern-plugin/` as a fixture plugin. Th
 | `the_panel_opens_the_screen_beside_it_and_releases_the_device` | The devices panel lists the lease with `iphone-16` and `alice`. The status segment shows `Seiji` and `min left`. `o` opens a `/view/open/…` link in a browser pane beside the panel. `x` asks `Release iphone-16?`, and enter releases the lease: the panel shows `No devices` and the device was destroyed. Tern's log has no plugin errors |
 | `admin_sees_users_tab_edits_and_saves_limits` | An admin selects another user, edits concurrency and unlimited monthly budget through native controls, saves, and observes persisted quotas. The other user and finite session/idle limits remain unchanged |
 | `non_admin_does_not_see_users_tab_or_admin_data` | A normal user's tab navigation stays between Devices and Runs, without the Users tab or another user's data |
+| `admin_watches_another_users_device_from_the_users_tab` | An admin selects Bob in the Users tab and sees his lease. **Watch** opens a view-only screen beside the panel, **Copy link** copies a view-only link, and **Control** opens a screen with control |
 
 ### Unit tests
 
