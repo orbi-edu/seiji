@@ -1,7 +1,7 @@
 schema = 1
 id = "seiji"
 name = "Seiji"
-version = "0.1.0"
+version = "0.2.0"
 description = "Your Seiji simulators inside Tern: budget, devices, runs, and the live screen in Tern's browser."
 icon = "monitor"
 host = "host.luau"
