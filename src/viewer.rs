@@ -898,8 +898,15 @@ async fn session(live: Live, mut video: broadcast::Receiver<Video>, socket: WebS
         touched: None,
     };
     let stop = CancellationToken::new();
-    let reader =
-        tokio::spawn(read_page(stream, live.pool.clone(), hub.clone(), live.control, in_tx, out_tx.clone(), ctl_tx));
+    // Once the page is gone its queued input is dropped, even while a frame write still waits.
+    let gone = stop.clone().drop_guard();
+    let reader = tokio::spawn({
+        let reading = read_page(stream, live.pool.clone(), hub.clone(), live.control, in_tx, out_tx.clone(), ctl_tx);
+        async move {
+            let _gone = gone;
+            reading.await;
+        }
+    });
     let input = tokio::spawn(run_input(input, in_rx, out_tx, stop.clone()));
     let mut flow = Flow::new();
     // The format may be in the cache and in the channel both: send each one once.

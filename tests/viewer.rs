@@ -593,14 +593,34 @@ async fn a_burst_of_input_after_a_hiccup_arrives_whole_and_in_order() {
     assert_eq!(text(&mut ws).await, json!({"t": "done", "id": 3}), "no input was refused as busy");
     let log: Vec<String> =
         env.fake.log().into_iter().filter(|l| l.starts_with("touch") || l.starts_with("type")).collect();
-    assert_eq!(log.first().map(String::as_str), Some("touch down 0.00,0.50"));
-    assert_eq!(&log[log.len() - 2..], ["touch up 1.00,0.50", "type ok"]);
-    let xs: Vec<f64> = log[1..log.len() - 2]
-        .iter()
-        .map(|l| l.strip_prefix("touch move ").unwrap().split(',').next().unwrap().parse().unwrap())
-        .collect();
-    assert!(xs.windows(2).all(|w| w[0] <= w[1]), "moves out of order: {xs:?}");
-    assert_eq!(xs.last(), Some(&1.0));
+    let mut want = vec!["touch down 0.00,0.50".to_string()];
+    want.extend((1..=300).map(|i| format!("touch move {:.2},0.50", f64::from(i) / 300.0)));
+    want.extend(["touch up 1.00,0.50".to_string(), "type ok".to_string()]);
+    assert_eq!(log, want, "every message, in order");
+}
+
+#[tokio::test]
+async fn a_page_that_closes_on_a_stuck_link_runs_none_of_its_queued_input() {
+    let env = heavy_stream().await;
+    let (token, lease) = device(&env, "alice").await;
+    let mut ws = open(&env, &token, &lease, true).await.ws().await;
+    format(&mut ws).await;
+    // The page reads nothing, so the server's frame write waits. It queues 50 button presses
+    // (about 60 ms each) and then closes.
+    for _ in 0..50 {
+        ws.feed(tungstenite::Message::text(json!({"t": "button", "name": "home"}).to_string())).await.unwrap();
+    }
+    ws.feed(tungstenite::Message::Close(None)).await.unwrap();
+    ws.flush().await.unwrap();
+    let presses = || env.fake.log().iter().filter(|l| *l == "hid button home down").count();
+
+    // The presses that were still queued at the close never run, though the write still waits.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let at_close = presses();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(presses(), at_close, "queued input ran after the page closed");
+    assert!(at_close < 50, "all {at_close} presses ran before the close was read");
+    drop(ws);
 }
 
 #[tokio::test]
