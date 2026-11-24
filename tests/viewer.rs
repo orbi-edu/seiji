@@ -464,6 +464,165 @@ async fn a_finger_left_down_is_lifted_when_the_page_goes_away() {
     assert!(!is_err(&call(&c, "inspect_screen", json!({})).await));
 }
 
+/// Frames of 1 MiB at 60 fps: a page that stops reading fills its socket within a second.
+async fn heavy_stream() -> Env {
+    let env = setup_with(2, json!({"viewer": {"fps": 60}})).await;
+    env.fake.frame_bytes.store(1 << 20, Ordering::SeqCst);
+    env
+}
+
+#[tokio::test]
+async fn input_reaches_the_device_while_a_frame_is_stuck_on_a_slow_link() {
+    let env = heavy_stream().await;
+    let (token, lease) = device(&env, "alice").await;
+    let mut ws = open(&env, &token, &lease, true).await.ws().await;
+    format(&mut ws).await;
+    // The page reads nothing: the socket fills and the server's write waits.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    send(&mut ws, json!({"t": "touch", "phase": "down", "x": 0.2, "y": 0.5})).await;
+    send(&mut ws, json!({"t": "touch", "phase": "move", "x": 0.5, "y": 0.5})).await;
+    send(&mut ws, json!({"t": "touch", "phase": "up", "x": 0.8, "y": 0.5})).await;
+    send(&mut ws, json!({"t": "type", "id": 9, "text": "hi"})).await;
+    logged(&env, "type hi").await;
+    let log: Vec<String> = env.fake.log().into_iter().filter(|l| !l.starts_with("encode")).collect();
+    assert_eq!(log, ["touch down 0.20,0.50", "touch move 0.50,0.50", "touch up 0.80,0.50", "type hi"]);
+
+    // Once the link drains, the reply arrives.
+    assert_eq!(text(&mut ws).await, json!({"t": "done", "id": 9}));
+}
+
+#[tokio::test]
+async fn a_page_on_a_dead_link_is_closed_and_lets_the_device_go() {
+    let env = heavy_stream().await;
+    let (token, lease) = device(&env, "alice").await;
+    let mut ws = open(&env, &token, &lease, true).await.ws().await;
+    format(&mut ws).await;
+    send(&mut ws, json!({"t": "touch", "phase": "down", "x": 0.3, "y": 0.3})).await;
+    send(&mut ws, json!({"t": "touch", "phase": "move", "x": 0.3, "y": 0.7})).await;
+    logged(&env, "touch move 0.30,0.70").await;
+
+    // The socket stays open but nothing reads it. After the 5 s send timeout, not the 10 s
+    // gesture timeout, the finger is lifted and the device is free.
+    let started = std::time::Instant::now();
+    while !env.fake.log().iter().any(|l| l == "touch up 0.30,0.70") {
+        assert!(started.elapsed() < Duration::from_secs(8), "the finger is still down: {:?}", env.fake.log());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let c = client(&env, &token).await;
+    assert!(!is_err(&call(&c, "inspect_screen", json!({})).await));
+    drop(ws);
+}
+
+#[tokio::test]
+async fn a_long_steady_round_trip_keeps_the_frame_rate_and_bitrate() {
+    let env = setup_with(2, json!({"viewer": {"fps": 60}})).await;
+    let (token, lease) = device(&env, "alice").await;
+    let mut ws = open(&env, &token, &lease, false).await.ws().await;
+    format(&mut ws).await;
+    let (mut tx, mut rx) = ws.split();
+
+    // Each ack leaves 400 ms after its frame arrived, as over a 400 ms round trip.
+    let (acks, mut pending) = tokio::sync::mpsc::unbounded_channel::<(u32, tokio::time::Instant)>();
+    let acker = tokio::spawn(async move {
+        while let Some((seq, at)) = pending.recv().await {
+            tokio::time::sleep_until(at + Duration::from_millis(400)).await;
+            if tx.send(tungstenite::Message::text(json!({"t": "ack", "seq": seq}).to_string())).await.is_err() {
+                return;
+            }
+        }
+    });
+    let mut arrivals = Vec::new();
+    let window = tokio::time::Instant::now() + Duration::from_secs(3);
+    while let Ok(Some(Ok(m))) = tokio::time::timeout_at(window, rx.next()).await {
+        if let tungstenite::Message::Binary(b) = m {
+            let now = tokio::time::Instant::now();
+            acks.send((u32::from_be_bytes(b[1..5].try_into().unwrap()), now)).unwrap();
+            arrivals.push(now);
+        }
+    }
+    acker.abort();
+
+    assert!(arrivals.len() >= 120, "{} frames in 3 s at 60 fps", arrivals.len());
+    let gap = arrivals.windows(2).map(|w| w[1] - w[0]).max().unwrap();
+    assert!(gap < Duration::from_millis(300), "the stream stalled for {gap:?}");
+    let lowered: Vec<String> = env.fake.log().into_iter().filter(|l| l.starts_with("encode")).collect();
+    assert!(lowered.is_empty(), "a steady link lowered the bitrate: {lowered:?}");
+}
+
+#[tokio::test]
+async fn a_flapping_link_resumes_at_a_keyframe_and_never_leaves_a_finger_down() {
+    let env = setup(2).await;
+    let (token, lease) = device(&env, "alice").await;
+    let view = open(&env, &token, &lease, true).await;
+    for round in 0..3 {
+        let mut ws = view.ws().await;
+        format(&mut ws).await;
+        let (key, _) = frame(&mut ws).await;
+        assert!(key, "round {round}: a new socket starts at a keyframe");
+        let y = 0.1 + 0.2 * f64::from(round);
+        send(&mut ws, json!({"t": "touch", "phase": "down", "x": 0.5, "y": y})).await;
+        send(&mut ws, json!({"t": "touch", "phase": "move", "x": 0.6, "y": y})).await;
+        logged(&env, &format!("touch move 0.60,{y:.2}")).await;
+        // The connection drops mid-gesture.
+        drop(ws);
+        logged(&env, &format!("touch up 0.60,{y:.2}")).await;
+    }
+    let downs = env.fake.log().iter().filter(|l| l.starts_with("touch down")).count();
+    let ups = env.fake.log().iter().filter(|l| l.starts_with("touch up")).count();
+    assert_eq!((downs, ups), (3, 3));
+}
+
+#[tokio::test]
+async fn a_burst_of_input_after_a_hiccup_arrives_whole_and_in_order() {
+    let env = setup(2).await;
+    let (token, lease) = device(&env, "alice").await;
+    let mut ws = open(&env, &token, &lease, true).await.ws().await;
+    format(&mut ws).await;
+
+    // A link that held the page's messages back delivers them at once.
+    let mut burst = vec![json!({"t": "touch", "phase": "down", "x": 0.0, "y": 0.5})];
+    burst.extend((1..=300).map(|i| json!({"t": "touch", "phase": "move", "x": f64::from(i) / 300.0, "y": 0.5})));
+    burst.push(json!({"t": "touch", "phase": "up", "x": 1.0, "y": 0.5}));
+    burst.push(json!({"t": "type", "id": 3, "text": "ok"}));
+    for m in burst {
+        ws.feed(tungstenite::Message::text(m.to_string())).await.unwrap();
+    }
+    ws.flush().await.unwrap();
+
+    assert_eq!(text(&mut ws).await, json!({"t": "done", "id": 3}), "no input was refused as busy");
+    let log: Vec<String> =
+        env.fake.log().into_iter().filter(|l| l.starts_with("touch") || l.starts_with("type")).collect();
+    let mut want = vec!["touch down 0.00,0.50".to_string()];
+    want.extend((1..=300).map(|i| format!("touch move {:.2},0.50", f64::from(i) / 300.0)));
+    want.extend(["touch up 1.00,0.50".to_string(), "type ok".to_string()]);
+    assert_eq!(log, want, "every message, in order");
+}
+
+#[tokio::test]
+async fn a_page_that_closes_on_a_stuck_link_runs_none_of_its_queued_input() {
+    let env = heavy_stream().await;
+    let (token, lease) = device(&env, "alice").await;
+    let mut ws = open(&env, &token, &lease, true).await.ws().await;
+    format(&mut ws).await;
+    // The page reads nothing, so the server's frame write waits. It queues 50 button presses
+    // (about 60 ms each) and then closes.
+    for _ in 0..50 {
+        ws.feed(tungstenite::Message::text(json!({"t": "button", "name": "home"}).to_string())).await.unwrap();
+    }
+    ws.feed(tungstenite::Message::Close(None)).await.unwrap();
+    ws.flush().await.unwrap();
+    let presses = || env.fake.log().iter().filter(|l| *l == "hid button home down").count();
+
+    // The presses that were still queued at the close never run, though the write still waits.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let at_close = presses();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(presses(), at_close, "queued input ran after the page closed");
+    assert!(at_close < 50, "all {at_close} presses ran before the close was read");
+    drop(ws);
+}
+
 #[tokio::test]
 async fn agents_share_a_view_only_link() {
     let env = setup(2).await;

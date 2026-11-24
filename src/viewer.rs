@@ -877,11 +877,18 @@ async fn put(sink: &mut futures_util::stream::SplitSink<WebSocket, Message>, m: 
     matches!(tokio::time::timeout(SEND_TIMEOUT, sink.send(m)).await, Ok(Ok(())))
 }
 
+/// What the page's reader hands to the session loop, which owns the flow state.
+enum Ctl {
+    Ack(u32),
+    Keyframe,
+}
+
 async fn session(live: Live, mut video: broadcast::Receiver<Video>, socket: WebSocket) {
-    let (mut sink, mut stream) = socket.split();
+    let (mut sink, stream) = socket.split();
     let hub = live.joined.hub.clone();
     let (out_tx, mut out_rx) = mpsc::channel::<Message>(64);
     let (in_tx, in_rx) = mpsc::channel::<ClientMsg>(1024);
+    let (ctl_tx, mut ctl_rx) = mpsc::channel::<Ctl>(256);
     let input = Input {
         pool: live.pool.clone(),
         ctx: live.ctx.clone(),
@@ -891,6 +898,15 @@ async fn session(live: Live, mut video: broadcast::Receiver<Video>, socket: WebS
         touched: None,
     };
     let stop = CancellationToken::new();
+    // Once the page is gone its queued input is dropped, even while a frame write still waits.
+    let gone = stop.clone().drop_guard();
+    let reader = tokio::spawn({
+        let reading = read_page(stream, live.pool.clone(), hub.clone(), live.control, in_tx, out_tx.clone(), ctl_tx);
+        async move {
+            let _gone = gone;
+            reading.await;
+        }
+    });
     let input = tokio::spawn(run_input(input, in_rx, out_tx, stop.clone()));
     let mut flow = Flow::new();
     // The format may be in the cache and in the channel both: send each one once.
@@ -936,36 +952,14 @@ async fn session(live: Live, mut video: broadcast::Receiver<Video>, socket: WebS
                 }
                 Err(broadcast::error::RecvError::Closed) => close = Some(Some(live.ended())),
             },
-            m = stream.next() => match m {
-                Some(Ok(Message::Text(t))) => {
-                    let reply = match serde_json::from_str::<ClientMsg>(&t) {
-                        Ok(ClientMsg::Ack { seq }) => {
-                            flow.ack(seq, &hub);
-                            None
-                        }
-                        Ok(ClientMsg::Ping { at }) => Some(text(serde_json::json!({ "t": "pong", "at": at, "server_ms": now_ms() }))),
-                        Ok(ClientMsg::Keyframe) => {
-                            flow.need_key = true;
-                            hub.keyframe(false);
-                            None
-                        }
-                        Ok(ClientMsg::Preset { .. } | ClientMsg::Touch { .. } | ClientMsg::Key { .. } | ClientMsg::Button { .. } | ClientMsg::Type { .. } | ClientMsg::Paste { .. } | ClientMsg::PasteAndType { .. })
-                            if !live.control => view_only(&t),
-                        Ok(ClientMsg::Preset { name }) => {
-                            let opts = hub.set_preset(name, &live.pool.config.viewer);
-                            Some(text(serde_json::json!({ "t": "preset", "preset": name, "opts": opts })))
-                        }
-                        Ok(msg) => in_tx.try_send(msg).err().map(|_| ViewError::Busy.message(None)),
-                        Err(e) => Some(ViewError::Bad(format!("invalid message: {e}")).message(None)),
-                    };
-                    if let Some(r) = reply
-                        && !put(&mut sink, r).await
-                    {
-                        close = Some(None);
-                    }
+            c = ctl_rx.recv() => match c {
+                Some(Ctl::Ack(seq)) => flow.ack(seq, &hub),
+                Some(Ctl::Keyframe) => {
+                    flow.need_key = true;
+                    hub.keyframe(false);
                 }
-                Some(Ok(Message::Close(_)) | Err(_)) | None => close = Some(None),
-                Some(Ok(_)) => {}
+                // The page closed its socket.
+                None => close = Some(None),
             },
             Some(m) = out_rx.recv() => {
                 if !put(&mut sink, m).await {
@@ -983,12 +977,71 @@ async fn session(live: Live, mut video: broadcast::Receiver<Video>, socket: WebS
     // Queued input is dropped: nothing more reaches the device once the page is gone or its
     // session is revoked. The input task still lifts a finger that is down.
     stop.cancel();
-    drop(in_tx);
+    reader.abort();
+    let _ = reader.await;
     drop(out_rx);
     if let Some(Some(frame)) = close {
         let _ = put(&mut sink, Message::Close(Some(frame))).await;
     }
     let _ = input.await;
+}
+
+/// Reads the page on its own task, so input reaches the device while a video frame is still
+/// being written to a slow link. Replies go through `out`; acks and keyframe requests go to the
+/// session loop. Returns, closing `ctl`, when the page closes its socket.
+async fn read_page(
+    mut stream: futures_util::stream::SplitStream<WebSocket>,
+    pool: Arc<Pool>,
+    hub: Arc<Hub>,
+    control: bool,
+    input: mpsc::Sender<ClientMsg>,
+    out: mpsc::Sender<Message>,
+    ctl: mpsc::Sender<Ctl>,
+) {
+    while let Some(Ok(m)) = stream.next().await {
+        let t = match m {
+            Message::Text(t) => t,
+            Message::Close(_) => return,
+            _ => continue,
+        };
+        let reply = match serde_json::from_str::<ClientMsg>(&t) {
+            Ok(ClientMsg::Ack { seq }) => {
+                if ctl.send(Ctl::Ack(seq)).await.is_err() {
+                    return;
+                }
+                None
+            }
+            Ok(ClientMsg::Keyframe) => {
+                if ctl.send(Ctl::Keyframe).await.is_err() {
+                    return;
+                }
+                None
+            }
+            Ok(ClientMsg::Ping { at }) => {
+                Some(text(serde_json::json!({ "t": "pong", "at": at, "server_ms": now_ms() })))
+            }
+            Ok(
+                ClientMsg::Preset { .. }
+                | ClientMsg::Touch { .. }
+                | ClientMsg::Key { .. }
+                | ClientMsg::Button { .. }
+                | ClientMsg::Type { .. }
+                | ClientMsg::Paste { .. }
+                | ClientMsg::PasteAndType { .. },
+            ) if !control => view_only(&t),
+            Ok(ClientMsg::Preset { name }) => {
+                let opts = hub.set_preset(name, &pool.config.viewer);
+                Some(text(serde_json::json!({ "t": "preset", "preset": name, "opts": opts })))
+            }
+            Ok(msg) => input.try_send(msg).err().map(|_| ViewError::Busy.message(None)),
+            Err(e) => Some(ViewError::Bad(format!("invalid message: {e}")).message(None)),
+        };
+        if let Some(r) = reply
+            && out.send(r).await.is_err()
+        {
+            return;
+        }
+    }
 }
 
 /// A view-only page is told once per gesture, not for every move.
