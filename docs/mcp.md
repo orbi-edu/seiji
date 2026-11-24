@@ -1820,7 +1820,7 @@ The server sends:
 - One binary message for each frame: 1 byte of flags (bit 0: keyframe), the frame number (4 bytes, big-endian), the capture time in Unix microseconds (8 bytes, big-endian), then the sample in AVCC form (a 4-byte length before each NAL unit).
 - `{"t": "pong", "at", "server_ms"}` for each ping, `{"t": "preset", "preset", "opts"}` after a preset change, and `{"t": "done", "id", "via"}` after a text input.
 
-The page acknowledges each frame it receives with `{"t": "ack", "seq": <frame number>}`. A viewer whose oldest unacknowledged frame is older than its lowest round trip of the last 10 s plus 200 ms (or 60 frames are in flight) is congested: Seiji sends it no more frames until it catches up, then asks the helper for a keyframe and resumes there. So a slow link shows a recent picture with gaps, never a growing delay. A joining viewer gets the current format and a keyframe at once.
+The page acknowledges each frame with `{"t": "ack", "seq": <frame number>}` once it has shown it (a frame it skips, once it skipped it), so a slow decoder holds the stream back like a slow link. A viewer whose oldest unacknowledged frame is older than its lowest round trip of the last 10 s plus 200 ms (or 60 frames are in flight) is congested: Seiji sends it no more frames until it catches up, then asks the helper for a keyframe and resumes there. So a slow link shows a recent picture with gaps, never a growing delay. A joining viewer gets the current format and a keyframe at once; a viewer that fell behind the shared buffer gets the current format again if it missed one. A page that reads nothing for 5 s is closed, and input still queued for it is dropped.
 
 A congested viewer also lowers the shared bitrate to 70 %, at most every 2 s and never below 20 % of the preset. After 4 s without congestion the bitrate grows 15 % every 2 s, back to the preset.
 
@@ -1847,7 +1847,8 @@ The page sends text messages, each a JSON object with `t`. Points are fractions 
 | `paste` | `id`, `text` (1–10 000 bytes) | Puts the text on the simulator clipboard (`axe clipboard copy`) and presses Cmd+V, so accents and emoji go through. If the clipboard cannot be set, types the text instead. Answers `done` with `via`: `pasted` or `typed` |
 | `paste_and_type` | `id`, `text` (1–10 000 bytes) | Types the text (same as `type`), for fields that refuse paste |
 | `preset` | `name` | See [Quality presets](#quality-presets) |
-| `ack` | `seq` | The last frame received |
+| `ack` | `seq` | The last frame shown (or skipped) |
+| `keyframe` | | The page dropped frames (its decoder fell behind or was reset): start over at a keyframe. Also allowed in a view-only session |
 | `ping` | `at` | Echoed back in a `pong` |
 
 Input restarts the idle timer. Viewer input is not recorded as a run.

@@ -447,7 +447,7 @@ pub struct StreamOpts {
 }
 
 /// A helper message larger than this is not a frame but a broken stream.
-const MAX_MESSAGE: usize = 8 * 1024 * 1024;
+const MAX_MESSAGE: usize = 4 * 1024 * 1024;
 const MSG_FORMAT: u8 = 1;
 const MSG_FRAME: u8 = 2;
 const MSG_STATUS: u8 = 3;

@@ -10,13 +10,20 @@ import VideoToolbox
 /// Driven from the capture queue. VideoToolbox calls the output handler on its own threads; the
 /// state it shares with `encode` is behind `lock`.
 final class Encoder {
-    private(set) var width = 0
-    private(set) var height = 0
+    /// What one session encodes. Each submitted frame carries its session's copy, so a frame
+    /// finishing while the session is replaced still describes itself correctly.
+    private struct Stream {
+        let generation: Int
+        let width: Int
+        let height: Int
+        /// Screen size in points, for the `format` message.
+        let screen: (width: Int, height: Int)?
+    }
+
     private var fps: Int
     private var bitrate: Int
-    /// Screen size in points, for the `format` message.
-    private var screen: (width: Int, height: Int)?
     private var session: VTCompressionSession?
+    private var stream: Stream?
     private var generation = 0
 
     private let lock = NSLock()
@@ -25,6 +32,11 @@ final class Encoder {
     private var lastDescription: Data?
     /// Set after a dropped frame (or before the first format): deltas are useless until an IDR.
     private var needKeyframe = true
+    /// The last keyframe was over the payload limit; set until a keyframe is written or the
+    /// session changes, so an unchanged screen does not keep encoding one that is too big again.
+    private var keyframeTooBig = false
+    /// Encoded frames not written (stdout backlog or over the payload limit).
+    private var dropped = 0
 
     init(fps: Int, bitrate: Int) {
         self.fps = fps
@@ -33,25 +45,37 @@ final class Encoder {
 
     deinit { invalidate() }
 
+    /// The size of the current session's pictures (0 before the first `configure`).
+    var width: Int { stream?.width ?? 0 }
+    var height: Int { stream?.height ?? 0 }
+
     var framesInFlight: Int {
         lock.lock()
         defer { lock.unlock() }
         return inFlight
     }
 
-    /// (Re)creates the session if the output size changed. The next frame is then an IDR and is
-    /// preceded by a new `format`.
+    /// True while a keyframe of a working session is owed and worth retrying on an unchanged
+    /// screen. Changed frames are still sent as keyframes until one is written.
+    var needsKeyframe: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return (needKeyframe && !keyframeTooBig) || session == nil
+    }
+
+    /// (Re)creates the session if the output size or screen changed. The next frame is then an
+    /// IDR and is preceded by a new `format`.
     func configure(width: Int, height: Int, screen: (width: Int, height: Int)?) throws {
-        self.screen = screen
-        if session != nil, width == self.width, height == self.height { return }
+        if session != nil, let stream, width == stream.width, height == stream.height,
+           screen?.width == stream.screen?.width, screen?.height == stream.screen?.height { return }
         invalidate()
-        self.width = width
-        self.height = height
-        session = try makeSession()
-        generation += 1
         lock.lock()
         needKeyframe = true
+        keyframeTooBig = false
         lock.unlock()
+        generation += 1
+        stream = Stream(generation: generation, width: width, height: height, screen: screen)
+        session = try makeSession(width: width, height: height)
         debugLog("encoder session \(generation): \(width)x\(height) fps=\(fps) bitrate=\(bitrate)")
     }
 
@@ -76,12 +100,11 @@ final class Encoder {
     }
 
     func encode(_ buffer: CVPixelBuffer, capturedMicros: UInt64, forceKeyframe: Bool) {
-        guard let session else { return }
+        guard let session, let stream else { return }
         lock.lock()
         let keyframe = forceKeyframe || needKeyframe
         inFlight += 1
         lock.unlock()
-        let generation = self.generation
         let properties: CFDictionary? = keyframe
             ? [kVTEncodeFrameOptionKey_ForceKeyFrame: kCFBooleanTrue!] as CFDictionary : nil
         let status = VTCompressionSessionEncodeFrame(
@@ -89,7 +112,7 @@ final class Encoder {
             presentationTimeStamp: CMClockGetTime(CMClockGetHostTimeClock()),
             duration: .invalid, frameProperties: properties, infoFlagsOut: nil
         ) { [weak self] status, flags, sample in
-            self?.output(status: status, flags: flags, sample: sample, generation: generation,
+            self?.output(status: status, flags: flags, sample: sample, stream: stream,
                          capturedMicros: capturedMicros)
         }
         if status != noErr {
@@ -104,7 +127,7 @@ final class Encoder {
     // MARK: - Output
 
     private func output(status: OSStatus, flags: VTEncodeInfoFlags, sample: CMSampleBuffer?,
-                        generation: Int, capturedMicros: UInt64) {
+                        stream: Stream, capturedMicros: UInt64) {
         lock.lock()
         defer { lock.unlock() }
         inFlight -= 1
@@ -117,19 +140,31 @@ final class Encoder {
         let keyframe = Self.isKeyframe(sample)
         if keyframe, let format = CMSampleBufferGetFormatDescription(sample),
            let description = Self.avcC(format) {
-            if generation != formatGeneration || description != lastDescription {
-                guard sendFormat(description) else { return }
-                formatGeneration = generation
+            if stream.generation != formatGeneration || description != lastDescription {
+                guard sendFormat(description, stream: stream) else {
+                    needKeyframe = true
+                    return
+                }
+                formatGeneration = stream.generation
                 lastDescription = description
             }
         }
         // No format for this session yet, or waiting for an IDR after a drop.
-        guard generation == formatGeneration, keyframe || !needKeyframe else {
+        guard stream.generation == formatGeneration, keyframe || !needKeyframe else {
             needKeyframe = true
             return
         }
 
         let length = CMBlockBufferGetDataLength(block)
+        guard 9 + length <= Output.maxPayload else {
+            // Never written. A delta loss still needs an IDR, but a keyframe this big would most
+            // likely be too big again, so a static screen does not retry it (see `needsKeyframe`).
+            dropped += 1
+            needKeyframe = true
+            if keyframe { keyframeTooBig = true }
+            debugLog("dropping a \(length)-byte \(keyframe ? "key" : "delta") frame over the \(Output.maxPayload)-byte payload limit (\(dropped) dropped)")
+            return
+        }
         var message = Output.message(.frame, payloadLength: 9 + length)
         message.append(keyframe ? 1 : 0)
         for shift in stride(from: 56, through: 0, by: -8) {
@@ -146,23 +181,31 @@ final class Encoder {
             return
         }
         if Output.shared.send(message, droppable: true) {
-            if keyframe { needKeyframe = false }
+            if keyframe {
+                needKeyframe = false
+                keyframeTooBig = false
+            }
         } else {
+            dropped += 1
             needKeyframe = true
+            debugLog("stdout backlog: dropped a \(keyframe ? "key" : "delta") frame (\(dropped) dropped)")
+            return
         }
         debugLog("frame \(keyframe ? "key" : "delta") \(length) B, capture→queued \(Double(unixMicros() - capturedMicros) / 1000) ms")
     }
 
-    private func sendFormat(_ description: Data) -> Bool {
+    private func sendFormat(_ description: Data, stream: Stream) -> Bool {
         let sps = description.subdata(in: 1..<4)
         let codec = "avc1." + sps.map { String(format: "%02X", $0) }.joined()
         var object: [String: Any] = [
             "codec": codec,
-            "width": width,
-            "height": height,
+            "width": stream.width,
+            "height": stream.height,
             "description": description.base64EncodedString(),
         ]
-        if let screen { object["screen"] = ["width": screen.width, "height": screen.height] }
+        if let screen = stream.screen {
+            object["screen"] = ["width": screen.width, "height": screen.height]
+        }
         guard let json = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
         else { return false }
         var message = Output.message(.format, payloadLength: json.count)
@@ -223,7 +266,7 @@ final class Encoder {
 
     // MARK: - Session
 
-    private func makeSession() throws -> VTCompressionSession {
+    private func makeSession(width: Int, height: Int) throws -> VTCompressionSession {
         var created: VTCompressionSession?
         func create(_ spec: [CFString: Any]) -> OSStatus {
             VTCompressionSessionCreate(

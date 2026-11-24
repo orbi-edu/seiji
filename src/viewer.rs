@@ -12,7 +12,7 @@
 //! connection; it stops when the last viewer leaves or the lease ends.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -54,6 +54,8 @@ const CMD: u8 = 227;
 const KEY_V: u8 = 25;
 /// How long input waits for the device before it answers busy.
 const INPUT_WAIT: Duration = Duration::from_secs(1);
+/// A page that reads nothing for this long is gone: its socket closes.
+const SEND_TIMEOUT: Duration = Duration::from_secs(5);
 /// A WebSocket checks its session (user, lease, cookie) this often.
 const RECHECK_EVERY: Duration = Duration::from_secs(2);
 /// A viewer is congested when its oldest unacknowledged frame is older than its base round trip
@@ -75,8 +77,9 @@ const BUTTON_HOLD: Duration = Duration::from_millis(60);
 const INPUT_TOUCH_EVERY: Duration = Duration::from_secs(5);
 /// The largest message a page may send (a paste of `MAX_TEXT` bytes, JSON-escaped).
 const MAX_CLIENT_MESSAGE: usize = 64 * 1024;
-/// Format and frames a slow viewer may fall behind before it resyncs at a keyframe.
-const VIDEO_BUFFER: usize = 256;
+/// Format and frames a slow viewer may fall behind before it resyncs at a keyframe. With
+/// helper messages of at most 4 MiB, one hub holds at most 128 MiB of video.
+const VIDEO_BUFFER: usize = 32;
 /// Adaptive bitrate: a congested viewer cuts the bitrate to 70 %, at most every 2 s and never
 /// below 20 % of the preset; after 4 s without congestion it grows 15 % every 2 s.
 const RATE_DOWN: f64 = 0.7;
@@ -182,6 +185,8 @@ struct Hub {
     next_seq: AtomicU64,
     rate: StdMutex<Rate>,
     keyframe_at: StdMutex<Option<Instant>>,
+    /// A keyframe was asked for inside `KEYFRAME_GAP`, or the helper was not there to take it.
+    keyframe_pending: AtomicBool,
     stats: StreamStats,
 }
 
@@ -205,6 +210,7 @@ impl Hub {
                 congested_at: None,
             }),
             keyframe_at: StdMutex::new(None),
+            keyframe_pending: AtomicBool::new(false),
             stats: StreamStats {
                 started_at_ms: now_ms(),
                 frame_count: AtomicU64::new(0),
@@ -214,18 +220,32 @@ impl Hub {
         }
     }
 
-    /// Hands a command to the helper. A missing helper (restarting) drops it.
-    fn send(&self, cmd: ScreenCommand) {
-        if let Some(tx) = &*self.commands.lock().expect("commands mutex") {
-            let _ = tx.try_send(cmd);
+    /// Hands a command to the helper; `false` when no helper runs (it is restarting) or its
+    /// queue is full.
+    fn send(&self, cmd: ScreenCommand) -> bool {
+        match &*self.commands.lock().expect("commands mutex") {
+            Some(tx) => tx.try_send(cmd).is_ok(),
+            None => false,
         }
     }
 
+    /// Hands every command to the helper, or none of them (a key press must not arrive in part).
+    fn send_all(&self, cmds: Vec<ScreenCommand>) -> bool {
+        let guard = self.commands.lock().expect("commands mutex");
+        let Some(tx) = &*guard else { return false };
+        if tx.capacity() < cmds.len() {
+            return false;
+        }
+        cmds.into_iter().all(|c| tx.try_send(c).is_ok())
+    }
+
     /// Waits until the helper has every command sent so far (at most `INPUT_WAIT`).
-    async fn sync(&self) {
+    async fn sync(&self) -> Result<(), ViewError> {
         let (done, wait) = tokio::sync::oneshot::channel();
-        self.send(ScreenCommand::Sync(done));
-        let _ = tokio::time::timeout(INPUT_WAIT, wait).await;
+        if self.send(ScreenCommand::Sync(done)) && matches!(tokio::time::timeout(INPUT_WAIT, wait).await, Ok(Ok(()))) {
+            return Ok(());
+        }
+        Err(helper_missing())
     }
 
     fn opts(&self) -> StreamOpts {
@@ -233,11 +253,21 @@ impl Hub {
         StreamOpts { bitrate: rate.bitrate, ..rate.target }
     }
 
+    /// Asks for a keyframe. A request within `KEYFRAME_GAP` of the last one stays pending and
+    /// goes out when the gap has passed (`flush_keyframe`), so a still screen still gets it.
     fn keyframe(&self, force: bool) {
         let mut at = self.keyframe_at.lock().expect("keyframe mutex");
         if force || at.is_none_or(|t| t.elapsed() >= KEYFRAME_GAP) {
             *at = Some(Instant::now());
-            self.send(ScreenCommand::Keyframe);
+            self.keyframe_pending.store(!self.send(ScreenCommand::Keyframe), Ordering::SeqCst);
+        } else {
+            self.keyframe_pending.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn flush_keyframe(&self) {
+        if self.keyframe_pending.load(Ordering::SeqCst) {
+            self.keyframe(false);
         }
     }
 
@@ -651,6 +681,7 @@ async fn run_hub(pool: Arc<Pool>, ctx: DeviceCtx, hub: Arc<Hub>) {
             let mut touch = tokio::time::interval(TOUCH_EVERY);
             let mut log = tokio::time::interval(STATS_LOG_EVERY);
             let mut rate = tokio::time::interval(Duration::from_secs(1));
+            let mut keyframes = tokio::time::interval(KEYFRAME_GAP / 2);
             touch.tick().await;
             log.tick().await;
             loop {
@@ -658,6 +689,7 @@ async fn run_hub(pool: Arc<Pool>, ctx: DeviceCtx, hub: Arc<Hub>) {
                     _ = hub.cancel.cancelled() => break,
                     _ = touch.tick() => { let _ = store.touch_lease(&lease_id, now()); }
                     _ = rate.tick() => hub.recover(),
+                    _ = keyframes.tick() => hub.flush_keyframe(),
                     _ = log.tick() => {
                         let st = &hub.stats;
                         let count = st.frame_count.load(Ordering::Relaxed);
@@ -717,6 +749,8 @@ enum ClientMsg {
     Ping {
         at: f64,
     },
+    /// The page's decoder dropped frames (it fell behind, or was reset): start over at a keyframe.
+    Keyframe,
     Preset {
         name: StreamPreset,
     },
@@ -837,6 +871,12 @@ impl Live {
     }
 }
 
+/// Sends one message; `false` when the socket is gone or the page has not read for
+/// `SEND_TIMEOUT`, so a stalled page cannot hold off the session checks for long.
+async fn put(sink: &mut futures_util::stream::SplitSink<WebSocket, Message>, m: Message) -> bool {
+    matches!(tokio::time::timeout(SEND_TIMEOUT, sink.send(m)).await, Ok(Ok(())))
+}
+
 async fn session(live: Live, mut video: broadcast::Receiver<Video>, socket: WebSocket) {
     let (mut sink, mut stream) = socket.split();
     let hub = live.joined.hub.clone();
@@ -850,13 +890,14 @@ async fn session(live: Live, mut video: broadcast::Receiver<Video>, socket: WebS
         gesture: None,
         touched: None,
     };
-    let input = tokio::spawn(run_input(input, in_rx, out_tx));
+    let stop = CancellationToken::new();
+    let input = tokio::spawn(run_input(input, in_rx, out_tx, stop.clone()));
     let mut flow = Flow::new();
     // The format may be in the cache and in the channel both: send each one once.
     let mut sent_format = hub.format.lock().expect("format mutex").clone();
     let mut close = None;
     if let Some(f) = &sent_format
-        && sink.send(Message::Text(f.to_string().into())).await.is_err()
+        && !put(&mut sink, Message::Text(f.to_string().into())).await
     {
         close = Some(None);
     }
@@ -868,18 +909,28 @@ async fn session(live: Live, mut video: broadcast::Receiver<Video>, socket: WebS
                 Ok(Video::Format(f)) => {
                     if !sent_format.as_ref().is_some_and(|s| Arc::ptr_eq(s, &f)) {
                         flow.need_key = true;
-                        if sink.send(Message::Text(f.to_string().into())).await.is_err() {
+                        if !put(&mut sink, Message::Text(f.to_string().into())).await {
                             close = Some(None);
                         }
                         sent_format = Some(f);
                     }
                 }
                 Ok(Video::Frame(f)) => {
-                    if flow.admit(&f, &hub) && sink.send(Message::Binary(f.message.clone())).await.is_err() {
+                    if flow.admit(&f, &hub) && !put(&mut sink, Message::Binary(f.message.clone())).await {
                         close = Some(None);
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => {
+                    // A format may have been among the messages it missed.
+                    let current = hub.format.lock().expect("format mutex").clone();
+                    if let Some(f) = current
+                        && !sent_format.as_ref().is_some_and(|s| Arc::ptr_eq(s, &f))
+                    {
+                        if !put(&mut sink, Message::Text(f.to_string().into())).await {
+                            close = Some(None);
+                        }
+                        sent_format = Some(f);
+                    }
                     flow.need_key = true;
                     hub.keyframe(false);
                 }
@@ -893,6 +944,11 @@ async fn session(live: Live, mut video: broadcast::Receiver<Video>, socket: WebS
                             None
                         }
                         Ok(ClientMsg::Ping { at }) => Some(text(serde_json::json!({ "t": "pong", "at": at, "server_ms": now_ms() }))),
+                        Ok(ClientMsg::Keyframe) => {
+                            flow.need_key = true;
+                            hub.keyframe(false);
+                            None
+                        }
                         Ok(ClientMsg::Preset { .. } | ClientMsg::Touch { .. } | ClientMsg::Key { .. } | ClientMsg::Button { .. } | ClientMsg::Type { .. } | ClientMsg::Paste { .. } | ClientMsg::PasteAndType { .. })
                             if !live.control => view_only(&t),
                         Ok(ClientMsg::Preset { name }) => {
@@ -903,7 +959,7 @@ async fn session(live: Live, mut video: broadcast::Receiver<Video>, socket: WebS
                         Err(e) => Some(ViewError::Bad(format!("invalid message: {e}")).message(None)),
                     };
                     if let Some(r) = reply
-                        && sink.send(r).await.is_err()
+                        && !put(&mut sink, r).await
                     {
                         close = Some(None);
                     }
@@ -912,7 +968,7 @@ async fn session(live: Live, mut video: broadcast::Receiver<Video>, socket: WebS
                 Some(Ok(_)) => {}
             },
             Some(m) = out_rx.recv() => {
-                if sink.send(m).await.is_err() {
+                if !put(&mut sink, m).await {
                     close = Some(None);
                 }
             }
@@ -924,11 +980,14 @@ async fn session(live: Live, mut video: broadcast::Receiver<Video>, socket: WebS
             _ = hub.cancel.cancelled() => close = Some(Some(live.ended())),
         }
     }
-    if let Some(Some(frame)) = close {
-        let _ = sink.send(Message::Close(Some(frame))).await;
-    }
-    // The input task lifts a finger still down before it ends.
+    // Queued input is dropped: nothing more reaches the device once the page is gone or its
+    // session is revoked. The input task still lifts a finger that is down.
+    stop.cancel();
     drop(in_tx);
+    drop(out_rx);
+    if let Some(Some(frame)) = close {
+        let _ = put(&mut sink, Message::Close(Some(frame))).await;
+    }
     let _ = input.await;
 }
 
@@ -988,10 +1047,12 @@ struct Input {
 }
 
 impl Input {
-    /// Lifts a finger that is still down, and frees the device.
-    fn lift(&mut self) {
+    /// Lifts a finger that is still down, and frees the device once the helper has the lift, so
+    /// a run that takes the device next never finds the finger down.
+    async fn lift(&mut self) {
         if let Some(g) = self.gesture.take() {
             self.hub.send(ScreenCommand::Touch { phase: TouchPhase::Up, x: g.x, y: g.y, edge: None });
+            let _ = self.hub.sync().await;
         }
     }
 
@@ -1013,14 +1074,14 @@ impl Input {
 
     async fn apply_inner(&mut self, msg: ClientMsg) -> Result<Option<Message>, ViewError> {
         if !matches!(msg, ClientMsg::Touch { phase: TouchPhase::Move | TouchPhase::Up, .. }) {
-            self.lift();
+            self.lift().await;
         }
         let hub = self.hub.clone();
         match msg {
             ClientMsg::Touch { phase: TouchPhase::Down, x, y, edge } => {
                 point(x, y)?;
                 let held = hold(&self.rt, &hub).await?;
-                hub.send(ScreenCommand::Touch { phase: TouchPhase::Down, x, y, edge });
+                delivered(hub.send(ScreenCommand::Touch { phase: TouchPhase::Down, x, y, edge }))?;
                 self.gesture = Some(Gesture { _held: held, x, y, at: Instant::now() });
             }
             ClientMsg::Touch { phase, x, y, .. } => {
@@ -1030,6 +1091,8 @@ impl Input {
                     hub.send(ScreenCommand::Touch { phase, x, y, edge: None });
                     (g.x, g.y, g.at) = (x, y, Instant::now());
                     if phase == TouchPhase::Up {
+                        // The device stays held until the helper has the lift.
+                        let _ = hub.sync().await;
                         self.gesture = None;
                     }
                 }
@@ -1039,27 +1102,29 @@ impl Input {
                     return Err(ViewError::Bad("mods must be up to 4 modifier usages (224-231)".into()));
                 }
                 let _held = hold(&self.rt, &hub).await?;
-                press(&hub, usage, &mods);
+                delivered(press(&hub, usage, &mods))?;
+                hub.sync().await?;
             }
             ClientMsg::Button { name } => {
                 let _held = hold(&self.rt, &hub).await?;
-                hub.send(ScreenCommand::Button { button: name, down: true });
+                delivered(hub.send(ScreenCommand::Button { button: name, down: true }))?;
                 tokio::time::sleep(BUTTON_HOLD).await;
                 hub.send(ScreenCommand::Button { button: name, down: false });
+                hub.sync().await?;
             }
             ClientMsg::Type { id, text } | ClientMsg::PasteAndType { id, text } => {
                 let _held = hold(&self.rt, &hub).await?;
-                hub.sync().await;
+                hub.sync().await?;
                 self.typed(&text).await?;
                 return Ok(Some(done(id, None)));
             }
             ClientMsg::Paste { id, text } => {
                 let _held = hold(&self.rt, &hub).await?;
-                hub.sync().await;
+                hub.sync().await?;
                 let via = self.pasted(&text).await?;
                 return Ok(Some(done(id, Some(via))));
             }
-            ClientMsg::Ack { .. } | ClientMsg::Ping { .. } | ClientMsg::Preset { .. } => {}
+            ClientMsg::Ack { .. } | ClientMsg::Ping { .. } | ClientMsg::Keyframe | ClientMsg::Preset { .. } => {}
         }
         Ok(None)
     }
@@ -1094,7 +1159,9 @@ impl Input {
         self.with_text_file(text, async |file| {
             match self.pool.devices.device_op(&self.ctx, &DeviceOp::Pasteboard { text_file: file.clone() }).await {
                 Ok(_) => {
-                    press(&self.hub, KEY_V, &[CMD]);
+                    // The clipboard alone is not a paste: report it only once Cmd+V is with the helper.
+                    delivered(press(&self.hub, KEY_V, &[CMD]))?;
+                    self.hub.sync().await?;
                     Ok("pasted")
                 }
                 Err(e) => {
@@ -1109,16 +1176,21 @@ impl Input {
 }
 
 /// A key press with modifiers held: modifiers down in order, the key down and up, modifiers up
-/// in reverse.
-fn press(hub: &Hub, usage: u8, mods: &[u8]) {
-    for m in mods {
-        hub.send(ScreenCommand::Key { usage: *m, down: true });
-    }
-    hub.send(ScreenCommand::Key { usage, down: true });
-    hub.send(ScreenCommand::Key { usage, down: false });
-    for m in mods.iter().rev() {
-        hub.send(ScreenCommand::Key { usage: *m, down: false });
-    }
+/// in reverse. All of it goes to the helper, or none; `false` for none.
+fn press(hub: &Hub, usage: u8, mods: &[u8]) -> bool {
+    let mut keys: Vec<ScreenCommand> = mods.iter().map(|m| ScreenCommand::Key { usage: *m, down: true }).collect();
+    keys.push(ScreenCommand::Key { usage, down: true });
+    keys.push(ScreenCommand::Key { usage, down: false });
+    keys.extend(mods.iter().rev().map(|m| ScreenCommand::Key { usage: *m, down: false }));
+    hub.send_all(keys)
+}
+
+fn delivered(sent: bool) -> Result<(), ViewError> {
+    if sent { Ok(()) } else { Err(helper_missing()) }
+}
+
+fn helper_missing() -> ViewError {
+    ViewError::Internal(anyhow::anyhow!("the screen helper did not take the input; try again"))
 }
 
 fn done(id: u32, via: Option<&str>) -> Message {
@@ -1129,18 +1201,23 @@ fn done(id: u32, via: Option<&str>) -> Message {
     text(v)
 }
 
-async fn run_input(mut input: Input, mut rx: mpsc::Receiver<ClientMsg>, out: mpsc::Sender<Message>) {
+/// Runs until the page goes away (`stop`): what is still queued then is dropped, not applied.
+async fn run_input(
+    mut input: Input,
+    mut rx: mpsc::Receiver<ClientMsg>,
+    out: mpsc::Sender<Message>,
+    stop: CancellationToken,
+) {
     loop {
-        let idle_until = input.gesture.as_ref().map(|g| g.at + GESTURE_IDLE);
-        let msg = match idle_until {
-            Some(t) => tokio::select! {
-                m = rx.recv() => m,
-                _ = tokio::time::sleep_until(t.into()) => {
-                    input.lift();
-                    continue;
-                }
-            },
-            None => rx.recv().await,
+        let idle = input.gesture.as_ref().map(|g| tokio::time::Instant::from_std(g.at + GESTURE_IDLE));
+        let msg = tokio::select! {
+            biased;
+            _ = stop.cancelled() => break,
+            _ = async { tokio::time::sleep_until(idle.expect("checked")).await }, if idle.is_some() => {
+                input.lift().await;
+                continue;
+            }
+            m = rx.recv() => m,
         };
         let Some(msg) = msg else { break };
         if let Some(reply) = input.apply(msg).await
@@ -1149,7 +1226,7 @@ async fn run_input(mut input: Input, mut rx: mpsc::Receiver<ClientMsg>, out: mps
             break;
         }
     }
-    input.lift();
+    input.lift().await;
 }
 
 // ---- routes ----

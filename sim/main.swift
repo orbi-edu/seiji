@@ -72,10 +72,15 @@ final class Shutdown {
         }
         started = true
         lock.unlock()
+        let start = monotonicNanos()
+        func elapsed() -> String { "\(Double(monotonicNanos() - start) / 1e6) ms" }
         debugLog("exiting: \(reason)")
-        hid.liftFinger(timeout: .milliseconds(200))
+        hid.close(timeout: .milliseconds(200))
+        debugLog("HID closed after \(elapsed())")
         capture.stop()
+        debugLog("capture stopped after \(elapsed())")
         Output.shared.closeAndDrain(timeout: .milliseconds(300))
+        debugLog("stdout drained after \(elapsed())")
         exit(0)
     }
 }

@@ -35,6 +35,8 @@ final class Capture {
 
     private static let pollInterval = DispatchTimeInterval.nanoseconds(1_000_000_000 / 60)
     private static let maxInFlight = 3
+    /// Pace of retries for pending work (keyframe, new session) on an unchanged screen.
+    private static let retryInterval: UInt64 = 200_000_000
 
     private let io: NSObject
     private let pointScale: Double?
@@ -49,11 +51,15 @@ final class Capture {
     private var running = false
 
     private var main: Int? // index into `ports` of the largest surface
-    private var sourceSurface: IOSurface?
-    private var sourceBuffer: CVPixelBuffer?
+    /// The surface and seed of the last frame handed to the encoder.
+    private var lastSurface: IOSurface?
     private var lastSeed: UInt32?
     private var lastCaptureNanos: UInt64 = 0
+    private var lastAttemptNanos: UInt64 = 0
     private var keyframeRequested = true
+    /// The surface `sourceBuffer` wraps.
+    private var bufferSurface: IOSurface?
+    private var sourceBuffer: CVPixelBuffer?
 
     private var transfer: VTPixelTransferSession?
     private var pool: CVPixelBufferPool?
@@ -132,7 +138,9 @@ final class Capture {
             }
             if let scale, scale != self.scale {
                 self.scale = scale
-                // The next capture re-creates the session at the new size.
+                // The next capture re-creates the session at the new size; until one succeeds the
+                // request stays pending, so a static screen still gets the new size.
+                keyframeRequested = true
                 tick(force: true)
             }
         }
@@ -223,15 +231,31 @@ final class Capture {
         guard running, transfer != nil, let index = pickMain(), let surface = ports[index].surface
         else { return }
         let seed = IOSurfaceGetSeed(surface)
-        let changed = surface !== sourceSurface || seed != lastSeed
-        guard changed || force else { return }
+        let changed = surface !== lastSurface || seed != lastSeed
+        // Work a static screen would never trigger again: a requested keyframe, one the encoder or
+        // stdout dropped, or a session still to be created at a new size.
+        let pending = keyframeRequested || encoder.needsKeyframe
+        guard changed || pending || force else { return }
         let now = monotonicNanos()
+        // A keyframe line flood must not queue frames without bound: forced work over the limit
+        // stays pending for a paced retry.
+        guard encoder.framesInFlight < Self.maxInFlight else { return }
         if !force {
-            // At most `fps` frames a second; an unsent change is picked up by a later poll tick.
-            let interval = 1_000_000_000 / UInt64(fps)
-            guard now &- lastCaptureNanos >= interval - interval / 8,
-                  encoder.framesInFlight < Self.maxInFlight else { return }
+            // Encoding what stdout would refuse only wastes time; the change or pending work is
+            // picked up by a later tick.
+            guard Output.shared.acceptsFrames else { return }
+            if changed {
+                // At most `fps` frames a second.
+                let interval = 1_000_000_000 / UInt64(fps)
+                guard now &- lastCaptureNanos >= interval - interval / 8 else { return }
+            } else {
+                // Retry pending work on an unchanged screen at a slow pace, once the last attempt
+                // has come back.
+                guard encoder.framesInFlight == 0, now &- lastAttemptNanos >= Self.retryInterval
+                else { return }
+            }
         }
+        lastAttemptNanos = now
         do {
             try configureEncoder(for: surface)
         } catch {
@@ -242,12 +266,13 @@ final class Capture {
               let transfer,
               VTPixelTransferSessionTransferImage(transfer, from: source, to: output) == noErr
         else { return }
+        lastSurface = surface
         lastSeed = seed
         lastCaptureNanos = now
         let keyframe = keyframeRequested
         keyframeRequested = false
         encoder.encode(output, capturedMicros: unixMicros(), forceKeyframe: keyframe)
-        debugLog("captured seed=\(seed) force=\(force) in \(Double(monotonicNanos() - now) / 1e6) ms")
+        debugLog("captured seed=\(seed) force=\(force) changed=\(changed) in \(Double(monotonicNanos() - now) / 1e6) ms")
     }
 
     private func configureEncoder(for surface: IOSurface) throws {
@@ -260,12 +285,13 @@ final class Capture {
         try encoder.configure(width: even(width), height: even(height), screen: screen)
     }
 
+    /// A CVPixelBuffer over the framebuffer surface, kept for as long as the surface lasts.
     private func pixelBuffer(for surface: IOSurface) -> CVPixelBuffer? {
-        if surface === sourceSurface, let sourceBuffer { return sourceBuffer }
+        if surface === bufferSurface, let sourceBuffer { return sourceBuffer }
         var made: Unmanaged<CVPixelBuffer>?
         guard CVPixelBufferCreateWithIOSurface(kCFAllocatorDefault, surface, nil, &made)
             == kCVReturnSuccess, let buffer = made?.takeRetainedValue() else { return nil }
-        sourceSurface = surface
+        bufferSurface = surface
         sourceBuffer = buffer
         return buffer
     }

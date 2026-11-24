@@ -500,14 +500,18 @@ Stopping the daemon releases every device. Tell the users first.
    ```sh
    diff deploy/dev.seiji.daemon.plist /Library/LaunchDaemons/dev.seiji.daemon.plist
    ```
-6. Start the daemon:
+6. Check the config against the new version. It must load before the daemon starts: a key that no longer exists stops it. Coming from the JPEG viewer, remove `viewer.quality` (and set `viewer.bitrateKbps` if you want another bitrate, see [configuration.md](configuration.md#viewer)). This prints the first error, or nothing:
+   ```sh
+   sudo -u seiji /usr/local/bin/seiji usage -c /usr/local/etc/seiji/seiji.json >/dev/null
+   ```
+7. Start the daemon:
    ```sh
    sudo launchctl bootstrap system /Library/LaunchDaemons/dev.seiji.daemon.plist
    ```
 
 Seiji has no schema migrations: at start it creates missing tables (`CREATE TABLE IF NOT EXISTS`) and changes nothing else. Back up `seiji.db` before an upgrade ([configuration.md](configuration.md#the-data-directory)).
 
-After an upgrade, run `sudo -u seiji seiji doctor <user> --platform ios`. It checks AXe, the screen helper and the capture as the user's account. If the host predates recorded runs, install AXe first ([AXe](#axe)); the `runs` table is created at the next start. If the config still has `viewer.quality` (from the JPEG viewer), remove it: the daemon does not start with it ([configuration.md](configuration.md#viewer)).
+After an upgrade, run `sudo -u seiji seiji doctor <user> --platform ios`. It checks AXe, the screen helper and the capture as the user's account. If the host predates recorded runs, install AXe first ([AXe](#axe)); the `runs` table is created at the next start.
 
 ## 14. Uninstall
 

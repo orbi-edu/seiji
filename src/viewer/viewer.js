@@ -108,8 +108,11 @@
   let clockOffset = 0; // server clock minus browser clock
   let rtt = null;
 
+  // `false` when the socket is not open: the message was not sent.
   function send(msg) {
-    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+    ws.send(JSON.stringify(msg));
+    return true;
   }
 
   function connect() {
@@ -131,7 +134,13 @@
     ws.onmessage = (ev) => (typeof ev.data === "string" ? onText(JSON.parse(ev.data)) : onFrame(ev.data));
     ws.onclose = (ev) => {
       ws = null;
+      resetVideo();
       if (ended) return;
+      // An input sent before the drop may or may not have reached the device: say so, never replay.
+      if (pending.size) {
+        flash(`The connection dropped: ${pending.size === 1 ? "an input" : `${pending.size} inputs`} may not have been applied.`, "error");
+        pending.clear();
+      }
       // 4401: the session expired. 4410: the device was released.
       if (ev.code === 4401 || ev.code === 4410) {
         end(ev.reason || "The viewer closed.");
@@ -191,7 +200,14 @@
   let decoder = null;
   let waitingKey = true;
   let format = null;
+  let decodeErrors = [];
   const stats = { frames: [], bytes: [], age: null, drawn: 0 };
+  // Frames sent to the decoder and not yet shown: capture time → [frame number, when sent]. A
+  // frame is acknowledged once it is shown, so a slow decoder holds the stream back like a slow
+  // link.
+  const decoding = new Map();
+  // At most this many frames wait in the decoder; past it, frames are dropped up to a keyframe.
+  const MAX_DECODE_QUEUE = 3;
 
   function base64Bytes(s) {
     const bin = atob(s);
@@ -200,9 +216,30 @@
     return out;
   }
 
+  // Acknowledges every frame still in the decoder (it was reset, or stalled) and starts over at a
+  // keyframe.
+  function flushDecoding() {
+    let last = null;
+    for (const [seq] of decoding.values()) last = seq;
+    decoding.clear();
+    if (last !== null) send({ t: "ack", seq: last });
+    waitingKey = true;
+    send({ t: "keyframe" });
+  }
+
+  function resetVideo() {
+    decoding.clear();
+    waitingKey = true;
+  }
+
   function newDecoder() {
     return new VideoDecoder({
       output: (frame) => {
+        const entry = decoding.get(frame.timestamp);
+        if (entry !== undefined) {
+          decoding.delete(frame.timestamp);
+          send({ t: "ack", seq: entry[0] });
+        }
         if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
           canvas.width = frame.displayWidth;
           canvas.height = frame.displayHeight;
@@ -214,25 +251,47 @@
         frame.close();
         veil.hidden = true;
       },
-      error: () => {
-        // A broken decoder starts over at the next keyframe.
+      error: (e) => {
         decoder = null;
-        if (format) configure(format);
+        // A browser that cannot decode this stream fails the same way every time: stop there.
+        const now = Date.now();
+        decodeErrors = decodeErrors.filter((t) => t > now - 10000).concat(now);
+        if (e && e.name === "NotSupportedError") {
+          end(`This browser cannot decode the stream (${format ? format.codec : "H.264"}).`);
+        } else if (decodeErrors.length > 3) {
+          end("The stream could not be decoded. Open the device again.");
+        } else if (format) {
+          configure(format);
+          flushDecoding();
+        }
       },
     });
   }
 
-  function configure(f) {
+  async function configure(f) {
     format = f;
-    if (!decoder || decoder.state === "closed") decoder = newDecoder();
-    decoder.configure({
+    const config = {
       codec: f.codec,
       codedWidth: f.width,
       codedHeight: f.height,
       description: base64Bytes(f.description),
       optimizeForLatency: true,
-    });
+    };
     waitingKey = true;
+    try {
+      const support = await VideoDecoder.isConfigSupported(config);
+      if (!support.supported) {
+        end(`This browser cannot decode the stream (${f.codec}, ${f.width}×${f.height}).`);
+        return;
+      }
+    } catch {
+      end(`This browser cannot decode the stream (${f.codec}).`);
+      return;
+    }
+    if (format !== f || ended) return;
+    if (!decoder || decoder.state === "closed") decoder = newDecoder();
+    decoder.configure(config);
+    decoding.clear();
   }
 
   function onFrame(buf) {
@@ -240,13 +299,27 @@
     const key = (view.getUint8(0) & 1) === 1;
     const seq = view.getUint32(1);
     const capturedUs = Number(view.getBigInt64(5));
-    send({ t: "ack", seq });
     stats.bytes.push([Date.now(), buf.byteLength]);
-    if (!decoder || decoder.state !== "configured") return;
-    if (waitingKey && !key) return;
+    const ready = decoder && decoder.state === "configured";
+    if (ready && !key && decoder.decodeQueueSize >= MAX_DECODE_QUEUE) {
+      // The decoder is behind: drop up to the next keyframe rather than fall further behind.
+      waitingKey = true;
+      send({ t: "keyframe" });
+    }
+    if (!ready || (waitingKey && !key)) {
+      send({ t: "ack", seq });
+      return;
+    }
     waitingKey = false;
+    decoding.set(capturedUs, [seq, performance.now()]);
     decoder.decode(new EncodedVideoChunk({ type: key ? "key" : "delta", timestamp: capturedUs, data: new Uint8Array(buf, 13) }));
   }
+
+  // A decoder that holds a frame for a second has stalled: let the stream go on.
+  setInterval(() => {
+    const oldest = decoding.values().next().value;
+    if (oldest && performance.now() - oldest[1] > 1000) flushDecoding();
+  }, 500);
 
   // ── stats overlay ──────────────────────────────────────────────────────
 
@@ -430,10 +503,18 @@
     if (text) paste(text);
     text = "";
   }
-  function paste(t) {
+  // Sends a text input and remembers it for its answer; says so when it could not be sent.
+  function request(kind, t) {
     const id = nextId++;
-    pending.set(id, "paste");
-    send({ t: "paste", id, text: t });
+    if (!send({ t: kind, id, text: t })) {
+      flash("Not connected: the text was not sent.", "error");
+      return false;
+    }
+    pending.set(id, kind);
+    return true;
+  }
+  function paste(t) {
+    request("paste", t);
   }
   function key(usage, mods) {
     flushText();
@@ -523,10 +604,7 @@
   $("paste-type").addEventListener("click", () => {
     const t = pasteText.value;
     pasteBox.hidden = true;
-    if (t) {
-      const id = nextId++;
-      pending.set(id, "type");
-      send({ t: "paste_and_type", id, text: t });
+    if (t && request("paste_and_type", t)) {
       flash("Typing pasted text…");
     }
     screen.focus();

@@ -117,50 +117,67 @@ async fn next(ws: &mut Socket) -> Msg {
     }
 }
 
+/// One deadline for a whole wait, however many unrelated messages arrive meanwhile.
+async fn within<T>(what: &str, wait: impl Future<Output = T>) -> T {
+    tokio::time::timeout(Duration::from_secs(10), wait).await.unwrap_or_else(|_| panic!("no {what} within 10 s"))
+}
+
 /// The next text message that is not a decoder setup, acknowledging frames on the way.
 async fn text(ws: &mut Socket) -> Value {
-    loop {
-        match next(ws).await {
-            Msg::Text(v) if v["t"] == "format" => {}
-            Msg::Text(v) => return v,
-            Msg::Frame { seq, .. } => send(ws, json!({"t": "ack", "seq": seq})).await,
-            Msg::Closed(code, why) => panic!("closed {code}: {why}"),
+    within("reply", async {
+        loop {
+            match next(ws).await {
+                Msg::Text(v) if v["t"] == "format" => {}
+                Msg::Text(v) => return v,
+                Msg::Frame { seq, .. } => send(ws, json!({"t": "ack", "seq": seq})).await,
+                Msg::Closed(code, why) => panic!("closed {code}: {why}"),
+            }
         }
-    }
+    })
+    .await
 }
 
 /// The next decoder setup.
 async fn format(ws: &mut Socket) -> Value {
-    loop {
-        match next(ws).await {
-            Msg::Text(v) if v["t"] == "format" => return v,
-            Msg::Closed(code, why) => panic!("closed {code}: {why}"),
-            _ => {}
+    within("format", async {
+        loop {
+            match next(ws).await {
+                Msg::Text(v) if v["t"] == "format" => return v,
+                Msg::Closed(code, why) => panic!("closed {code}: {why}"),
+                _ => {}
+            }
         }
-    }
+    })
+    .await
 }
 
 /// The next frame, acknowledged; text messages on the way are skipped.
 async fn frame(ws: &mut Socket) -> (bool, u32) {
-    loop {
-        match next(ws).await {
-            Msg::Frame { key, seq } => {
-                send(ws, json!({"t": "ack", "seq": seq})).await;
-                return (key, seq);
+    within("frame", async {
+        loop {
+            match next(ws).await {
+                Msg::Frame { key, seq } => {
+                    send(ws, json!({"t": "ack", "seq": seq})).await;
+                    return (key, seq);
+                }
+                Msg::Text(_) => {}
+                Msg::Closed(code, why) => panic!("closed {code}: {why}"),
             }
-            Msg::Text(_) => {}
-            Msg::Closed(code, why) => panic!("closed {code}: {why}"),
         }
-    }
+    })
+    .await
 }
 
 /// Waits until the socket closes; returns the close code.
 async fn closed(ws: &mut Socket) -> u16 {
-    loop {
-        if let Msg::Closed(code, _) = next(ws).await {
-            return code;
+    within("close", async {
+        loop {
+            if let Msg::Closed(code, _) = next(ws).await {
+                return code;
+            }
         }
-    }
+    })
+    .await
 }
 
 /// Waits until the fake device's log has `line`.
@@ -328,6 +345,12 @@ async fn a_still_screen_reaches_a_viewer_that_joins_later() {
     let mut s2 = open(&env, &token, &lease, false).await.ws().await;
     let joined = tokio::time::timeout(Duration::from_millis(500), frame(&mut s2)).await;
     assert!(matches!(joined, Ok((true, _))), "a later viewer gets a keyframe at once: {joined:?}");
+
+    // A page that asks again right away (its decoder dropped frames) is inside the throttle; the
+    // request waits and still goes out, though the screen does not change.
+    send(&mut s2, json!({"t": "keyframe"})).await;
+    let again = tokio::time::timeout(Duration::from_secs(2), frame(&mut s2)).await;
+    assert!(matches!(again, Ok((true, _))), "a throttled keyframe request is retried: {again:?}");
 }
 
 #[tokio::test]

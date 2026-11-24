@@ -31,15 +31,20 @@ final class Output {
     }
 
     static let shared = Output()
-    static let maxPayload = 8 << 20
+    static let maxPayload = 4 << 20
     /// Queued bytes above which droppable messages (frames) are refused.
     private static let maxBacklog = 4 << 20
+    /// Error statuses queued at once; more are counted and reported in one later status.
+    private static let maxQueuedErrors = 8
 
     private let queue = DispatchQueue(label: "seiji-sim.stdout", qos: .userInitiated)
     private let lock = NSLock()
     private var backlog = 0
     private var broken = false
     private var closed = false
+    private var queuedErrors = 0
+    private var skippedErrors = 0
+    private var lastSkippedError = ""
 
     /// A message buffer with the 5-byte header filled in, ready for `payloadLength` payload bytes.
     static func message(_ kind: Kind, payloadLength: Int) -> Data {
@@ -62,32 +67,69 @@ final class Output {
             return false
         }
         lock.lock()
-        if closed || broken || (droppable && backlog > Self.maxBacklog) {
-            lock.unlock()
-            return false
-        }
-        backlog += message.count
+        let accepted = !closed && !broken && !(droppable && backlog > Self.maxBacklog)
+        if accepted { backlog += message.count }
         lock.unlock()
-        queue.async { [self] in
-            let ok = writeAll(message)
-            lock.lock()
-            backlog -= message.count
-            if !ok { broken = true }
-            lock.unlock()
-        }
-        return true
+        if accepted { enqueue(message, isError: false) }
+        return accepted
+    }
+
+    /// Whether a frame sent now would be accepted.
+    var acceptsFrames: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return !closed && !broken && backlog <= Self.maxBacklog
     }
 
     func status(_ object: [String: Any]) {
-        guard let json = try? JSONSerialization.data(withJSONObject: object) else { return }
-        var message = Self.message(.status, payloadLength: json.count)
-        message.append(json)
+        guard let message = Self.statusMessage(object) else { return }
         send(message)
     }
 
+    /// An error status. While stdout is not draining, at most `maxQueuedErrors` wait in the
+    /// queue; the rest are summed up in one status once the queue moves again.
     func error(_ text: String) {
         debugLog("status error: \(text)")
-        status(["error": text])
+        guard let message = Self.statusMessage(["error": text]) else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        guard !closed, !broken else { return }
+        if queuedErrors >= Self.maxQueuedErrors {
+            skippedErrors += 1
+            lastSkippedError = text
+            return
+        }
+        queuedErrors += 1
+        backlog += message.count
+        enqueue(message, isError: true)
+    }
+
+    private static func statusMessage(_ object: [String: Any]) -> Data? {
+        guard let json = try? JSONSerialization.data(withJSONObject: object) else { return nil }
+        var message = Self.message(.status, payloadLength: json.count)
+        message.append(json)
+        return message
+    }
+
+    /// Writes on `queue`; the caller has already counted `message` into `backlog`.
+    private func enqueue(_ message: Data, isError: Bool) {
+        queue.async { [self] in
+            let ok = writeAll(message)
+            lock.lock()
+            defer { lock.unlock() }
+            backlog -= message.count
+            if !ok { broken = true }
+            guard isError else { return }
+            queuedErrors -= 1
+            guard skippedErrors > 0, !closed, !broken,
+                  let summary = Self.statusMessage([
+                      "error": "\(skippedErrors) more errors; the last: \(lastSkippedError)",
+                  ]) else { return }
+            skippedErrors = 0
+            queuedErrors += 1
+            backlog += summary.count
+            enqueue(summary, isError: true)
+        }
     }
 
     /// Stops accepting messages and waits (bounded) for the queued ones to reach the pipe.
@@ -170,18 +212,20 @@ final class LineReader {
                 }
                 if pending.count + head.count > Self.maxLine {
                     pending.removeAll(keepingCapacity: true)
-                    onTooLong()
+                    autoreleasepool { onTooLong() }
                     continue
                 }
                 pending.append(contentsOf: head)
-                onLine(pending)
+                // A plain Thread has no autorelease pool of its own; without one per line,
+                // every JSONSerialization temporary would live until exit.
+                autoreleasepool { onLine(pending) }
                 pending.removeAll(keepingCapacity: true)
             }
             if discarding { continue }
             if pending.count + bytes.count > Self.maxLine {
                 pending.removeAll(keepingCapacity: true)
                 discarding = true
-                onTooLong()
+                autoreleasepool { onTooLong() }
             } else {
                 pending.append(contentsOf: bytes)
             }

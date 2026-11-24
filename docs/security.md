@@ -299,7 +299,7 @@ A session ends at `viewer.sessionHours` or with its lease, whichever comes first
 
 ### The stream
 
-`seiji-sim` runs as the tenant, so its output is untrusted, like any file a tenant writes. The daemon reads only its framed messages, at most 8 MiB each, and ends the stream on anything else. A `format` must have an `avc1.` codec of six hex digits, sizes of 2–8192 and a base64 record of at most 4 KiB. Frames go only to the viewers of that lease, who see that screen anyway; the browser's own H.264 decoder parses them, as it parses any video.
+`seiji-sim` runs as the tenant, so its output is untrusted, like any file a tenant writes. The daemon reads only its framed messages, at most 4 MiB each, and ends the stream on anything else; the shared buffer of a lease holds at most 32 of them. A `format` must have an `avc1.` codec of six hex digits, sizes of 2–8192 and a base64 record of at most 4 KiB. Frames go only to the viewers of that lease, who see that screen anyway; the browser's own H.264 decoder parses them, as it parses any video. A page that reads nothing for 5 s is closed, and its queued input is dropped, so a revoked session stops reaching the device even when its socket stalls.
 
 ### The page
 

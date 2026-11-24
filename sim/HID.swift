@@ -46,6 +46,8 @@ final class HID {
     /// Serializes sends: the stdin thread and shutdown both use the client.
     private let lock = NSLock()
     private var finger: (point: CGPoint, edge: Edge)?
+    /// Set by `close`: later input is not sent, so nothing can press after the final lift.
+    private var closed = false
 
     init(device: NSObject, onError: @escaping (String) -> Void) throws {
         guard let hidClass = NSClassFromString("_TtC12SimulatorKit24SimDeviceLegacyHIDClient") else {
@@ -86,6 +88,7 @@ final class HID {
     func touch(_ phase: TouchPhase, x: Double, y: Double, edge: Edge) -> String? {
         lock.lock()
         defer { lock.unlock() }
+        guard !closed else { return nil }
         let point = CGPoint(x: x, y: y)
         switch phase {
         case .down:
@@ -107,19 +110,24 @@ final class HID {
     func key(usage: UInt32, down: Bool) -> String? {
         lock.lock()
         defer { lock.unlock() }
+        guard !closed else { return nil }
         return send(keyboardFn(usage, down ? 1 : 2), what: "keyboard")
     }
 
     func button(_ button: Button, down: Bool) -> String? {
         lock.lock()
         defer { lock.unlock() }
+        guard !closed else { return nil }
         return send(buttonFn(button.rawValue, down ? 1 : 2, Self.buttonTarget), what: "button")
     }
 
-    /// Lifts a finger still down at its last point, and waits (bounded) for the send to finish.
-    func liftFinger(timeout: DispatchTimeInterval) {
+    /// Stops sending input, then lifts a finger still down at its last point and waits (bounded)
+    /// for that send to finish. Both happen under the input lock, so a touch either went out
+    /// before (and is lifted here) or is never sent.
+    func close(timeout: DispatchTimeInterval) {
         lock.lock()
         defer { lock.unlock() }
+        closed = true
         guard let old = finger else { return }
         finger = nil
         var point = old.point
@@ -128,7 +136,8 @@ final class HID {
         let done = DispatchSemaphore(value: 0)
         let completion: Completion = { _ in done.signal() }
         sendFn(client, sendSel, message, true, completionQueue, completion as AnyObject)
-        _ = done.wait(timeout: .now() + timeout)
+        let lifted = done.wait(timeout: .now() + timeout) == .success
+        debugLog("lifted the finger at (\(point.x), \(point.y))\(lifted ? "" : " (no completion in time)")")
     }
 
     @discardableResult
