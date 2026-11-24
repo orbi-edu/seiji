@@ -71,6 +71,8 @@ const RTT_WINDOW: Duration = Duration::from_secs(10);
 const KEYFRAME_GAP: Duration = Duration::from_millis(500);
 /// A finger left down this long without a move is lifted, and the device is free again.
 const GESTURE_IDLE: Duration = Duration::from_secs(10);
+/// The longest a touch move or lift waits to keep the spacing the page gave the gesture.
+const PACE_MAX: Duration = Duration::from_millis(250);
 /// How long a hardware button is held.
 const BUTTON_HOLD: Duration = Duration::from_millis(60);
 /// Viewer inputs touch the lease at most this often.
@@ -760,6 +762,9 @@ enum ClientMsg {
         y: f64,
         #[serde(default)]
         edge: Option<Edge>,
+        /// When the page saw it, in milliseconds on the page's own clock (`performance.now()`).
+        #[serde(default)]
+        ts: Option<f64>,
     },
     /// A HID usage pressed with modifier usages (224-231) held.
     Key {
@@ -1078,6 +1083,27 @@ struct Gesture {
     x: f64,
     y: f64,
     at: Instant,
+    /// The page's time of one point of the gesture and when it goes to the helper.
+    clock: Option<(f64, Instant)>,
+}
+
+impl Gesture {
+    /// How long to hold a point so the helper gets the gesture with the page's own spacing,
+    /// though the link delivered its points late or in a burst. A late point starts a new anchor;
+    /// no point waits longer than `PACE_MAX`.
+    fn pace(&mut self, ts: Option<f64>) -> Option<Duration> {
+        let ts = ts?;
+        let now = Instant::now();
+        let (c0, s0) = self.clock?;
+        let target = s0 + Duration::from_secs_f64((ts - c0).max(0.0) / 1000.0);
+        if target <= now {
+            self.clock = Some((ts, now));
+            return None;
+        }
+        let wait = (target - now).min(PACE_MAX);
+        self.clock = Some((ts, now + wait));
+        Some(wait)
+    }
 }
 
 fn point(x: f64, y: f64) -> Result<(), ViewError> {
@@ -1131,16 +1157,20 @@ impl Input {
         }
         let hub = self.hub.clone();
         match msg {
-            ClientMsg::Touch { phase: TouchPhase::Down, x, y, edge } => {
+            ClientMsg::Touch { phase: TouchPhase::Down, x, y, edge, ts } => {
                 point(x, y)?;
                 let held = hold(&self.rt, &hub).await?;
                 delivered(hub.send(ScreenCommand::Touch { phase: TouchPhase::Down, x, y, edge }))?;
-                self.gesture = Some(Gesture { _held: held, x, y, at: Instant::now() });
+                let clock = ts.map(|t| (t, Instant::now()));
+                self.gesture = Some(Gesture { _held: held, x, y, at: Instant::now(), clock });
             }
-            ClientMsg::Touch { phase, x, y, .. } => {
+            ClientMsg::Touch { phase, x, y, ts, .. } => {
                 point(x, y)?;
                 // Without a finger down (it was refused as busy, or timed out) there is nothing to move.
                 if let Some(g) = self.gesture.as_mut() {
+                    if let Some(wait) = g.pace(ts) {
+                        tokio::time::sleep(wait).await;
+                    }
                     hub.send(ScreenCommand::Touch { phase, x, y, edge: None });
                     (g.x, g.y, g.at) = (x, y, Instant::now());
                     if phase == TouchPhase::Up {

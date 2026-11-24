@@ -1840,7 +1840,7 @@ The page sends text messages, each a JSON object with `t`. Points are fractions 
 
 | `t` | Fields | Effect |
 |---|---|---|
-| `touch` | `phase` (`down`, `move`, `up`), `x`, `y`, `edge` (optional on `down`: `top`, `bottom`, `left`, `right`) | A finger. `down` takes the lease's operation lock and holds it until `up`, so a run cannot interleave with the gesture. A finger left down 10 s without a move, or when the page goes away, is lifted. `edge` marks a system gesture from that screen edge (the home indicator, Notification Centre) |
+| `touch` | `phase` (`down`, `move`, `up`), `x`, `y`, `edge` (optional on `down`: `top`, `bottom`, `left`, `right`), `ts` (optional) | A finger. `down` takes the lease's operation lock and holds it until `up`, so a run cannot interleave with the gesture. A finger left down 10 s without a move, or when the page goes away, is lifted. `edge` marks a system gesture from that screen edge (the home indicator, Notification Centre). `ts` is when the page saw the point, in milliseconds on the page's clock (`performance.now()`); see [Gesture timing](#gesture-timing) |
 | `key` | `usage` (HID page 7), `mods` (optional, up to 4 of 224–231) | Presses the key with the modifiers held |
 | `button` | `name` (`home`, `lock`) | A hardware button |
 | `type` | `id`, `text` (1–10 000 bytes) | Types the text through `axe type --stdin`, from a scratch file in `<dataDir>/run/` that Seiji deletes after the input (US keyboard characters only). Answers `done` |
@@ -1849,13 +1849,28 @@ The page sends text messages, each a JSON object with `t`. Points are fractions 
 | `preset` | `name` | See [Quality presets](#quality-presets) |
 | `ack` | `seq` | The last frame shown (or skipped) |
 | `keyframe` | | The page dropped frames (its decoder fell behind or was reset): start over at a keyframe. Also allowed in a view-only session |
-| `ping` | `at` | Echoed back in a `pong` |
+| `ping` | `at` | Echoed back in a `pong`. The page sends one every second |
 
 Input restarts the idle timer. Viewer input is not recorded as a run.
 
 ```json
 {"t": "touch", "phase": "down", "x": 0.5, "y": 0.5}
 ```
+
+### Gesture timing
+
+A link can hold a gesture's points back and then deliver them together. The device would then see a swipe that is too fast, and fling. With `ts` on the points, Seiji hands each `move` and `up` to the helper with the spacing the page gave them:
+
+- The `down` sets the anchor: its `ts` and the moment it reached the helper.
+- A later point waits until the anchor plus its `ts` difference, at most 250 ms.
+- A point that is already late goes at once and becomes the new anchor. So a gesture that the link delayed keeps its shape, and it arrives late by the worst delay inside the gesture, up to 250 ms.
+
+Points without `ts` go at once, as before.
+
+### What the page shows
+
+- **Feedback at once:** the finger's position while it is down, its path for the last 400 ms, and a ripple where a tap landed. The page draws them before the device answers.
+- **Link:** a badge with the last round trip and the jitter (the mean change between the last 10 round trips): green under 150 ms and 30 ms, amber under 350 ms and 100 ms, red above, and red with `no answer N s` when no `pong` came back for 3 s. After 3 s of red, the page says once a minute that the picture and input lag, and that Smooth needs less bandwidth. **Stats** also shows the jitter.
 
 ## Client setup
 

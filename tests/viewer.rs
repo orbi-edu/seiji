@@ -599,6 +599,65 @@ async fn a_burst_of_input_after_a_hiccup_arrives_whole_and_in_order() {
     assert_eq!(log, want, "every message, in order");
 }
 
+/// When each touch reached the device, by its log line.
+fn touch_times(env: &Env) -> Vec<(std::time::Instant, String)> {
+    env.fake.timed_log().into_iter().filter(|(_, l)| l.starts_with("touch")).collect()
+}
+
+fn gaps_ms(times: &[(std::time::Instant, String)]) -> Vec<u128> {
+    times.windows(2).map(|w| (w[1].0 - w[0].0).as_millis()).collect()
+}
+
+#[tokio::test]
+async fn a_gesture_that_arrives_in_a_burst_keeps_its_own_timing() {
+    let env = setup(2).await;
+    let (token, lease) = device(&env, "alice").await;
+    let mut ws = open(&env, &token, &lease, true).await.ws().await;
+    format(&mut ws).await;
+
+    // A swipe the page drew over 400 ms, delivered all at once by a link that held it back.
+    let mut burst = vec![json!({"t": "touch", "phase": "down", "x": 0.5, "y": 0.8, "ts": 1000.0})];
+    burst.extend((1..=3).map(|i| json!({"t": "touch", "phase": "move", "x": 0.5, "y": 0.8 - 0.1 * f64::from(i), "ts": 1000.0 + 100.0 * f64::from(i)})));
+    burst.push(json!({"t": "touch", "phase": "up", "x": 0.5, "y": 0.4, "ts": 1400.0}));
+    for m in burst {
+        ws.feed(tungstenite::Message::text(m.to_string())).await.unwrap();
+    }
+    ws.flush().await.unwrap();
+    logged(&env, "touch up 0.50,0.40").await;
+
+    let times = touch_times(&env);
+    assert_eq!(times.len(), 5, "{times:?}");
+    for gap in gaps_ms(&times) {
+        assert!((80..250).contains(&gap), "the device got the points {:?} ms apart, not 100", gaps_ms(&times));
+    }
+}
+
+#[tokio::test]
+async fn pacing_sends_a_late_point_at_once_and_holds_none_past_250_ms() {
+    let env = setup(2).await;
+    let (token, lease) = device(&env, "alice").await;
+    let mut ws = open(&env, &token, &lease, true).await.ws().await;
+    format(&mut ws).await;
+
+    send(&mut ws, json!({"t": "touch", "phase": "down", "x": 0.5, "y": 0.5, "ts": 0.0})).await;
+    logged(&env, "touch down 0.50,0.50").await;
+    // The page drew this 100 ms after the down; it arrives 400 ms after it.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let sent = std::time::Instant::now();
+    send(&mut ws, json!({"t": "touch", "phase": "move", "x": 0.5, "y": 0.6, "ts": 100.0})).await;
+    // Then a point the page says came 5 s later: it waits at most 250 ms.
+    send(&mut ws, json!({"t": "touch", "phase": "move", "x": 0.5, "y": 0.7, "ts": 5100.0})).await;
+    send(&mut ws, json!({"t": "touch", "phase": "up", "x": 0.5, "y": 0.7, "ts": 5101.0})).await;
+    logged(&env, "touch up 0.50,0.70").await;
+
+    let times = touch_times(&env);
+    assert_eq!(times.len(), 4, "{times:?}");
+    assert!((times[1].0 - sent).as_millis() < 100, "the late point waited {:?}", times[1].0 - sent);
+    let held = (times[2].0 - times[1].0).as_millis();
+    assert!((200..400).contains(&held), "a far point waited {held} ms");
+    assert!((times[3].0 - times[2].0).as_millis() < 100, "the lift kept its 1 ms spacing");
+}
+
 #[tokio::test]
 async fn a_page_that_closes_on_a_stuck_link_runs_none_of_its_queued_input() {
     let env = heavy_stream().await;
