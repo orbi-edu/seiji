@@ -553,7 +553,7 @@ A view-only session answers `This viewer is view-only.` for every input. Ask for
 
 **Cause:** The link cannot carry the stream. Seiji skips frames for that viewer instead of queueing them, and lowers the bitrate for a while ([mcp.md](mcp.md#the-stream)).
 
-**Fix:** Pick **Smooth** in the toolbar, or lower `viewer.bitrateKbps` or `viewer.scale` for the host. The round trip itself (for example about 140 ms from São Paulo to us-east-1) does not lower the frame rate.
+**Fix:** Pick **Smooth** in the toolbar, or lower `viewer.bitrateKbps` or `viewer.scale` for the host. A long round trip alone (about 140 ms was tested) does not lower the frame rate.
 
 ### The Tern plugin says the CLI is missing
 
