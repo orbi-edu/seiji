@@ -154,6 +154,7 @@ Builds are copied in through stdin. Under `os_user` the daemon cannot write into
 - A tool call holds its HTTP request open for its whole length. The response is an SSE stream with keepalive comments every 15 s, so the proxy needs only an idle read timeout above 15 s. The absolute operation time does not matter for timeouts.
 - Outbound connections: build downloads (`install_app` with `url`), and `https://api.copilot.mobile.dev/v2/bot/maestro-cheat-sheet` at the first `cheat_sheet` call of the process.
 - Driver ports, emulator console ports, the adb server and open tunnels are TCP ports on the host. Seiji does not authenticate them. Any local process can connect to them.
+- With `viewer.webrtc.enabled`, each viewer page that asks gets one UDP port from `viewer.webrtc.ports`, bound on `viewer.webrtc.bind`. See [WebRTC](#webrtc).
 
 ## Maestro flows
 
@@ -300,6 +301,16 @@ A session ends at `viewer.sessionHours` or with its lease, whichever comes first
 ### The stream
 
 `seiji-sim` runs as the tenant, so its output is untrusted, like any file a tenant writes. The daemon reads only its framed messages, at most 4 MiB each, and ends the stream on anything else; the shared buffer of a lease holds at most 32 of them. A `format` must have an `avc1.` codec of six hex digits, sizes of 2–8192 and a base64 record of at most 4 KiB. Frames go only to the viewers of that lease, who see that screen anyway; the browser's own H.264 decoder parses them, as it parses any video. A page that reads nothing for 5 s is closed, and its queued input is dropped, so a revoked session stops reaching the device even when its socket stalls.
+
+### WebRTC
+
+With `viewer.webrtc.enabled`, a page can take the stream and send its input over WebRTC ([configuration.md](configuration.md#webrtc)). The code is in `src/viewer/rtc.rs` (the `str0m` crate).
+
+- **Signaling is the session.** The page sends its offer on its own WebSocket, which passed every check above, and the answer goes back only there. Seiji is ICE-lite: it never connects out, it answers on the port it bound for that session.
+- **Only that page connects.** The answer carries a random ICE password and the DTLS certificate's fingerprint. A peer without them fails the STUN check or the DTLS handshake. Video goes over SRTP and input over SCTP in DTLS, both encrypted.
+- **Same input rules.** Input on the data channel goes into the same queue as the WebSocket's, under the same op lock and checks; a view-only session gets `view_only` (on the WebSocket) for it. The channel takes input and pings only, not presets.
+- **It ends with the session.** A WebRTC session ends when its WebSocket closes, when a new offer replaces it, when its peer disconnects, or after 15 s without connecting. Its port is free again then. One page holds at most one port; the range caps them all.
+- **Exposure.** The ports in `viewer.webrtc.ports` answer only STUN with the right password, then DTLS. Allow them only from the networks your pages are on.
 
 ### The page
 

@@ -147,6 +147,10 @@ Each test acquires an iOS device for a new user and opens viewer links with `POS
 | `agents_share_a_view_only_link` | `share_screen` with no arguments returns `control: false`, and its link opens with `303` |
 | `paste_puts_text_on_pasteboard_and_respects_guards` | `paste` sets the clipboard and then presses Cmd+V through the helper (`hid key 227 down`, `25 down`, `25 up`, `227 up`), and answers `done` with `via: "pasted"`; without a clipboard, `via: "typed"`. `paste_and_type` types. A view-only page gets `view_only`; empty or over-limit text gets `bad_request` with the input's `id` |
 | `presets_and_stats_describe_the_shared_stream` | `stats` counts frames and shows `balanced` with `fps`, `scale` and `bitrate`. The `sharp` preset sends `encode 20 0.8 5000000` to the helper and shows in `info`. A view-only page cannot change the preset |
+| `webrtc_carries_the_stream_and_the_input` | With `viewer.webrtc` on, `info` shows `webrtc: true`. A str0m peer on loopback (the page's end) gets an answer to its offer, and its first frame holds an SPS, a PPS and an IDR slice. A touch on the `input` channel reaches the device, and a `ping` there gets a `pong` with `server_ms`. After `video_via rtc` the WebSocket carries no frames for 700 ms while WebRTC frames go on; after `video_via ws` the WebSocket's next frame is a keyframe |
+| `a_view_only_page_watches_over_webrtc_but_cannot_touch` | A view-only page gets WebRTC frames; a touch on its `input` channel gets `view_only` on the WebSocket and never reaches the device |
+| `webrtc_is_refused_when_it_is_off` | Without `viewer.webrtc`, `info` shows `webrtc: false`, an offer gets `rtc_unavailable`, and the WebSocket stream goes on |
+| `a_page_that_goes_away_frees_its_webrtc_port` | With one port, a second page's offer gets `rtc_unavailable`; once the first page closes, the second gets an answer within 5 s |
 
 ### `tests/forward.rs`
 

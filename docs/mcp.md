@@ -1791,7 +1791,7 @@ These routes take no bearer token. `GET /view/open/{ticket}` trades a ticket (si
 | `GET /view/open/{ticket}` | `303` to the page with the session cookie. A used or expired ticket gets a `401` HTML page |
 | `GET /view/s/{sid}/` | The viewer page |
 | `GET /view/assets/viewer.js`, `GET /view/assets/viewer.css` | The page's script and style, embedded in the binary |
-| `GET /view/s/{sid}/info` | JSON: `lease_id`, `user`, `model`, `device_type`, `runtime`, `udid`, `started_at`, `ends_at_latest`, `control`, `busy` (a run holds the device), `viewers`, `app`, `preset`, `stream_opts` (`fps`, `scale`, `bitrate`), `server_time_ms` |
+| `GET /view/s/{sid}/info` | JSON: `lease_id`, `user`, `model`, `device_type`, `runtime`, `udid`, `started_at`, `ends_at_latest`, `control`, `busy` (a run holds the device), `viewers`, `app`, `preset`, `stream_opts` (`fps`, `scale`, `bitrate`), `server_time_ms`, `webrtc` (`viewer.webrtc.enabled`) |
 | `GET /view/s/{sid}/stats` | JSON: `stream` (`started_at_ms`, `fps`, `kbps`, `mean_frame_bytes`, `total_frames`, `total_bytes`, `viewers`, `last_frame_at_ms`), `preset`, `opts` (`fps`, `scale`, `bitrate` now) |
 | `GET /view/s/{sid}/ws` | The WebSocket of the page: the stream out, the input in (below). The `Origin` header, when present, must name this host |
 | `GET /view/s/{sid}/screenshot.jpg` | A JPEG download of the screen |
@@ -1812,17 +1812,30 @@ The WebSocket closes with code `4401` when the session expires or its user (or t
 
 ### The stream
 
-Seiji runs one [`seiji-sim`](configuration.md#viewer) helper for each watched lease, as the user's account. It reads the simulator's framebuffer, encodes it as H.264 with VideoToolbox (no B-frames, a keyframe on request and every 2 s while the screen moves) and keeps one HID connection open for input. A static screen produces no frames. The helper starts with the first viewer and stops when the last one leaves or the lease ends. If it exits while someone watches, Seiji starts it again after 1 s. While someone watches, Seiji touches the lease every 60 s, so a watched device is not released as idle. Every 30 s, Seiji logs a structured line with the stream's fps, kbit/s, bitrate and viewer count.
+Seiji runs one [`seiji-sim`](configuration.md#viewer) helper for each watched lease, as the user's account. It reads the simulator's framebuffer, encodes it as H.264 with VideoToolbox (no B-frames; a keyframe when a viewer asks for one, and at least every 10 s while the screen moves) and keeps one HID connection open for input. At a low bitrate the encoder skips frames; a skipped frame needs no keyframe after it, so the stream stays a stream of small frames. A static screen produces no frames. The helper starts with the first viewer and stops when the last one leaves or the lease ends. If it exits while someone watches, Seiji starts it again after 1 s. While someone watches, Seiji touches the lease every 60 s, so a watched device is not released as idle. Every 30 s, Seiji logs a structured line with the stream's fps, kbit/s, bitrate and viewer count.
 
 The server sends:
 
 - A text message `{"t": "format", "codec": "avc1.PPCCLL", "width", "height", "description": "<base64 avcC>"}` before the first frame and after a size change: the arguments of WebCodecs `VideoDecoder.configure`.
 - One binary message for each frame: 1 byte of flags (bit 0: keyframe), the frame number (4 bytes, big-endian), the capture time in Unix microseconds (8 bytes, big-endian), then the sample in AVCC form (a 4-byte length before each NAL unit).
-- `{"t": "pong", "at", "server_ms"}` for each ping, `{"t": "preset", "preset", "opts"}` after a preset change, and `{"t": "done", "id", "via"}` after a text input.
+- `{"t": "pong", "at", "server_ms"}` for each ping, `{"t": "preset", "preset", "opts"}` after a preset change, `{"t": "done", "id", "via"}` after a text input, and `{"t": "rtc_answer", "sdp"}` after a WebRTC offer.
 
 The page acknowledges each frame with `{"t": "ack", "seq": <frame number>}` once it has shown it (a frame it skips, once it skipped it), so a slow decoder holds the stream back like a slow link. A viewer whose oldest unacknowledged frame is older than its lowest round trip of the last 10 s plus 200 ms (or 60 frames are in flight) is congested: Seiji sends it no more frames until it catches up, then asks the helper for a keyframe and resumes there. So a slow link shows a recent picture with gaps, never a growing delay. A joining viewer gets the current format and a keyframe at once; a viewer that fell behind the shared buffer gets the current format again if it missed one. Seiji reads the page apart from writing to it: input reaches the device while a frame is still on its way down a slow link. When one write to the page stalls for 5 s, Seiji closes the session. Once a session ends, or the page closes its socket, input still queued for it is dropped.
 
 A congested viewer also lowers the shared bitrate to 70 %, at most every 2 s and never below 20 % of the preset. After 4 s without congestion the bitrate grows 15 % every 2 s, back to the preset.
+
+### WebRTC
+
+With `viewer.webrtc.enabled` (`info.webrtc` is `true`), the page can take the stream and send its input over WebRTC ([configuration.md](configuration.md#webrtc)):
+
+1. The page sends `{"t": "rtc_offer", "sdp"}` on its WebSocket: one `recvonly` video transceiver and a data channel labeled `input`. Seiji answers `{"t": "rtc_answer", "sdp"}`, or an `error` with `code` `rtc_unavailable` when WebRTC is off or every port is in use. A new offer replaces the session's old WebRTC session.
+2. The page connects over UDP to the answer's candidates. Seiji sends the shared stream as H.264 (Annex B, the SPS and PPS before each keyframe), with the capture time as RTP time at 90 kHz and a playout delay of 0. Frames start at a keyframe, and a lost one gets a keyframe on the browser's request (PLI or FIR).
+3. Once it plays the WebRTC video, the page sends `{"t": "video_via", "via": "rtc"}` on the WebSocket, and Seiji stops sending it frames there. `{"t": "video_via", "via": "ws"}` brings them back, starting at a keyframe.
+4. On the `input` channel, the page sends the same input messages as on the WebSocket (`touch`, `key`, `button`, `type`, `paste`, `paste_and_type`) and `ping`, answered on the channel with `pong`. They join the WebSocket's input queue; their replies (`done`, errors) come on the WebSocket. Anything else gets `bad_request`.
+
+The bandwidth estimate (transport-wide congestion control) replaces the acknowledgments: the shared stream stays under 85 % of the lowest estimate among the lease's WebRTC viewers (never below 150 kbit/s). It follows a falling estimate at once and a rising one at most every second, so the sender's pacer, which holds back whatever goes above the estimate (up to 2 s of it), stays nearly empty. The estimator probes up to the preset's bitrate. A WebRTC session ends with its WebSocket, when its peer disconnects, or 15 s after the answer if the page never connects.
+
+The page uses WebRTC when `info.webrtc` is `true` and the browser has `RTCPeerConnection` and `requestVideoFrameCallback`. It falls back to the WebSocket stream when WebRTC does not play within 10 s or the connection fails, and tries again on its next WebSocket. A gesture keeps the path its `down` took.
 
 ### Quality presets
 
@@ -1849,7 +1862,9 @@ The page sends text messages, each a JSON object with `t`. Points are fractions 
 | `preset` | `name` | See [Quality presets](#quality-presets) |
 | `ack` | `seq` | The last frame shown (or skipped) |
 | `keyframe` | | The page dropped frames (its decoder fell behind or was reset): start over at a keyframe. Also allowed in a view-only session |
-| `ping` | `at` | Echoed back in a `pong`. The page sends one every second |
+| `ping` | `at` | Echoed back in a `pong`. The page sends one every second, on the WebRTC `input` channel when it is open |
+| `rtc_offer` | `sdp` | A WebRTC offer; see [WebRTC](#webrtc). Also allowed in a view-only session |
+| `video_via` | `via` (`ws`, `rtc`) | Where the page shows the stream from; see [WebRTC](#webrtc). Also allowed in a view-only session |
 
 Input restarts the idle timer. Viewer input is not recorded as a run.
 
@@ -1870,7 +1885,8 @@ Points without `ts` go at once, as before.
 ### What the page shows
 
 - **Feedback at once:** the finger's position while it is down, its path for the last 400 ms, and a ripple where a tap landed. The page draws them before the device answers.
-- **Link:** a badge with the last round trip and the jitter (the mean change between the last 10 round trips): green under 150 ms and 30 ms, amber under 350 ms and 100 ms, red above, and red with `no answer N s` when no `pong` came back for 3 s. After 3 s of red, the page says once a minute that the picture and input lag, and that Smooth needs less bandwidth. **Stats** also shows the jitter.
+- **Link:** a badge with the last round trip and the jitter (the mean change between the last 10 round trips): green under 150 ms and 30 ms, amber under 350 ms and 100 ms, red above, and red with `no answer N s` when no `pong` came back for 3 s. It also counts what is lost on the way in windows of 3 s, as Moonlight does: frames the server skipped for this page (gaps in the frame numbers) over the WebSocket, packets over WebRTC. It shows `N% lost`, turns red at 30 % in one window or 15 % in two in a row, and is fine again at 5 % or less; over 5 % it is at best amber. After 3 s of red, the page says once a minute that the picture and input lag, and that Smooth needs less bandwidth. **Stats** also shows the jitter and the loss.
+- **A keyframe dropped during setup is asked for again.** On a slow link the format and the first keyframe can arrive together, before the decoder is set up. The page drops what arrives meanwhile and, if a keyframe was among it, asks for one with `keyframe`, so a still screen does not stay on "Connecting…".
 
 ## Client setup
 

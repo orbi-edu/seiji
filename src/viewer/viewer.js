@@ -46,6 +46,7 @@
     $("dot").className = "dot off";
     for (const b of document.querySelectorAll("button, select")) b.disabled = true;
     if (ws) ws.close();
+    stopRtc();
     if (decoder && decoder.state !== "closed") decoder.close();
   }
 
@@ -115,6 +116,23 @@
     return true;
   }
 
+  // Input goes on the WebRTC input channel once it is open, else on the socket. A gesture keeps
+  // the path its `down` took, so its points never overtake each other on two paths.
+  let gesturePath = null;
+  function sendInput(msg) {
+    let path = dc && dc.readyState === "open" ? "rtc" : "ws";
+    if (msg.t === "touch") {
+      if (msg.phase === "down") gesturePath = path;
+      else if (gesturePath) path = gesturePath;
+      if (msg.phase === "up") gesturePath = null;
+    }
+    if (path === "rtc" && dc && dc.readyState === "open") {
+      dc.send(JSON.stringify(msg));
+      return true;
+    }
+    return send(msg);
+  }
+
   function connect() {
     if (ended) return;
     if (!("VideoDecoder" in window)) {
@@ -131,13 +149,18 @@
       retry = 0;
       // A new socket starts a new sample: the old one's round trips say nothing about it.
       rtts.length = 0;
+      resetLoss();
       lastPong = performance.now();
       ping();
+      startRtc();
     };
     ws.onmessage = (ev) => (typeof ev.data === "string" ? onText(JSON.parse(ev.data)) : onFrame(ev.data));
     ws.onclose = (ev) => {
       ws = null;
       resetVideo();
+      // The session's WebRTC end closed with it; the next socket tries again.
+      stopRtc();
+      rtcTried = false;
       if (ended) return;
       // An input sent before the drop may or may not have reached the device: say so, never replay.
       if (pending.size) {
@@ -157,8 +180,11 @@
     };
   }
 
+  // Over the input channel when it is open: the round trip of the path input takes.
   function ping() {
-    send({ t: "ping", at: performance.now() });
+    const msg = { t: "ping", at: performance.now() };
+    if (dc && dc.readyState === "open") dc.send(JSON.stringify(msg));
+    else send(msg);
   }
   setInterval(ping, 1000);
 
@@ -184,12 +210,40 @@
     lastPong = performance.now();
   }
 
+  // Frames lost on the way, in windows of 3 s, as Moonlight judges a link: poor at 30 % in one
+  // window or 15 % in two in a row, fine again at 5 % or less. Over the WebSocket a lost frame is
+  // one the server skipped for this page (a gap in the frame numbers); over WebRTC, a lost
+  // packet.
+  const loss = { got: 0, lost: 0, since: performance.now(), pct: null, last: 0, poor: false };
+  function countFrames(got, lost) {
+    loss.got += got;
+    loss.lost += lost;
+  }
+  function sampleLoss(now) {
+    if (now - loss.since < 3000) return;
+    const total = loss.got + loss.lost;
+    const pct = total ? (loss.lost * 100) / total : null;
+    if (pct !== null) {
+      if (pct >= 30 || (pct >= 15 && loss.last >= 15)) loss.poor = true;
+      else if (pct <= 5) loss.poor = false;
+      loss.last = pct;
+    }
+    loss.pct = pct;
+    loss.got = 0;
+    loss.lost = 0;
+    loss.since = now;
+  }
+  function resetLoss() {
+    Object.assign(loss, { got: 0, lost: 0, since: performance.now(), pct: null, last: 0, poor: false });
+  }
+
   function renderLink() {
     if (ended) {
       linkEl.hidden = true;
       return;
     }
     const now = performance.now();
+    sampleLoss(now);
     let text;
     let quality;
     if (!ws || ws.readyState !== WebSocket.OPEN) {
@@ -203,6 +257,9 @@
       const j = jitter();
       text = `${Math.round(rtt)} ms ±${Math.round(j)}`;
       quality = rtt < 150 && j < 30 ? "good" : rtt < 350 && j < 100 ? "fair" : "poor";
+      if (loss.pct !== null && loss.pct >= 1) text += ` · ${Math.round(loss.pct)}% lost`;
+      if (loss.poor) quality = "poor";
+      else if (quality === "good" && loss.pct !== null && loss.pct > 5) quality = "fair";
     } else {
       linkEl.hidden = true;
       return;
@@ -210,7 +267,7 @@
     linkEl.textContent = text;
     linkEl.className = `link ${quality}`;
     linkEl.title =
-      "Round trip to the Seiji host, and how much it varies (jitter). " +
+      "Round trip to the Seiji host, how much it varies (jitter), and the share of frames lost on the way. " +
       "Over a poor link the picture and your input lag; Smooth needs less bandwidth.";
     linkEl.hidden = false;
     // Say so once a minute at most, after the link stayed poor for a few seconds.
@@ -244,6 +301,9 @@
       case "preset":
         flash(`Preset: ${msg.preset}`);
         break;
+      case "rtc_answer":
+        onRtcAnswer(msg);
+        break;
       case "done": {
         const kind = pending.get(msg.id);
         pending.delete(msg.id);
@@ -255,6 +315,11 @@
         break;
       }
       case "error":
+        if (msg.code === "rtc_unavailable") {
+          // No WebRTC on this host or no port free: the WebSocket stream goes on, nothing to say.
+          stopRtc();
+          break;
+        }
         if (msg.id) pending.delete(msg.id);
         flash(msg.message || "Input failed.", msg.code === "busy" ? "warning" : "error");
         if (msg.code === "busy") refresh();
@@ -294,9 +359,13 @@
     send({ t: "keyframe" });
   }
 
+  // The last frame number seen on the socket, for the frames the server skipped.
+  let lastSeq = null;
+
   function resetVideo() {
     decoding.clear();
     waitingKey = true;
+    lastSeq = null;
   }
 
   function newDecoder() {
@@ -335,8 +404,15 @@
     });
   }
 
+  // While the decoder is being set up, frames are dropped. A still screen sends no more of them,
+  // so a keyframe dropped then is asked for again once the decoder is ready: on a slow link the
+  // format and the first keyframe arrive together, before the setup is done.
+  let configuring = false;
+  let droppedKey = false;
+
   async function configure(f) {
     format = f;
+    configuring = true;
     const config = {
       codec: f.codec,
       codedWidth: f.width,
@@ -359,6 +435,11 @@
     if (!decoder || decoder.state === "closed") decoder = newDecoder();
     decoder.configure(config);
     decoding.clear();
+    configuring = false;
+    if (droppedKey) {
+      droppedKey = false;
+      send({ t: "keyframe" });
+    }
   }
 
   function onFrame(buf) {
@@ -367,13 +448,16 @@
     const seq = view.getUint32(1);
     const capturedUs = Number(view.getBigInt64(5));
     stats.bytes.push([Date.now(), buf.byteLength]);
-    const ready = decoder && decoder.state === "configured";
+    countFrames(1, lastSeq !== null && seq > lastSeq ? seq - lastSeq - 1 : 0);
+    lastSeq = seq;
+    const ready = decoder && decoder.state === "configured" && !configuring;
     if (ready && !key && decoder.decodeQueueSize >= MAX_DECODE_QUEUE) {
       // The decoder is behind: drop up to the next keyframe rather than fall further behind.
       waitingKey = true;
       send({ t: "keyframe" });
     }
     if (!ready || (waitingKey && !key)) {
+      if (!ready && key) droppedKey = true;
       send({ t: "ack", seq });
       return;
     }
@@ -387,6 +471,155 @@
     const oldest = decoding.values().next().value;
     if (oldest && performance.now() - oldest[1] > 1000) flushDecoding();
   }, 500);
+
+  // ── WebRTC ─────────────────────────────────────────────────────────────
+
+  // With `info.webrtc`, the page also offers a WebRTC session over the socket: the stream as
+  // H.264 over UDP into a <video> laid over the canvas, and input on the `input` data channel.
+  // A lost packet then holds back only its own frame, not the input or the frames after it.
+  // The socket keeps the replies, and the video goes back to it when WebRTC fails or never
+  // connects.
+  const video = $("rtc");
+  let pc = null;
+  let dc = null;
+  let rtcOn = false; // the page shows the WebRTC video
+  let rtcTried = false; // one try per socket
+  let rtcTimer = 0;
+  let rtcBytes = null;
+
+  function rtcUsable() {
+    return !!(info && info.webrtc && "RTCPeerConnection" in window && "requestVideoFrameCallback" in HTMLVideoElement.prototype);
+  }
+
+  async function startRtc() {
+    if (pc || rtcTried || ended || !rtcUsable()) return;
+    rtcTried = true;
+    const peer = new RTCPeerConnection({ bundlePolicy: "max-bundle" });
+    pc = peer;
+    const tr = peer.addTransceiver("video", { direction: "recvonly" });
+    // Show each frame as soon as it is decoded: no jitter buffer beyond what decoding needs.
+    if ("jitterBufferTarget" in tr.receiver) tr.receiver.jitterBufferTarget = 0;
+    if ("playoutDelayHint" in tr.receiver) tr.receiver.playoutDelayHint = 0;
+    dc = peer.createDataChannel("input", { ordered: true });
+    dc.onmessage = (ev) => {
+      try {
+        onText(JSON.parse(ev.data));
+      } catch { /* not ours */ }
+    };
+    peer.ontrack = (ev) => {
+      video.srcObject = new MediaStream([ev.track]);
+      placeVideo();
+      video.play().catch(() => {});
+      video.requestVideoFrameCallback(onRtcFrame);
+    };
+    peer.onconnectionstatechange = () => {
+      if (pc === peer && ["failed", "closed"].includes(peer.connectionState)) {
+        stopRtc("The WebRTC link failed: the video is back on the WebSocket.");
+      }
+    };
+    try {
+      await peer.setLocalDescription(await peer.createOffer());
+    } catch {
+      stopRtc();
+      return;
+    }
+    if (pc !== peer || !send({ t: "rtc_offer", sdp: peer.localDescription.sdp })) {
+      stopRtc();
+      return;
+    }
+    // A page that cannot reach the host over UDP stays on the WebSocket.
+    rtcTimer = setTimeout(() => {
+      if (!rtcOn) stopRtc();
+    }, 10000);
+  }
+
+  async function onRtcAnswer(msg) {
+    if (!pc) return;
+    try {
+      await pc.setRemoteDescription({ type: "answer", sdp: msg.sdp });
+    } catch {
+      stopRtc();
+    }
+  }
+
+  function stopRtc(why) {
+    clearTimeout(rtcTimer);
+    if (pc) {
+      pc.ontrack = null;
+      pc.onconnectionstatechange = null;
+      pc.close();
+    }
+    pc = null;
+    dc = null;
+    rtcBytes = null;
+    video.srcObject = null;
+    video.classList.remove("on");
+    if (rtcOn) {
+      rtcOn = false;
+      send({ t: "video_via", via: "ws" });
+      if (why) flash(why, "warning");
+    }
+  }
+
+  // The video covers the canvas exactly; the canvas below keeps the pointer.
+  function placeVideo() {
+    const r = canvas.getBoundingClientRect();
+    const s = screen.getBoundingClientRect();
+    video.style.left = `${r.left - s.left}px`;
+    video.style.top = `${r.top - s.top}px`;
+    video.style.width = `${r.width}px`;
+    video.style.height = `${r.height}px`;
+  }
+  window.addEventListener("resize", () => {
+    if (rtcOn) placeVideo();
+  });
+
+  function onRtcFrame(_now, meta) {
+    if (!pc) return;
+    // The canvas keeps the picture's size, so the layout and the pointer map stay right.
+    if (canvas.width !== meta.width || canvas.height !== meta.height) {
+      canvas.width = meta.width;
+      canvas.height = meta.height;
+    }
+    if (!rtcOn) {
+      rtcOn = true;
+      clearTimeout(rtcTimer);
+      send({ t: "video_via", via: "rtc" });
+      video.classList.add("on");
+      veil.hidden = true;
+      resetVideo();
+    }
+    placeVideo();
+    stats.frames.push(Date.now());
+    // The RTP time is the capture time at 90 kHz, modulo 2^32: the frame's age on the server's
+    // clock.
+    if (meta.rtpTimestamp !== undefined) {
+      const wrap = 2 ** 32 / 90;
+      const age = (((Date.now() + clockOffset - meta.rtpTimestamp / 90) % wrap) + wrap) % wrap;
+      if (age < 10000) stats.age = age;
+    }
+    video.requestVideoFrameCallback(onRtcFrame);
+  }
+
+  // The received bytes, for the bitrate in Stats, and the packets lost, for the link badge.
+  setInterval(async () => {
+    if (!pc || !rtcOn) return;
+    let bytes = 0;
+    let got = 0;
+    let lost = 0;
+    (await pc.getStats()).forEach((r) => {
+      if (r.type === "inbound-rtp" && r.kind === "video") {
+        bytes += r.bytesReceived;
+        got += r.packetsReceived;
+        lost += r.packetsLost;
+      }
+    });
+    if (rtcBytes !== null) {
+      stats.bytes.push([Date.now(), bytes - rtcBytes.bytes]);
+      countFrames(Math.max(0, got - rtcBytes.got), Math.max(0, lost - rtcBytes.lost));
+    }
+    rtcBytes = { bytes, got, lost };
+  }, 1000);
 
   // ── stats overlay ──────────────────────────────────────────────────────
 
@@ -403,10 +636,12 @@
       `Bitrate: ${(bits / 1e6).toFixed(2)} Mbit/s`,
       `Resolution: ${canvas.width}×${canvas.height}`,
       `Codec: ${format ? format.codec : "—"}`,
+      `Transport: ${rtcOn ? "WebRTC (UDP)" : "WebSocket"}`,
       `Round trip: ${rtt === null ? "—" : `${Math.round(rtt)} ms`}`,
       `Jitter: ${rtts.length < 2 ? "—" : `${Math.round(jitter())} ms`}`,
+      `Lost (3 s): ${loss.pct === null ? "—" : `${loss.pct.toFixed(1)} %`}`,
       `Frame age: ${stats.age === null ? "—" : `${Math.round(stats.age)} ms`}`,
-      `Decode queue: ${decoder ? decoder.decodeQueueSize : 0}`,
+      `Decode queue: ${rtcOn ? "—" : decoder ? decoder.decodeQueueSize : 0}`,
     ];
     statsOverlay.textContent = lines.join("\n");
   }
@@ -527,7 +762,7 @@
   // Each touch carries when the page saw it (`ts`), so the server can hand a gesture that the
   // link delayed or bunched to the device with its own spacing.
   function touch(phase, p, ts, edge) {
-    send({ t: "touch", phase, x: p.x, y: p.y, edge, ts });
+    sendInput({ t: "touch", phase, x: p.x, y: p.y, edge, ts });
   }
 
   // Moves are sent at most once per animation frame, always the latest point.
@@ -659,7 +894,7 @@
   // Sends a text input and remembers it for its answer; says so when it could not be sent.
   function request(kind, t) {
     const id = nextId++;
-    if (!send({ t: kind, id, text: t })) {
+    if (!sendInput({ t: kind, id, text: t })) {
       flash("Not connected: the text was not sent.", "error");
       return false;
     }
@@ -671,7 +906,7 @@
   }
   function key(usage, mods) {
     flushText();
-    send({ t: "key", usage, mods: mods || [] });
+    sendInput({ t: "key", usage, mods: mods || [] });
   }
 
   screen.addEventListener("keydown", (ev) => {
@@ -680,11 +915,11 @@
     if (ev.metaKey && ev.shiftKey && k === "h") {
       ev.preventDefault();
       flushText();
-      send({ t: "button", name: "home" });
+      sendInput({ t: "button", name: "home" });
     } else if (ev.metaKey && k === "l") {
       ev.preventDefault();
       flushText();
-      send({ t: "button", name: "lock" });
+      sendInput({ t: "button", name: "lock" });
     } else if (ev.metaKey && k === "s") {
       ev.preventDefault();
       save();
@@ -780,8 +1015,8 @@
     a.click();
     a.remove();
   }
-  $("home").addEventListener("click", () => send({ t: "button", name: "home" }));
-  $("lock").addEventListener("click", () => send({ t: "button", name: "lock" }));
+  $("home").addEventListener("click", () => sendInput({ t: "button", name: "home" }));
+  $("lock").addEventListener("click", () => sendInput({ t: "button", name: "lock" }));
   $("shot").addEventListener("click", save);
 
   refresh().then(connect);
