@@ -253,7 +253,7 @@ impl Devices for FakeDevices {
             let captured_us =
                 std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_micros()
                     as i64;
-            let referenced = key || refresh || n % 2 == 0;
+            let referenced = key || refresh || n.is_multiple_of(2);
             let header = if key {
                 0x65
             } else if referenced {
