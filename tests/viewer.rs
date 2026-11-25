@@ -538,6 +538,34 @@ async fn touches_keys_and_buttons_reach_the_device_in_order() {
 }
 
 #[tokio::test]
+async fn a_short_look_keeps_the_lease_from_idling_out() {
+    let env = setup(2).await;
+    let (token, lease) = device(&env, "alice").await;
+    // Idle for longer than the 10 minute limit.
+    let idle_since = seiji::store::now() - 11 * 60;
+    let conn = rusqlite::Connection::open(env.pool.config.db_path()).unwrap();
+    conn.execute("UPDATE leases SET last_activity_at = ?1 WHERE id = ?2", rusqlite::params![idle_since, lease])
+        .unwrap();
+
+    // A few seconds of watching, without input, well under the 60 s between touches.
+    let mut ws = open(&env, &token, &lease, false).await.ws().await;
+    format(&mut ws).await;
+    frame(&mut ws).await;
+    drop(ws);
+    // The touch happens on the stream's own task.
+    within("the touch", async {
+        while env.pool.store.lease(&lease).unwrap().unwrap().last_activity_at <= idle_since {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    env.pool.reap().await.unwrap();
+    let now_lease = env.pool.store.lease(&lease).unwrap().unwrap();
+    assert_eq!(now_lease.end_reason, None, "the look counts as use");
+    assert!(now_lease.last_activity_at > idle_since);
+}
+
+#[tokio::test]
 async fn a_finger_left_down_is_lifted_when_the_page_goes_away() {
     let env = setup(2).await;
     let (token, lease) = device(&env, "alice").await;

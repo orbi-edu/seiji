@@ -50,7 +50,8 @@ use crate::store::{Lease, LeaseStatus, User, now};
 
 const TICKET_SECONDS: i64 = 60;
 const COOKIE: &str = "seiji_view";
-/// A watched lease counts as used: the stream touches it this often.
+/// A watched lease counts as used: the stream touches it when it starts, this often while it
+/// runs, and when the last viewer leaves, so even a short look keeps it from idling out.
 const TOUCH_EVERY: Duration = Duration::from_secs(60);
 /// How often the stream logs its stats for the operator.
 const STATS_LOG_EVERY: Duration = Duration::from_secs(30);
@@ -973,11 +974,14 @@ async fn run_hub(pool: Arc<Pool>, ctx: DeviceCtx, hub: Arc<Hub>) {
             let mut log = tokio::time::interval(STATS_LOG_EVERY);
             let mut rate = tokio::time::interval(Duration::from_secs(1));
             let mut keyframes = tokio::time::interval(KEYFRAME_GAP / 2);
-            touch.tick().await;
             log.tick().await;
             loop {
                 tokio::select! {
-                    _ = hub.cancel.cancelled() => break,
+                    _ = hub.cancel.cancelled() => {
+                        let _ = store.touch_lease(&lease_id, now());
+                        break;
+                    }
+                    // The first tick is at once: the start of watching counts too.
                     _ = touch.tick() => { let _ = store.touch_lease(&lease_id, now()); }
                     _ = rate.tick() => hub.recover(),
                     _ = keyframes.tick() => hub.flush_keyframe(),
