@@ -12,8 +12,19 @@
 //! 5. **Decode**: received to decoded (page clock).
 //! 6. **Capture → shown**: the whole, the frame age.
 //!
-//! Input has the upload (about half a round trip) and **input in server**: the daemon reading
-//! a message to the helper having it, with the op lock, gesture timing and AXe.
+//! An input (a finger down or up, a key, a button) has its own path, timed the same way:
+//!
+//! 1. **Upload**: the page seeing it to the daemon reading it (server's clock, through the
+//!    page's clock offset).
+//! 2. **Input in server**: the daemon reading it to the helper having it. Of that, **lock** is
+//!    the wait for the device's op lock and **pacing** the hold that keeps a gesture's spacing.
+//! 3. **Screen reacts**: the helper having it to the first frame captured after (host clock):
+//!    the simulator and the app drawing, and the capture's frame pacing.
+//! 4. That frame's encode, helper → server, in server, network and decode, as above.
+//! 5. **Input → shown**: the whole, on the page's clock.
+//!
+//! The daemon tells the page when it read and handed on each input (`applied`); the page does
+//! the rest. Text goes through AXe and has one stage, read to typed (**text**).
 
 use std::collections::VecDeque;
 
@@ -63,6 +74,12 @@ pub(super) struct PageReport {
     /// The daemon reading the frame to the page receiving it (in server and network).
     pub down: Option<[f64; 2]>,
     pub decode: Option<[f64; 2]>,
+    /// An input seen by the page to read by the daemon.
+    pub upload: Option<[f64; 2]>,
+    /// An input with the helper to the first frame captured after it.
+    pub react: Option<[f64; 2]>,
+    /// An input seen by the page to that frame shown.
+    pub photon: Option<[f64; 2]>,
     pub rtt: Option<f64>,
     pub jitter: Option<f64>,
     /// Percent lost in the last 3 s.
@@ -74,7 +91,17 @@ impl PageReport {
     /// Keeps only numbers that can be timings: a page's report goes into the log.
     pub(super) fn checked(mut self) -> Self {
         let ok = |v: f64| v.is_finite() && (0.0..=MAX_MS).contains(&v);
-        for pair in [&mut self.age, &mut self.encode, &mut self.helper, &mut self.down, &mut self.decode] {
+        let stages = [
+            &mut self.age,
+            &mut self.encode,
+            &mut self.helper,
+            &mut self.down,
+            &mut self.decode,
+            &mut self.upload,
+            &mut self.react,
+            &mut self.photon,
+        ];
+        for pair in stages {
             if pair.is_some_and(|[a, b]| !ok(a) || !ok(b)) {
                 *pair = None;
             }
@@ -95,13 +122,27 @@ pub(super) struct Pipeline {
     pub server: Samples,
     /// The daemon reading an input message to the helper having it.
     pub input: Samples,
+    /// Of `input`: the wait for the op lock.
+    pub lock: Samples,
+    /// Of `input`: the hold that keeps a gesture's spacing.
+    pub pace: Samples,
+    /// Text: read to typed or pasted.
+    pub text: Samples,
     pub page: Option<PageReport>,
 }
 
 impl Pipeline {
-    /// What the page shows of this side: `{"t": "server_stats", "server", "input"}`.
+    /// What the page shows of this side: `{"t": "server_stats", "server", "input", "lock",
+    /// "pace", "text"}`.
     pub(super) fn message(&self) -> serde_json::Value {
-        serde_json::json!({ "t": "server_stats", "server": self.server.p50_p95(), "input": self.input.p50_p95() })
+        serde_json::json!({
+            "t": "server_stats",
+            "server": self.server.p50_p95(),
+            "input": self.input.p50_p95(),
+            "lock": self.lock.p50_p95(),
+            "pace": self.pace.p50_p95(),
+            "text": self.text.p50_p95(),
+        })
     }
     /// One log line with every stage, when the page has reported.
     pub(super) fn log(&self, lease: &str, viewer: &str) {
@@ -109,9 +150,11 @@ impl Pipeline {
         let p50 = |v: Option<[f64; 2]>| v.map(|[a, _]| a);
         let p95 = |v: Option<[f64; 2]>| v.map(|[_, b]| b);
         let server = self.server.p50_p95();
-        // The network is the page's "down" minus this side's part of it.
-        let net = p.down.zip(server).map(|([d50, d95], [s50, s95])| [(d50 - s50).max(0.0), (d95 - s95).max(0.0)]);
-        let input = self.input.p50_p95();
+        // The network is the page's "down" minus this side's part of it, to 0.1 ms.
+        let diff = |d: f64, s: f64| ((d - s).max(0.0) * 10.0).round() / 10.0;
+        let net = p.down.zip(server).map(|([d50, d95], [s50, s95])| [diff(d50, s50), diff(d95, s95)]);
+        let (input, lock, pace, text) =
+            (self.input.p50_p95(), self.lock.p50_p95(), self.pace.p50_p95(), self.text.p50_p95());
         let transport = p.transport.map(|t| if t == Via::Rtc { "rtc" } else { "ws" });
         // A stage the page could not measure is left out of the line.
         tracing::info!(
@@ -130,8 +173,20 @@ impl Pipeline {
             network_p95 = p95(net),
             decode_p50 = p50(p.decode),
             decode_p95 = p95(p.decode),
+            upload_p50 = p50(p.upload),
+            upload_p95 = p95(p.upload),
             input_server_p50 = p50(input),
             input_server_p95 = p95(input),
+            input_lock_p50 = p50(lock),
+            input_lock_p95 = p95(lock),
+            input_pace_p50 = p50(pace),
+            input_pace_p95 = p95(pace),
+            react_p50 = p50(p.react),
+            react_p95 = p95(p.react),
+            photon_p50 = p50(p.photon),
+            photon_p95 = p95(p.photon),
+            text_p50 = p50(text),
+            text_p95 = p95(text),
             rtt = p.rtt,
             jitter = p.jitter,
             lost = p.lost,

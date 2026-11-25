@@ -1843,7 +1843,7 @@ The server sends:
 
 - A text message `{"t": "format", "codec": "avc1.PPCCLL", "width", "height", "description": "<base64 avcC>"}` before the first frame and after a size change: the arguments of WebCodecs `VideoDecoder.configure`.
 - One binary message for each frame: 1 byte of flags (bit 0: keyframe), the frame number (4 bytes, big-endian), then three times in Unix microseconds (8 bytes each, big-endian): the capture, the encoder's output (the capture again from a helper older than this version) and the daemon reading the frame, then the sample in AVCC form (a 4-byte length before each NAL unit). The sample starts at byte 29.
-- `{"t": "pong", "at", "server_ms"}` for each ping, `{"t": "preset", "preset", "opts"}` after a preset change, `{"t": "done", "id", "via"}` after a text input, `{"t": "rtc_answer", "sdp"}` after a WebRTC offer, and every 5 s `{"t": "server_stats", "server", "input"}` (see [Where the time goes](#where-the-time-goes)).
+- `{"t": "pong", "at", "server_ms"}` for each ping, `{"t": "preset", "preset", "opts"}` after a preset change, `{"t": "done", "id", "via"}` after a text input, `{"t": "rtc_answer", "sdp"}` after a WebRTC offer, `{"t": "applied", "ts", "read_us", "sent_us"}` after a finger down or up, key or button with `ts`, and every 5 s `{"t": "server_stats", "server", "input", "lock", "pace", "text"}` (see [Where the time goes](#where-the-time-goes)).
 
 The page acknowledges each frame with `{"t": "ack", "seq": <frame number>}` once it has shown it (a frame it skips, once it skipped it), so a slow decoder holds the stream back like a slow link. A viewer whose oldest unacknowledged frame is older than its lowest round trip of the last 10 s plus 200 ms (or 60 frames are in flight) is congested: Seiji sends it no more frames until it catches up, then asks the helper for a keyframe and resumes there. So a slow link shows a recent picture with gaps, never a growing delay. A joining viewer gets the current format and a keyframe at once; a viewer that fell behind the shared buffer gets the current format again if it missed one. Seiji reads the page apart from writing to it: input reaches the device while a frame is still on its way down a slow link. When one write to the page stalls for 5 s, Seiji closes the session. Once a session ends, or the page closes its socket, input still queued for it is dropped.
 
@@ -1879,8 +1879,8 @@ The page sends text messages, each a JSON object with `t`. Points are fractions 
 | `t` | Fields | Effect |
 |---|---|---|
 | `touch` | `phase` (`down`, `move`, `up`), `x`, `y`, `edge` (optional on `down`: `top`, `bottom`, `left`, `right`), `ts` (optional) | A finger. `down` takes the lease's operation lock and holds it until `up`, so a run cannot interleave with the gesture. A finger left down 10 s without a move, or when the page goes away, is lifted. `edge` marks a system gesture from that screen edge (the home indicator, Notification Centre). `ts` is when the page saw the point, in milliseconds on the page's clock (`performance.now()`); see [Gesture timing](#gesture-timing) |
-| `key` | `usage` (HID page 7), `mods` (optional, up to 4 of 224–231) | Presses the key with the modifiers held |
-| `button` | `name` (`home`, `lock`) | A hardware button |
+| `key` | `usage` (HID page 7), `mods` (optional, up to 4 of 224–231), `ts` (optional) | Presses the key with the modifiers held. `ts` as on `touch` |
+| `button` | `name` (`home`, `lock`), `ts` (optional) | A hardware button. `ts` as on `touch` |
 | `type` | `id`, `text` (1–10 000 bytes) | Types the text through `axe type --stdin`, from a scratch file in `<dataDir>/run/` that Seiji deletes after the input (US keyboard characters only). Answers `done` |
 | `paste` | `id`, `text` (1–10 000 bytes) | Puts the text on the simulator clipboard (`axe clipboard copy`) and presses Cmd+V, so accents and emoji go through. If the clipboard cannot be set, types the text instead. Answers `done` with `via`: `pasted` or `typed` |
 | `paste_and_type` | `id`, `text` (1–10 000 bytes) | Types the text (same as `type`), for fields that refuse paste |
@@ -1926,11 +1926,24 @@ Each frame carries its capture, encode and server-receipt times, so the page and
 | Network: written to the socket to the page receiving it (TCP, the TLS proxy, the path) | page minus server | server's, through the ping offset | `network_p50`, `network_p95` |
 | Decode: received to decoded | page | page | `decode_p50`, `decode_p95` |
 | Capture → shown: the frame age | page | server's, through the ping offset | `age_p50`, `age_p95` |
-| Input in server: read from the page to applied (op lock, gesture timing, the helper, AXe for text) | server | host | `input_server_p50`, `input_server_p95` |
 
-The line also has `rtt`, `jitter`, `lost` (percent, last 3 s), `fps`, `transport`, `lease` and `viewer` (the first 6 characters of the session id). The upload of input is about half the round trip; Seiji does not measure it apart. The page's numbers go to the server as `{"t": "telemetry", "report": {"transport", "age", "encode", "helper", "down", "decode", "rtt", "jitter", "lost", "fps"}}`, each stage as `[p50, p95]` in ms (`down` is in server plus network). The server keeps only numbers between 0 and 120 000.
+An input has its own way to the screen. For each finger down or up, key and button with `ts`, the server answers `{"t": "applied", "ts", "read_us", "sent_us"}`: the input's `ts`, when the daemon read it and when the helper had it, in Unix microseconds on the host's clock. The page takes the first frame captured after `sent_us` as the screen's answer, whatever changed it (an input that changes nothing is answered by the next change, up to 2 s later):
 
-Over WebRTC the page measures only the frame age; the other stages show `—`.
+| Stage | Measured | Clock | Log fields |
+|---|---|---|---|
+| Upload: the page seeing the input to the daemon reading it | page | server's, through the ping offset | `upload_p50`, `upload_p95` |
+| Input in server: read to the helper having it (moves too) | server | host | `input_server_p50`, `input_server_p95` |
+| Of that, the wait for the device's op lock (a run, or another viewer's gesture) | server | host | `input_lock_p50`, `input_lock_p95` |
+| Of that, the hold that keeps a gesture's spacing ([Gesture timing](#gesture-timing)) | server | host | `input_pace_p50`, `input_pace_p95` |
+| Screen reacts: the helper having it to the first frame captured after (the simulator and the app drawing, the capture's frame pacing) | page, from `applied` and the header | host | `react_p50`, `react_p95` |
+| Input → shown: the page seeing the input to that frame shown | page | page | `photon_p50`, `photon_p95` |
+| Text: read to typed or pasted (AXe) | server | host | `text_p50`, `text_p95` |
+
+The line also has `rtt`, `jitter`, `lost` (percent, last 3 s), `fps`, `transport`, `lease` and `viewer` (the first 6 characters of the session id). The page's numbers go to the server as `{"t": "telemetry", "report": {"transport", "age", "encode", "helper", "down", "decode", "upload", "react", "photon", "rtt", "jitter", "lost", "fps"}}`, each stage as `[p50, p95]` in ms (`down` is in server plus network). The server keeps only numbers between 0 and 120 000. The page's clock offset comes from the fastest of its last 10 pings, the one with the least queueing.
+
+On a local link (the page on the host), a tap reaches the screen in about 25 ms: upload and in server about 1 ms each, screen reacts about 20 ms, then the frame's encode (3 ms) and decode (2 ms). An app's first launch takes its own time to draw, about 1.5 s. Everything over that on a remote viewer is the link: the upload and the frame's network stage, each about half the round trip.
+
+Over WebRTC the page measures only the frame age and the input's upload; the other stages show `—`.
 
 ## Client setup
 

@@ -107,6 +107,7 @@
   let ws = null;
   let retry = 0;
   let clockOffset = 0; // server clock minus browser clock
+  const offsets = []; // [round trip, offset] of the last pongs
   let rtt = null;
 
   // `false` when the socket is not open: the message was not sent.
@@ -121,6 +122,8 @@
   let gesturePath = null;
   function sendInput(msg) {
     let path = dc && dc.readyState === "open" ? "rtc" : "ws";
+    // Keys and buttons carry the page's time too, so their way to the screen is timed.
+    if ((msg.t === "key" || msg.t === "button") && msg.ts === undefined) msg.ts = performance.now();
     if (msg.t === "touch") {
       if (msg.phase === "down") gesturePath = path;
       else if (gesturePath) path = gesturePath;
@@ -294,8 +297,11 @@
         const now = performance.now();
         rtt = now - msg.at;
         onPong(rtt);
-        // The server's clock at the middle of the round trip.
-        clockOffset = msg.server_ms - (Date.now() - rtt / 2);
+        // The server's clock at the middle of the round trip, from the fastest of the last pongs:
+        // the least queueing, so the closest to an even split.
+        offsets.push([rtt, msg.server_ms - (Date.now() - rtt / 2)]);
+        if (offsets.length > 10) offsets.shift();
+        clockOffset = offsets.reduce((a, b) => (b[0] < a[0] ? b : a))[1];
         break;
       }
       case "preset":
@@ -305,7 +311,10 @@
         onRtcAnswer(msg);
         break;
       case "server_stats":
-        serverStages = { server: msg.server, input: msg.input };
+        serverStages = { server: msg.server, input: msg.input, lock: msg.lock, pace: msg.pace, text: msg.text };
+        break;
+      case "applied":
+        onApplied(msg);
         break;
       case "done": {
         const kind = pending.get(msg.id);
@@ -338,9 +347,9 @@
   let decodeErrors = [];
   const stats = { frames: [], bytes: [], age: null, drawn: 0 };
   // Where each frame's time goes (see `pipeline.rs`): the last samples of each stage, in
-  // milliseconds. "In server" and "input in server" come from the server every 5 s.
-  const stages = { age: [], encode: [], helper: [], down: [], decode: [] };
-  let serverStages = { server: null, input: null };
+  // milliseconds. "In server" and the input's server stages come from the server every 5 s.
+  const stages = { age: [], encode: [], helper: [], down: [], decode: [], upload: [], react: [], photon: [] };
+  let serverStages = { server: null, input: null, lock: null, pace: null, text: null };
   function sample(name, ms) {
     if (!Number.isFinite(ms) || ms < 0 || ms > 120000) return;
     const a = stages[name];
@@ -352,6 +361,38 @@
     const s = [...a].sort((x, y) => x - y);
     const at = (p) => Math.round(s[Math.round((s.length - 1) * p)] * 10) / 10;
     return [at(0.5), at(0.95)];
+  }
+
+  // An input's way to the screen: the server says when it read the input and when the helper
+  // had it (`applied`); the first frame captured after that is the screen's answer, whatever
+  // changed it. Inputs still waiting for that frame: [page time, helper time in µs].
+  const awaiting = [];
+  // Frames shown in the last second, [capture µs, page time], for an `applied` that comes late.
+  const shown = [];
+  const REACT_MAX_MS = 2000;
+  function onApplied(msg) {
+    // The page's time of the input, on the server's clock.
+    const sentAt = Date.now() - (performance.now() - msg.ts) + clockOffset;
+    sample("upload", msg.read_us / 1000 - sentAt);
+    if (rtcOn) return;
+    const frame = shown.find(([capturedUs]) => capturedUs > msg.sent_us);
+    if (frame) answered(msg.ts, msg.sent_us, frame[0], frame[1]);
+    else awaiting.push([msg.ts, msg.sent_us]);
+  }
+  function answered(ts, sentUs, capturedUs, at) {
+    const react = (capturedUs - sentUs) / 1000;
+    if (react > REACT_MAX_MS) return;
+    sample("react", react);
+    sample("photon", at - ts);
+  }
+  function onShown(capturedUs, at) {
+    shown.push([capturedUs, at]);
+    while (shown.length && at - shown[0][1] > 1000) shown.shift();
+    for (let i = awaiting.length - 1; i >= 0; i--) {
+      const [ts, sentUs] = awaiting[i];
+      if (capturedUs > sentUs) answered(ts, sentUs, capturedUs, at);
+      if (capturedUs > sentUs || at - ts > REACT_MAX_MS * 2) awaiting.splice(i, 1);
+    }
   }
   // Frames sent to the decoder and not yet shown: capture time → [frame number, when sent]. A
   // frame is acknowledged once it is shown, so a slow decoder holds the stream back like a slow
@@ -401,6 +442,7 @@
           canvas.height = frame.displayHeight;
         }
         g2d.drawImage(frame, 0, 0);
+        onShown(frame.timestamp, performance.now());
         const now = Date.now();
         stats.age = now + clockOffset - frame.timestamp / 1000;
         sample("age", stats.age);
@@ -682,19 +724,24 @@
   function pipelineLines() {
     const f = (v) => (v ? `${v[0]} / ${v[1]} ms` : "—");
     const down = p50p95(stages.down);
-    const server = serverStages.server;
-    const net = down && server ? [Math.max(0, Math.round(down[0] - server[0])), Math.max(0, Math.round(down[1] - server[1]))] : null;
+    const s = serverStages;
+    const net = down && s.server ? [Math.max(0, Math.round(down[0] - s.server[0])), Math.max(0, Math.round(down[1] - s.server[1]))] : null;
     return [
       "",
       "Where the time goes (p50 / p95):",
       `  Encode: ${f(p50p95(stages.encode))}`,
       `  Helper → server: ${f(p50p95(stages.helper))}`,
-      `  In server: ${rtcOn ? "—" : f(server)}`,
+      `  In server: ${rtcOn ? "—" : f(s.server)}`,
       `  Network: ${rtcOn ? "—" : f(net)}`,
       `  Decode: ${rtcOn ? "—" : f(p50p95(stages.decode))}`,
       `  Capture → shown: ${f(p50p95(stages.age))}`,
-      `  Input in server: ${f(serverStages.input)}`,
-      `  Input upload: ${rtt === null ? "—" : `≈ ${Math.round(rtt / 2)} ms`}`,
+      "",
+      "Input (taps, keys, buttons):",
+      `  Upload: ${f(p50p95(stages.upload))}`,
+      `  In server: ${f(s.input)} (lock ${f(s.lock)}, pacing ${f(s.pace)})`,
+      `  Screen reacts: ${rtcOn ? "—" : f(p50p95(stages.react))}`,
+      `  Input → shown: ${rtcOn ? "—" : f(p50p95(stages.photon))}`,
+      `  Text: ${f(s.text)}`,
     ];
   }
 
@@ -710,6 +757,9 @@
         helper: p50p95(stages.helper),
         down: rtcOn ? null : p50p95(stages.down),
         decode: rtcOn ? null : p50p95(stages.decode),
+        upload: p50p95(stages.upload),
+        react: p50p95(stages.react),
+        photon: p50p95(stages.photon),
         rtt: rtt === null ? null : Math.round(rtt),
         jitter: rtts.length < 2 ? null : Math.round(jitter()),
         lost: loss.pct,

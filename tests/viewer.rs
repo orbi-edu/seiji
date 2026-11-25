@@ -12,6 +12,10 @@ use tokio_tungstenite::tungstenite::{self, client::IntoClientRequest};
 
 use common::*;
 
+fn now_us() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros() as i64
+}
+
 fn http() -> reqwest::Client {
     reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap()
 }
@@ -759,16 +763,33 @@ async fn the_page_learns_where_its_frames_and_input_spend_time() {
     let (token, lease) = device(&env, "alice").await;
     let mut ws = open(&env, &token, &lease, true).await.ws().await;
     format(&mut ws).await;
+    // Each timed finger down or up, key and button comes back with when the server read it and
+    // when the helper had it, on the server's clock.
+    let before = now_us();
+    send(&mut ws, json!({"t": "touch", "phase": "down", "x": 0.5, "y": 0.5, "ts": 1000.5})).await;
+    send(&mut ws, json!({"t": "touch", "phase": "up", "x": 0.5, "y": 0.5, "ts": 1080.0})).await;
+    send(&mut ws, json!({"t": "key", "usage": 4, "ts": 1200.0})).await;
+    send(&mut ws, json!({"t": "button", "name": "home", "ts": 1300.0})).await;
+    for ts in [1000.5, 1080.0, 1200.0, 1300.0] {
+        let a = text(&mut ws).await;
+        assert_eq!((a["t"].as_str(), a["ts"].as_f64()), (Some("applied"), Some(ts)), "{a}");
+        let (read, sent) = (a["read_us"].as_i64().unwrap(), a["sent_us"].as_i64().unwrap());
+        assert!(before <= read && read <= sent && sent <= now_us(), "{a}");
+    }
+    // An untimed input is not reported.
     send(&mut ws, json!({"t": "touch", "phase": "down", "x": 0.5, "y": 0.5})).await;
     send(&mut ws, json!({"t": "touch", "phase": "up", "x": 0.5, "y": 0.5})).await;
     // A report from the page is taken quietly; one with a field the server does not know is not.
-    let report = json!({"transport": "ws", "age": [80.5, 140.0], "down": [70.0, 120.0], "rtt": 140, "lost": 0});
+    let report = json!({
+        "transport": "ws", "age": [80.5, 140.0], "down": [70.0, 120.0], "rtt": 140, "lost": 0,
+        "upload": [70.0, 110.0], "react": [20.0, 40.0], "photon": [180.0, 260.0],
+    });
     send(&mut ws, json!({"t": "telemetry", "report": report})).await;
     send(&mut ws, json!({"t": "telemetry", "report": {"cpu": 99}})).await;
     assert_eq!(text(&mut ws).await["code"], "bad_request");
 
     // Every 5 s the page gets the server's part: frames read from the helper to written to its
-    // socket, and input read from the page to applied.
+    // socket, and input read from the page to the helper, with its wait for the device.
     let stats = within("server_stats", async {
         loop {
             let v = text(&mut ws).await;
@@ -782,6 +803,10 @@ async fn the_page_learns_where_its_frames_and_input_spend_time() {
     let p95 = stats["server"][1].as_f64().unwrap();
     assert!((0.0..1000.0).contains(&p50) && p50 <= p95, "{stats}");
     assert!(stats["input"][0].as_f64().unwrap() >= 0.0, "{stats}");
+    assert!(stats["lock"][0].as_f64().unwrap() >= 0.0, "{stats}");
+    // The lift came at once but was stamped 79.5 ms after the touch: it was held for that.
+    let pace = stats["pace"][1].as_f64().unwrap();
+    assert!((40.0..=81.0).contains(&pace), "{stats}");
 }
 
 #[tokio::test]
