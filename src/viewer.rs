@@ -15,6 +15,7 @@
 
 mod pipeline;
 mod rtc;
+mod trace;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -431,6 +432,8 @@ pub struct Viewers {
     pace_max_ms: AtomicU32,
     /// `viewer.webrtc.enabled`, as an admin last set it.
     webrtc: AtomicBool,
+    /// The viewer trace, off until an admin turns it on.
+    trace: trace::Trace,
 }
 
 /// The viewer settings an admin can change while Seiji runs (`/v1/admin/viewer`).
@@ -438,16 +441,19 @@ pub struct Viewers {
 pub struct ViewerSettings {
     pub pace_max_ms: u32,
     pub webrtc: bool,
+    /// The viewer trace is on.
+    pub trace: bool,
 }
 
 impl Viewers {
-    pub fn new(cfg: &crate::config::Viewer) -> Self {
+    pub fn new(cfg: &crate::config::Viewer, data_dir: &std::path::Path) -> Self {
         Self {
             tickets: StdMutex::default(),
             sessions: StdMutex::default(),
             hubs: StdMutex::default(),
             pace_max_ms: AtomicU32::new(cfg.pace_max_ms),
             webrtc: AtomicBool::new(cfg.webrtc.enabled),
+            trace: trace::Trace::new(data_dir.join("viewer-trace.jsonl")),
         }
     }
 
@@ -461,6 +467,7 @@ impl Viewers {
         ViewerSettings {
             pace_max_ms: self.pace_max_ms.load(Ordering::Relaxed),
             webrtc: self.webrtc.load(Ordering::Relaxed),
+            trace: self.trace.on(),
         }
     }
 
@@ -473,6 +480,21 @@ impl Viewers {
         if let Some(on) = webrtc {
             self.webrtc.store(on, Ordering::Relaxed);
         }
+    }
+
+    /// Turns the viewer trace on, as a new file in place of the last one, or off.
+    pub fn set_trace(&self, on: bool) -> std::io::Result<()> {
+        if on {
+            self.trace.start()
+        } else {
+            self.trace.stop();
+            Ok(())
+        }
+    }
+
+    /// The trace file, and its size when there is one.
+    pub fn trace_file(&self) -> (&std::path::Path, Option<u64>) {
+        (self.trace.path(), self.trace.bytes())
     }
 
     fn pace_max(&self) -> Duration {
@@ -923,17 +945,37 @@ enum ClientMsg {
     Telemetry {
         report: Box<pipeline::PageReport>,
     },
+    /// What the page showed, every second while the viewer trace is on; see `trace`.
+    Trace(Box<trace::PageTrace>),
 }
 
 impl ClientMsg {
+    /// The page's time of a touch, key or button (`ts`).
+    fn page_ts(&self) -> Option<f64> {
+        match self {
+            ClientMsg::Touch { ts, .. } | ClientMsg::Key { ts, .. } | ClientMsg::Button { ts, .. } => *ts,
+            _ => None,
+        }
+    }
+
     /// The page's time of an input whose way to the screen the page times (`applied`): a finger
     /// down or up, a key, a button. Moves are left out: there are too many.
     fn timed(&self) -> Option<f64> {
+        if matches!(self, ClientMsg::Touch { phase: TouchPhase::Move, .. }) { None } else { self.page_ts() }
+    }
+
+    /// What kind of input it is, for the trace: no coordinates, keys or text.
+    fn kind(&self) -> &'static str {
         match self {
-            ClientMsg::Touch { phase: TouchPhase::Down | TouchPhase::Up, ts, .. }
-            | ClientMsg::Key { ts, .. }
-            | ClientMsg::Button { ts, .. } => *ts,
-            _ => None,
+            ClientMsg::Touch { phase: TouchPhase::Down, .. } => "down",
+            ClientMsg::Touch { phase: TouchPhase::Move, .. } => "move",
+            ClientMsg::Touch { phase: TouchPhase::Up, .. } => "up",
+            ClientMsg::Key { .. } => "key",
+            ClientMsg::Button { .. } => "button",
+            ClientMsg::Type { .. } => "type",
+            ClientMsg::Paste { .. } => "paste",
+            ClientMsg::PasteAndType { .. } => "paste_and_type",
+            _ => "other",
         }
     }
 }
@@ -1042,6 +1084,8 @@ enum Ctl {
     Rtc(bool),
     /// The page's timings.
     Report(Box<pipeline::PageReport>),
+    /// What the page showed, for the viewer trace.
+    Trace(Box<trace::PageTrace>),
 }
 
 /// An input message and when the daemon read it.
@@ -1067,6 +1111,7 @@ async fn session(live: Live, mut video: broadcast::Receiver<Video>, socket: WebS
         touched: None,
         pipe: pipe.clone(),
         stamp: Stamp::default(),
+        viewer: live.sid[..6].to_string(),
     };
     let stop = CancellationToken::new();
     // Once the page is gone its queued input is dropped, even while a frame write still waits.
@@ -1110,15 +1155,28 @@ async fn session(live: Live, mut video: broadcast::Receiver<Video>, socket: WebS
                     }
                 }
                 Ok(Video::Frame(f)) => {
-                    if !rtc_video && flow.admit(&f, &hub) {
-                        if put(&mut sink, Message::Binary(f.message.clone())).await {
-                            // In server: read from the helper to written to this socket.
-                            let ms = (now_us() - f.received_us) as f64 / 1000.0;
-                            pipe.lock().expect("pipeline mutex").server.push(ms);
-                        } else {
-                            close = Some(None);
-                        }
+                    if rtc_video {
+                        continue;
                     }
+                    let sent = flow.admit(&f, &hub);
+                    if sent && !put(&mut sink, Message::Binary(f.message.clone())).await {
+                        close = Some(None);
+                        continue;
+                    }
+                    let written_us = now_us();
+                    if sent {
+                        // In server: read from the helper to written to this socket.
+                        let ms = (written_us - f.received_us) as f64 / 1000.0;
+                        pipe.lock().expect("pipeline mutex").server.push(ms);
+                    }
+                    live.pool.viewers.trace.write(|| {
+                        let at = |i: usize| f.message.get(i..i + 8).map(|b| i64::from_be_bytes(b.try_into().expect("8 bytes")));
+                        serde_json::json!({
+                            "ev": "frame", "lease": live.ctx.lease_id, "viewer": viewer, "seq": f.seq, "key": f.key,
+                            "bytes": f.message.len(), "capture_us": at(5), "encode_us": at(13),
+                            "read_us": f.received_us, "written_us": sent.then_some(written_us), "skipped": !sent,
+                        })
+                    });
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => {
                     // A format may have been among the messages it missed.
@@ -1151,6 +1209,7 @@ async fn session(live: Live, mut video: broadcast::Receiver<Video>, socket: WebS
                     }
                 }
                 Some(Ctl::Report(r)) => pipe.lock().expect("pipeline mutex").page = Some(*r),
+                Some(Ctl::Trace(t)) => t.write(&live.pool.viewers.trace, &live.ctx.lease_id, viewer),
                 // The page closed its socket.
                 None => close = Some(None),
             },
@@ -1165,7 +1224,10 @@ async fn session(live: Live, mut video: broadcast::Receiver<Video>, socket: WebS
                 }
             }
             _ = to_page.tick() => {
-                let m = text(pipe.lock().expect("pipeline mutex").message());
+                let mut m = pipe.lock().expect("pipeline mutex").message();
+                // The page reports what it showed while the trace is on.
+                m["trace"] = live.pool.viewers.trace.on().into();
+                let m = text(m);
                 if !put(&mut sink, m).await {
                     close = Some(None);
                 }
@@ -1270,6 +1332,18 @@ async fn read_page(
                 }
                 None
             }
+            Ok(ClientMsg::Trace(t)) => {
+                if !t.fits() {
+                    Some(
+                        ViewError::Bad(format!("a trace report holds at most {} frames and inputs", trace::MAX_BATCH))
+                            .message(None),
+                    )
+                } else if ctl.send(Ctl::Trace(t)).await.is_err() {
+                    return;
+                } else {
+                    None
+                }
+            }
             Ok(msg) => input.try_send((msg, Instant::now())).err().map(|_| ViewError::Busy.message(None)),
             Err(e) => Some(ViewError::Bad(format!("invalid message: {e}")).message(None)),
         };
@@ -1359,6 +1433,8 @@ struct Input {
     pipe: Arc<StdMutex<pipeline::Pipeline>>,
     /// The parts of the message being applied.
     stamp: Stamp,
+    /// The session's short id, for the trace.
+    viewer: String,
 }
 
 /// Where one input message's time went in the server, for the pipeline.
@@ -1478,7 +1554,8 @@ impl Input {
             | ClientMsg::Preset { .. }
             | ClientMsg::RtcOffer { .. }
             | ClientMsg::VideoVia { .. }
-            | ClientMsg::Telemetry { .. } => {}
+            | ClientMsg::Telemetry { .. }
+            | ClientMsg::Trace(_) => {}
         }
         Ok(None)
     }
@@ -1574,7 +1651,7 @@ async fn run_input(
             m = rx.recv() => m,
         };
         let Some((msg, read_at)) = msg else { break };
-        let timed = msg.timed();
+        let (timed, page_ts, kind) = (msg.timed(), msg.page_ts(), msg.kind());
         let text_input =
             matches!(msg, ClientMsg::Type { .. } | ClientMsg::Paste { .. } | ClientMsg::PasteAndType { .. });
         let reply = input.apply(msg).await;
@@ -1596,6 +1673,15 @@ async fn run_input(
                 pipe.text.push(ms(read_at.elapsed()));
             }
         }
+        input.pool.viewers.trace.write(|| {
+            let done_us = now_us();
+            let us = |d: Duration| d.as_micros() as f64 / 1000.0;
+            serde_json::json!({
+                "ev": "input", "lease": input.ctx.lease_id, "viewer": input.viewer, "kind": kind, "ts": page_ts,
+                "read_us": done_us - read_at.elapsed().as_micros() as i64, "lock_ms": stamp.lock.map(us),
+                "pace_ms": stamp.pace.map(us), "sent_us": stamp.sent.map(|(_, at)| at), "done_us": done_us,
+            })
+        });
         // The page times the rest of the input's way to the screen from these.
         if let (Some(ts), Some((at, sent_us))) = (timed, stamp.sent) {
             let read_us = sent_us - at.duration_since(read_at).as_micros() as i64;

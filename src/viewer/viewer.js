@@ -312,6 +312,8 @@
         break;
       case "server_stats":
         serverStages = { server: msg.server, input: msg.input, lock: msg.lock, pace: msg.pace, text: msg.text };
+        tracing = msg.trace === true;
+        if (!tracing) traced = { frames: [], inputs: [] };
         break;
       case "applied":
         onApplied(msg);
@@ -384,7 +386,28 @@
     if (react > REACT_MAX_MS) return;
     sample("react", react);
     sample("photon", at - ts);
+    if (tracing) traced.inputs.push([ts, serverMs(ts), capturedUs, serverMs(at)]);
   }
+
+  // The viewer trace (an admin turns it on; `server_stats` says so): every frame shown and
+  // every input answered goes to the server each second, on the server's clock.
+  let tracing = false;
+  let traced = { frames: [], inputs: [] };
+  function serverMs(pageTime) {
+    return Date.now() - (performance.now() - pageTime) + clockOffset;
+  }
+  setInterval(() => {
+    if (!tracing || (!traced.frames.length && !traced.inputs.length)) return;
+    // The server takes at most 1024 of each; a page that falls that far behind loses the oldest.
+    send({
+      t: "trace",
+      offset_ms: clockOffset,
+      rtt_ms: rtt,
+      frames: traced.frames.slice(-1024),
+      inputs: traced.inputs.slice(-1024),
+    });
+    traced = { frames: [], inputs: [] };
+  }, 1000);
   function onShown(capturedUs, at) {
     shown.push([capturedUs, at]);
     while (shown.length && at - shown[0][1] > 1000) shown.shift();
@@ -436,6 +459,7 @@
           decoding.delete(frame.timestamp);
           send({ t: "ack", seq: entry[0] });
           sample("decode", performance.now() - entry[1]);
+          if (tracing) traced.frames.push([entry[0], serverMs(entry[1]), serverMs(performance.now())]);
         }
         if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
           canvas.width = frame.displayWidth;

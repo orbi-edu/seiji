@@ -591,12 +591,9 @@ local function new_device(state: any)
 	end)
 end
 
-local function download_evidence(state: any, run: any)
-	if not run then
-		return
-	end
-	local id = run.run_id
-	local key = "zip:" .. id
+-- Saves `path` to ~/Downloads/<file>. Past what Tern downloads (16 MiB), copies a curl command
+-- that does.
+local function download(state: any, key: string, path: string, accept: string, file: string, what: string)
 	if state.busy[key] then
 		return
 	end
@@ -606,33 +603,45 @@ local function download_evidence(state: any, run: any)
 		return
 	end
 	state.busy[key] = true
-	apimod.request(state.api, "GET", "/v1/runs/" .. id .. "/evidence.zip", { raw = true, accept = "application/zip", timeout_ms = 120000 }, function(bytes, err)
+	apimod.request(state.api, "GET", path, { raw = true, accept = accept, timeout_ms = 120000 }, function(bytes, err)
 		state.busy[key] = nil
 		if state.stopped then
 			return
 		end
 		if err then
 			if err.code == "unreachable" and string.find(err.message, "16 MiB", 1, true) then
-				local cmd = "curl -fLo " .. id .. "-evidence.zip -H \"Authorization: Bearer $(seiji token print)\" "
-					.. state.api.creds.url .. "/v1/runs/" .. id .. "/evidence.zip"
+				local cmd = "curl -fLo " .. file .. " -H \"Authorization: Bearer $(seiji token print)\" "
+					.. state.api.creds.url .. path
 				state.cx:copy(cmd)
-				flash(state, "warning", "The evidence is over 16 MiB, more than Tern downloads. Copied a curl command that does.")
+				flash(state, "warning", "The " .. what .. " is over 16 MiB, more than Tern downloads. Copied a curl command that does.")
 			else
 				fail(state, "Download failed", err)
 			end
 		else
-			local path = home .. "/Downloads/" .. id .. "-evidence.zip"
-			local ok, werr = pcall(tern.fs.write, path, bytes)
+			local ok, werr = pcall(tern.fs.write, home .. "/Downloads/" .. file, bytes)
 			if ok then
-				flash(state, "success", "Saved " .. fmt.bytes(#bytes) .. " to ~/Downloads/" .. id .. "-evidence.zip")
+				flash(state, "success", "Saved " .. fmt.bytes(#bytes) .. " to ~/Downloads/" .. file)
 			else
-				flash(state, "error", "Could not save the evidence: " .. tostring(werr))
+				flash(state, "error", "Could not save the " .. what .. ": " .. tostring(werr))
 			end
 		end
 		state.cx:render()
 	end)
-	flash(state, "info", "Downloading the evidence of " .. id .. "…")
+	flash(state, "info", "Downloading the " .. what .. "…")
 	state.cx:render()
+end
+
+local function download_evidence(state: any, run: any)
+	if not run then
+		return
+	end
+	local id = run.run_id
+	download(state, "zip:" .. id, "/v1/runs/" .. id .. "/evidence.zip", "application/zip", id .. "-evidence.zip", "evidence of " .. id)
+end
+
+-- The last viewer trace (`/v1/admin/viewer/trace`), as JSON lines.
+local function download_trace(state: any)
+	download(state, "trace", "/v1/admin/viewer/trace", "application/x-ndjson", "seiji-viewer-trace.jsonl", "viewer trace")
 end
 
 local function copy_summary(state: any, run: any)
@@ -802,6 +811,10 @@ local function on_action(state: any, act: string, value: string?)
 		end
 	elseif act == "viewer_webrtc" and value then
 		set_viewer(state, { webrtc = value == "true" })
+	elseif act == "viewer_trace" and value then
+		set_viewer(state, { trace = value == "true" })
+	elseif act == "viewer_trace_download" then
+		download_trace(state)
 	end
 end
 

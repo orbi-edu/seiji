@@ -1134,3 +1134,73 @@ async fn webrtc_without_addresses_cannot_be_turned_on() {
     assert_eq!(now["settings"]["webrtc"], false);
     assert!(now["webrtc_problem"].as_str().is_some_and(|p| p.contains("candidates")), "{now}");
 }
+
+/// The last viewer trace, as JSON lines, and the response's status.
+async fn trace_lines(env: &Env, token: &str) -> (u16, Vec<Value>) {
+    let r = http().get(format!("{}/v1/admin/viewer/trace", env.url)).bearer_auth(token).send().await.unwrap();
+    let status = r.status().as_u16();
+    let body = r.text().await.unwrap();
+    if status != 200 {
+        return (status, vec![]);
+    }
+    (status, body.lines().map(|l| serde_json::from_str(l).unwrap()).collect())
+}
+
+#[tokio::test]
+async fn an_admin_traces_each_input_and_frame_without_coordinates_or_text() {
+    let env = setup_with(2, json!({ "adminUsers": ["alice"] })).await;
+    let (alice, lease) = device(&env, "alice").await;
+    let bob = add_user(&env, "bob", QUOTA);
+    assert_eq!(trace_lines(&env, &alice).await.0, 404, "no trace before the first one");
+    assert_eq!(set_viewer(&env, &bob, json!({"trace": true})).await.status(), 403);
+    let on: Value = set_viewer(&env, &alice, json!({"trace": true})).await.json().await.unwrap();
+    assert_eq!(on["settings"]["trace"], true, "{on}");
+    assert_eq!(trace_lines(&env, &bob).await.0, 403);
+
+    let mut ws = open(&env, &alice, &lease, true).await.ws().await;
+    format(&mut ws).await;
+    frame(&mut ws).await;
+    send(&mut ws, json!({"t": "touch", "phase": "down", "x": 0.123, "y": 0.456, "ts": 10.0})).await;
+    send(&mut ws, json!({"t": "touch", "phase": "move", "x": 0.234, "y": 0.567, "ts": 20.0})).await;
+    send(&mut ws, json!({"t": "touch", "phase": "up", "x": 0.234, "y": 0.567, "ts": 30.0})).await;
+    send(&mut ws, json!({"t": "key", "usage": 23, "ts": 40.0})).await;
+    send(&mut ws, json!({"t": "type", "id": 1, "text": "hunter2"})).await;
+    within("done", async { while text(&mut ws).await["t"] != "done" {} }).await;
+    // The page learns that the trace is on, and reports what it showed.
+    within("server_stats", async { while text(&mut ws).await["trace"] != true {} }).await;
+    let report = json!({"t": "trace", "offset_ms": 1.5, "rtt_ms": 20.0,
+        "frames": [[1, 1000.0, 1010.0]], "inputs": [[10.0, 1000.0, 1_000_000, 1050.0]]});
+    send(&mut ws, report).await;
+    let too_big = vec![json!([1, 2.0, 3.0]); 1025];
+    send(&mut ws, json!({"t": "trace", "offset_ms": 0.0, "frames": too_big})).await;
+    assert_eq!(text(&mut ws).await["code"], "bad_request", "a report holds at most 1024 frames");
+
+    let (_, lines) = trace_lines(&env, &alice).await;
+    let of = |ev: &str| lines.iter().filter(|l| l["ev"] == ev).collect::<Vec<_>>();
+    let kinds: Vec<&str> = of("input").iter().map(|l| l["kind"].as_str().unwrap()).collect();
+    assert_eq!(kinds, ["down", "move", "up", "key", "type"], "{lines:?}");
+    let down = of("input")[0];
+    assert_eq!(down["ts"], 10.0);
+    let us = |v: &Value, k: &str| v[k].as_i64().unwrap_or_else(|| panic!("{k} is not a number: {v}"));
+    let (read, sent, done) = (us(down, "read_us"), us(down, "sent_us"), us(down, "done_us"));
+    assert!(read <= sent && sent <= done && down["lease"] == lease.as_str(), "{down}");
+    let written: Vec<_> = of("frame").into_iter().filter(|f| f["skipped"] == false).collect();
+    assert!(written.iter().any(|f| us(f, "written_us") >= us(f, "read_us") && f["capture_us"].is_i64()), "{written:?}");
+    assert_eq!(of("shown")[0]["shown_ms"], 1010.0);
+    assert_eq!(of("answer")[0]["capture_us"], 1_000_000);
+    assert_eq!(of("shown")[0]["seq"], 1);
+    assert_eq!(of("clock")[0]["offset_ms"], 1.5);
+    let all = serde_json::to_string(&lines).unwrap();
+    for secret in ["0.123", "0.456", "0.234", "hunter2", "\"usage\"", "\"x\"", "\"text\""] {
+        assert!(!all.contains(secret), "the trace holds {secret}: {all}");
+    }
+
+    // Off, it takes nothing more; on again, it starts a new file.
+    set_viewer(&env, &alice, json!({"trace": false})).await;
+    let before = trace_lines(&env, &alice).await.1.len();
+    send(&mut ws, json!({"t": "key", "usage": 40, "ts": 50.0})).await;
+    logged(&env, "hid key 40 up").await;
+    assert_eq!(trace_lines(&env, &alice).await.1.len(), before);
+    set_viewer(&env, &alice, json!({"trace": true})).await;
+    assert!(trace_lines(&env, &alice).await.1.iter().all(|l| l["ev"] != "input"), "a new trace starts empty");
+}

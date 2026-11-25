@@ -169,7 +169,7 @@ pub fn account_for(config: &Config, user: &User) -> Result<Account> {
 impl Pool {
     pub fn new(config: Arc<Config>, store: Arc<Store>, runner: Arc<Runner>, devices: Arc<dyn Devices>) -> Self {
         let maestro = Maestro::new(config.clone(), runner.clone());
-        let viewers = crate::viewer::Viewers::new(&config.viewer);
+        let viewers = crate::viewer::Viewers::new(&config.viewer, &config.data_dir);
         Self {
             config,
             store,

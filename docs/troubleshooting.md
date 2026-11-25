@@ -565,6 +565,8 @@ A view-only session answers `This viewer is view-only.` for every input. Ask for
 grep "viewer pipeline" /usr/local/var/log/seiji.log | tail
 ```
 
+To see which tap or frame was slow, and where its time went, turn the [viewer trace](mcp.md#the-viewer-trace) on (**Viewer settings** in the Tern plugin, or `PUT /v1/admin/viewer` with `{"trace": true}`), use the viewer, download the trace and run the `jq` in [mcp.md](mcp.md#the-viewer-trace). Turn it off afterwards.
+
 | The big stage | What it means | What helps |
 |---|---|---|
 | Encode | The Mac's media engine is busy (many watched leases) | Fewer streams, or a lower `viewer.scale` |
