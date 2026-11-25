@@ -18,7 +18,7 @@ mod rtc;
 mod trace;
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -146,13 +146,13 @@ pub enum StreamPreset {
 }
 
 impl StreamPreset {
-    fn opts(self, cfg: &crate::config::Viewer) -> StreamOpts {
+    fn opts(self, cfg: &crate::config::Viewer, fps: u8) -> StreamOpts {
         let bitrate = cfg.bitrate_kbps * 1000;
         match self {
-            StreamPreset::Smooth => StreamOpts { fps: cfg.fps, scale: cfg.scale.min(0.35), bitrate: bitrate / 2 },
-            StreamPreset::Balanced => StreamOpts { fps: cfg.fps, scale: cfg.scale, bitrate },
+            StreamPreset::Smooth => StreamOpts { fps, scale: cfg.scale.min(0.35), bitrate: bitrate / 2 },
+            StreamPreset::Balanced => StreamOpts { fps, scale: cfg.scale, bitrate },
             StreamPreset::Sharp => {
-                StreamOpts { fps: cfg.fps, scale: cfg.scale.max(0.8), bitrate: (bitrate * 2).min(20_000_000) }
+                StreamOpts { fps, scale: cfg.scale.max(0.8), bitrate: (bitrate * 2).min(20_000_000) }
             }
         }
     }
@@ -242,8 +242,8 @@ struct Hub {
 }
 
 impl Hub {
-    fn new(cancel: CancellationToken, cfg: &crate::config::Viewer) -> Self {
-        let target = StreamPreset::Balanced.opts(cfg);
+    fn new(cancel: CancellationToken, cfg: &crate::config::Viewer, fps: u8) -> Self {
+        let target = StreamPreset::Balanced.opts(cfg, fps);
         Self {
             commands: StdMutex::new(None),
             video: broadcast::channel(VIDEO_BUFFER).0,
@@ -368,15 +368,25 @@ impl Hub {
         self.send(ScreenCommand::Encode(opts));
     }
 
-    fn set_preset(&self, preset: StreamPreset, cfg: &crate::config::Viewer) -> StreamOpts {
+    fn set_preset(&self, preset: StreamPreset, cfg: &crate::config::Viewer, fps: u8) -> StreamOpts {
         let opts = {
             let mut rate = self.rate.lock().expect("rate mutex");
             let caps = std::mem::take(&mut rate.caps);
-            *rate = Rate::new(preset, preset.opts(cfg), caps);
+            *rate = Rate::new(preset, preset.opts(cfg, fps), caps);
             rate.send()
         };
         self.send(ScreenCommand::Encode(opts));
         opts
+    }
+
+    /// A new frame rate for the stream, keeping its preset's other options and the bitrate now.
+    fn set_fps(&self, fps: u8) {
+        let opts = {
+            let mut rate = self.rate.lock().expect("rate mutex");
+            rate.target.fps = fps;
+            rate.send()
+        };
+        self.send(ScreenCommand::Encode(opts));
     }
 
     fn on_event(&self, event: ScreenEvent, lease_id: &str) {
@@ -453,6 +463,8 @@ pub struct Viewers {
     pace_max_ms: AtomicU32,
     /// `viewer.webrtc.enabled`, as an admin last set it.
     webrtc: AtomicBool,
+    /// `viewer.fps`, as an admin last set it.
+    fps: AtomicU8,
     /// The viewer trace, off until an admin turns it on.
     trace: trace::Trace,
 }
@@ -464,6 +476,8 @@ pub struct ViewerSettings {
     pub webrtc: bool,
     /// The viewer trace is on.
     pub trace: bool,
+    /// The frame rate of every stream.
+    pub fps: u8,
 }
 
 impl Viewers {
@@ -474,6 +488,7 @@ impl Viewers {
             hubs: StdMutex::default(),
             pace_max_ms: AtomicU32::new(cfg.pace_max_ms),
             webrtc: AtomicBool::new(cfg.webrtc.enabled),
+            fps: AtomicU8::new(cfg.fps),
             trace: trace::Trace::new(data_dir.join("viewer-trace.jsonl")),
         }
     }
@@ -489,18 +504,30 @@ impl Viewers {
             pace_max_ms: self.pace_max_ms.load(Ordering::Relaxed),
             webrtc: self.webrtc.load(Ordering::Relaxed),
             trace: self.trace.on(),
+            fps: self.fps.load(Ordering::Relaxed),
         }
     }
 
-    /// Stores the settings given and leaves the others. Applies to new gestures and new pages at
-    /// once; a page already on WebRTC stays on it.
-    pub fn set_settings(&self, pace_max_ms: Option<u32>, webrtc: Option<bool>) {
+    /// Stores the settings given and leaves the others. Applies to new gestures, new pages and
+    /// every stream's frame rate at once; a page already on WebRTC stays on it.
+    pub fn set_settings(&self, pace_max_ms: Option<u32>, webrtc: Option<bool>, fps: Option<u8>) {
         if let Some(ms) = pace_max_ms {
             self.pace_max_ms.store(ms, Ordering::Relaxed);
         }
         if let Some(on) = webrtc {
             self.webrtc.store(on, Ordering::Relaxed);
         }
+        if let Some(fps) = fps {
+            // Stored before the hubs are read: a hub made meanwhile starts at the new rate.
+            self.fps.store(fps, Ordering::Relaxed);
+            for hub in self.hubs.lock().expect("hubs mutex").values() {
+                hub.set_fps(fps);
+            }
+        }
+    }
+
+    fn fps(&self) -> u8 {
+        self.fps.load(Ordering::Relaxed)
     }
 
     /// Turns the viewer trace on, as a new file in place of the last one, or off.
@@ -822,7 +849,7 @@ fn join(
         let joined = Joined { pool: pool.clone(), lease_id: ctx.lease_id.clone(), hub: hub.clone() };
         return Ok((joined, rx));
     }
-    let hub = Arc::new(Hub::new(rt.cancel.child_token(), &pool.config.viewer));
+    let hub = Arc::new(Hub::new(rt.cancel.child_token(), &pool.config.viewer, pool.viewers.fps()));
     hub.viewers.store(1, Ordering::SeqCst);
     let rx = hub.video.subscribe();
     hubs.insert(ctx.lease_id.clone(), hub.clone());
@@ -1326,7 +1353,7 @@ async fn read_page(
                 | ClientMsg::PasteAndType { .. },
             ) if !control => view_only(&t),
             Ok(ClientMsg::Preset { name }) => {
-                let opts = hub.set_preset(name, &pool.config.viewer);
+                let opts = hub.set_preset(name, &pool.config.viewer, pool.viewers.fps());
                 Some(text(serde_json::json!({ "t": "preset", "preset": name, "opts": opts })))
             }
             Ok(ClientMsg::RtcOffer { sdp }) => {

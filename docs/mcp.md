@@ -1735,13 +1735,14 @@ The viewer settings an admin can change while Seiji runs, to try them without a 
 | `pace_max_ms` | `viewer.paceMaxMs` | The longest a touch move or lift waits to keep a gesture's spacing ([Gesture timing](#gesture-timing)), 0–1000. `0` sends every point at once |
 | `webrtc` | `viewer.webrtc.enabled` | Pages may use WebRTC ([WebRTC](#webrtc)). Turning it on needs `viewer.webrtc.ports` and an address (`candidates`, or a specific `bind`) |
 | `trace` | (always off at start) | The [viewer trace](#the-viewer-trace). Turning it on starts a new trace in place of the last one |
+| `fps` | `viewer.fps` | The frame rate of every stream, 1–60. A running stream changes at once, at its bitrate then; a preset a page picks afterwards keeps it |
 
-`GET` returns `{"settings": {"pace_max_ms", "webrtc", "trace"}, "defaults": {"pace_max_ms", "webrtc", "trace"}, "webrtc_problem", "trace_bytes"}`. `defaults` is what `seiji.json` sets; `webrtc_problem` is why WebRTC cannot be turned on, or `null`; `trace_bytes` is the size of the last trace, or `null` before the first. `PUT` takes `{"pace_max_ms"?, "webrtc"?, "trace"?}` and returns the same as `GET`.
+`GET` returns `{"settings": {"pace_max_ms", "webrtc", "trace", "fps"}, "defaults": {"pace_max_ms", "webrtc", "trace", "fps"}, "webrtc_problem", "trace_bytes"}`. `defaults` is what `seiji.json` sets; `webrtc_problem` is why WebRTC cannot be turned on, or `null`; `trace_bytes` is the size of the last trace, or `null` before the first. `PUT` takes `{"pace_max_ms"?, "webrtc"?, "trace"?, "fps"?}` and returns the same as `GET`.
 
 | Status | Body | Cause |
 |---|---|---|
 | `200` | `{"settings", "defaults", "webrtc_problem", "trace_bytes"}` | The settings now |
-| `400` | `{"error": "<text>"}` | An unknown field, `pace_max_ms` above 1000, or `WebRTC cannot be turned on: <problem>` |
+| `400` | `{"error": "<text>"}` | An unknown field, `pace_max_ms` above 1000, `fps` outside 1–60, or `WebRTC cannot be turned on: <problem>` |
 | `401` | plain text | Missing or invalid token |
 | `403` | `{"error": "admin access required"}` | The caller is not in `adminUsers` |
 | `500` | `{"error": "cannot start the viewer trace: <cause>"}` | Seiji cannot write `<dataDir>/viewer-trace.jsonl`; nothing changed |

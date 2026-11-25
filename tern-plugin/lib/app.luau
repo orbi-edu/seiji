@@ -813,6 +813,11 @@ local function on_action(state: any, act: string, value: string?)
 		set_viewer(state, { webrtc = value == "true" })
 	elseif act == "viewer_trace" and value then
 		set_viewer(state, { trace = value == "true" })
+	elseif act == "viewer_fps" and value then
+		local fps = tonumber(value)
+		if fps and fps >= 1 and fps <= 60 then
+			set_viewer(state, { fps = math.floor(fps) })
+		end
 	elseif act == "viewer_trace_download" then
 		download_trace(state)
 	end
