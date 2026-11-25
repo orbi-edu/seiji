@@ -35,9 +35,13 @@ final class Encoder {
     /// The last keyframe was over the payload limit; set until a keyframe is written or the
     /// session changes, so an unchanged screen does not keep encoding one that is too big again.
     private var keyframeTooBig = false
-    /// A forced keyframe is being encoded. The frames behind it are not forced too: with three
-    /// frames in flight, a request (or the start) would otherwise send three keyframes in a row.
+    /// A forced keyframe or refresh is being encoded. The frames behind it are not forced too:
+    /// with three frames in flight, a request (or the start) would otherwise send three in a row.
     private var keyframeInFlight = false
+    /// A refresh the rate control skipped: the next frame is one.
+    private var refreshOwed = false
+    /// LTR tokens the daemon acknowledged since the last frame, for the next one.
+    private var acknowledged: [NSNumber] = []
     /// Encoded frames not written (stdout backlog or over the payload limit).
     private var dropped = 0
     /// Flags, capture time and encode time before each sample.
@@ -60,12 +64,12 @@ final class Encoder {
         return inFlight
     }
 
-    /// True while a keyframe of a working session is owed and worth retrying on an unchanged
-    /// screen. Changed frames are still sent as keyframes until one is written.
+    /// True while a keyframe of a working session (or a refresh) is owed and worth retrying on an
+    /// unchanged screen. Changed frames are still sent as keyframes until one is written.
     var needsKeyframe: Bool {
         lock.lock()
         defer { lock.unlock() }
-        return (needKeyframe && !keyframeTooBig) || session == nil
+        return (needKeyframe && !keyframeTooBig) || refreshOwed || session == nil
     }
 
     /// (Re)creates the session if the output size or screen changed. The next frame is then an
@@ -78,6 +82,9 @@ final class Encoder {
         needKeyframe = true
         keyframeTooBig = false
         keyframeInFlight = false
+        // A new session starts at an IDR: tokens of the old one mean nothing to it.
+        refreshOwed = false
+        acknowledged = []
         lock.unlock()
         generation += 1
         stream = Stream(generation: generation, width: width, height: height, screen: screen)
@@ -105,29 +112,47 @@ final class Encoder {
         self.session = nil
     }
 
-    func encode(_ buffer: CVPixelBuffer, capturedMicros: UInt64, forceKeyframe: Bool) {
+    /// The daemon says every viewer has this long-term reference frame: the encoder may refer
+    /// to it, and a refresh starts from it.
+    func acknowledge(ltr token: UInt64) {
+        lock.lock()
+        acknowledged.append(NSNumber(value: token))
+        lock.unlock()
+    }
+
+    /// `refresh`: a viewer skipped frames, so the next frame refers only to an acknowledged
+    /// long-term reference (a delta frame), or is an IDR if none is acknowledged yet.
+    func encode(_ buffer: CVPixelBuffer, capturedMicros: UInt64, forceKeyframe: Bool, refresh: Bool) {
         guard let session, let stream else { return }
         lock.lock()
-        // A keyframe already on its way serves this request too: it reaches every viewer after it.
+        // A keyframe or refresh already on its way serves this request too: it reaches every
+        // viewer after it.
         let keyframe = (forceKeyframe || needKeyframe) && !keyframeInFlight
-        if keyframe { keyframeInFlight = true }
+        let refreshing = (refresh || refreshOwed) && !keyframe && !keyframeInFlight
+        if keyframe || refreshing { keyframeInFlight = true }
+        if refreshing { refreshOwed = false }
+        let acks = acknowledged
+        acknowledged = []
         inFlight += 1
         lock.unlock()
-        let properties: CFDictionary? = keyframe
-            ? [kVTEncodeFrameOptionKey_ForceKeyFrame: kCFBooleanTrue!] as CFDictionary : nil
+        var options: [CFString: Any] = [:]
+        if keyframe { options[kVTEncodeFrameOptionKey_ForceKeyFrame] = kCFBooleanTrue }
+        if refreshing { options[kVTEncodeFrameOptionKey_ForceLTRRefresh] = kCFBooleanTrue }
+        if !acks.isEmpty { options[kVTEncodeFrameOptionKey_AcknowledgedLTRTokens] = acks }
         let status = VTCompressionSessionEncodeFrame(
             session, imageBuffer: buffer,
             presentationTimeStamp: CMClockGetTime(CMClockGetHostTimeClock()),
-            duration: .invalid, frameProperties: properties, infoFlagsOut: nil
+            duration: .invalid, frameProperties: options.isEmpty ? nil : options as CFDictionary, infoFlagsOut: nil
         ) { [weak self] status, flags, sample in
             self?.output(status: status, flags: flags, sample: sample, stream: stream,
-                         capturedMicros: capturedMicros, requestedKeyframe: keyframe)
+                         capturedMicros: capturedMicros, requestedKeyframe: keyframe, requestedRefresh: refreshing)
         }
         if status != noErr {
             lock.lock()
             inFlight -= 1
             needKeyframe = true
-            if keyframe { keyframeInFlight = false }
+            if keyframe || refreshing { keyframeInFlight = false }
+            acknowledged = acks + acknowledged
             lock.unlock()
             debugLog("VTCompressionSessionEncodeFrame failed: \(status)")
         }
@@ -136,18 +161,20 @@ final class Encoder {
     // MARK: - Output
 
     private func output(status: OSStatus, flags: VTEncodeInfoFlags, sample: CMSampleBuffer?,
-                        stream: Stream, capturedMicros: UInt64, requestedKeyframe: Bool) {
+                        stream: Stream, capturedMicros: UInt64, requestedKeyframe: Bool,
+                        requestedRefresh: Bool) {
         lock.lock()
         defer { lock.unlock() }
         inFlight -= 1
-        if requestedKeyframe { keyframeInFlight = false }
+        if requestedKeyframe || requestedRefresh { keyframeInFlight = false }
         // The rate control skipped this frame: nothing refers to it, so the stream goes on. Only
-        // a keyframe that was asked for is still owed. (Forcing one after every skip makes things
-        // worse at a low bitrate: each keyframe is skipped or makes the next frame skip, and the
-        // stream turns into keyframes only.)
+        // a keyframe or refresh that was asked for is still owed. (Forcing one after every skip
+        // makes things worse at a low bitrate: each keyframe is skipped or makes the next frame
+        // skip, and the stream turns into keyframes only.)
         if status == noErr && flags.contains(.frameDropped) {
             if requestedKeyframe { needKeyframe = true }
-            debugLog("the encoder skipped a frame\(requestedKeyframe ? " (a keyframe)" : "")")
+            if requestedRefresh { refreshOwed = true }
+            debugLog("the encoder skipped a frame\(requestedKeyframe ? " (a keyframe)" : requestedRefresh ? " (a refresh)" : "")")
             return
         }
         guard status == noErr, let sample, let block = CMSampleBufferGetDataBuffer(sample) else {
@@ -173,8 +200,10 @@ final class Encoder {
             return
         }
 
+        let token = Self.ltrToken(sample)
+        let header = Self.frameHeader + (token == nil ? 0 : 8)
         let length = CMBlockBufferGetDataLength(block)
-        guard Self.frameHeader + length <= Output.maxPayload else {
+        guard header + length <= Output.maxPayload else {
             // Never written. A delta loss still needs an IDR, but a keyframe this big would most
             // likely be too big again, so a static screen does not retry it (see `needsKeyframe`).
             dropped += 1
@@ -183,20 +212,21 @@ final class Encoder {
             debugLog("dropping a \(length)-byte \(keyframe ? "key" : "delta") frame over the \(Output.maxPayload)-byte payload limit (\(dropped) dropped)")
             return
         }
-        // Flags (bit 0: keyframe; bit 1: the encode time follows), the capture time, the time the
-        // encoder handed the frame over, then the sample.
-        var message = Output.message(.frame, payloadLength: Self.frameHeader + length)
-        message.append((keyframe ? 1 : 0) | 2)
-        for time in [capturedMicros, unixMicros()] {
+        // Flags (bit 0: keyframe; bit 1: the encode time follows; bit 2: an LTR token follows;
+        // bit 3: the refresh asked for), the capture time, the time the encoder handed the frame
+        // over, [the token,] then the sample.
+        var message = Output.message(.frame, payloadLength: header + length)
+        message.append((keyframe ? 1 : 0) | 2 | (token == nil ? 0 : 4) | (requestedRefresh && !keyframe ? 8 : 0))
+        for value in [capturedMicros, unixMicros()] + (token.map { [$0] } ?? []) {
             for shift in stride(from: 56, through: 0, by: -8) {
-                message.append(UInt8(truncatingIfNeeded: time >> UInt64(shift)))
+                message.append(UInt8(truncatingIfNeeded: value >> UInt64(shift)))
             }
         }
-        let header = message.count
-        message.count = header + length
+        let start = message.count
+        message.count = start + length
         let copied = message.withUnsafeMutableBytes { raw in
             CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: length,
-                                       destination: raw.baseAddress! + header)
+                                       destination: raw.baseAddress! + start)
         }
         guard copied == kCMBlockBufferNoErr else {
             needKeyframe = true
@@ -240,6 +270,14 @@ final class Encoder {
         guard let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false)
             as? [[CFString: Any]], let first = attachments.first else { return true }
         return (first[kCMSampleAttachmentKey_NotSync] as? Bool) != true
+    }
+
+    /// The token of a long-term reference frame, which the daemon acknowledges once every viewer
+    /// has the frame.
+    private static func ltrToken(_ sample: CMSampleBuffer) -> UInt64? {
+        guard let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false)
+            as? [[CFString: Any]], let first = attachments.first else { return nil }
+        return (first[kVTSampleAttachmentKey_RequireLTRAcknowledgementToken] as? NSNumber)?.uint64Value
     }
 
     /// AVCDecoderConfigurationRecord (ISO/IEC 14496-15 5.2.4.1) with every SPS and PPS.
@@ -324,6 +362,10 @@ final class Encoder {
         // each keyframe (2-4 times a delta frame) is a burst that delays the frames behind it.
         set(session, kVTCompressionPropertyKey_MaxKeyFrameInterval, NSNumber(value: 0))
         set(session, kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, NSNumber(value: 0))
+        // Long-term references: once every viewer has one (the daemon acknowledges its token), a
+        // viewer that skipped frames resumes at a delta frame that refers to it (`refresh`), not
+        // at a keyframe. Checked in WebKit and Chrome: the pictures after it match the full stream.
+        set(session, kVTCompressionPropertyKey_EnableLTR, kCFBooleanTrue!)
         // Two temporal layers: every other frame is one nothing refers to, so the daemon can skip
         // it for a viewer that falls behind and go on without a keyframe.
         set(session, kVTCompressionPropertyKey_BaseLayerFrameRateFraction, NSNumber(value: 0.5))
@@ -335,6 +377,9 @@ final class Encoder {
         return session
     }
 
+    /// A hard limit over a second only. VideoToolbox's H.264 encoder takes a per-frame window too
+    /// but does not keep to it (a scene cut came out at 63–100 KB against a 25 KB limit), so
+    /// there is none.
     private func dataRateLimits() -> CFArray {
         [NSNumber(value: Double(bitrate) * 1.5 / 8), NSNumber(value: 1)] as CFArray
     }

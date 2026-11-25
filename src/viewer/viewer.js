@@ -155,6 +155,12 @@
       resetLoss();
       lastPong = performance.now();
       ping();
+      // After skipped frames, the server may resume this page at a delta frame that refers to a
+      // long-term reference it has, not at a keyframe. Checked with the WebCodecs of WebKit and
+      // Chrome on macOS (both VideoToolbox), where the pictures match the full stream; any other
+      // decoder gets keyframes.
+      const ua = navigator.userAgent;
+      send({ t: "decoder", refresh: /Macintosh/.test(ua) && !/Firefox\//.test(ua) });
       startRtc();
     };
     ws.onmessage = (ev) => (typeof ev.data === "string" ? onText(JSON.parse(ev.data)) : onFrame(ev.data));

@@ -55,6 +55,20 @@ final class Commands {
             capture.requestKeyframe()
             return nil
         }
+        if let refresh = object["refresh"] {
+            guard only(object, ["refresh"]), boolean(refresh) == true else {
+                return "refresh line must be {\"refresh\":true}"
+            }
+            capture.requestRefresh()
+            return nil
+        }
+        if let token = object["ltr_ack"] {
+            guard only(object, ["ltr_ack"]), let token = integer(token), token >= 0 else {
+                return "ltr_ack must be a token from a frame"
+            }
+            capture.acknowledge(ltr: UInt64(token))
+            return nil
+        }
         if let encode = object["encode"] {
             guard only(object, ["encode"]), let settings = encode as? [String: Any] else {
                 return "encode must be an object"

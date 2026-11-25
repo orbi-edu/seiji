@@ -357,20 +357,16 @@ async fn a_still_screen_reaches_a_viewer_that_joins_later() {
     assert!(matches!(again, Ok((true, _))), "a throttled keyframe request is retried: {again:?}");
 }
 
-#[tokio::test]
-async fn a_slow_viewer_gets_no_stale_frames_and_resumes_at_a_keyframe() {
-    let env = setup_with(2, json!({"viewer": {"fps": 60}})).await;
-    let (token, lease) = device(&env, "alice").await;
-    let mut ws = open(&env, &token, &lease, false).await.ws().await;
-    format(&mut ws).await;
-
-    // Acknowledge nothing: frames queue up on the way, and past half a second the server stops
-    // sending instead of queueing more.
+/// Acknowledges nothing for 1.5 s, then the last frame it got: returns that frame's number and
+/// the next frame.
+async fn stall_then_catch_up(env: &Env, ws: &mut Socket) -> (u32, (bool, u32)) {
+    // Frames queue up on the way, and past half a second the server stops sending instead of
+    // queueing more.
     let started = std::time::Instant::now();
     let mut frames = Vec::new();
     let quiet = tokio::time::timeout(Duration::from_millis(1500), async {
         loop {
-            if let Msg::Frame { seq, .. } = next(&mut ws).await {
+            if let Msg::Frame { seq, .. } = next(ws).await {
                 frames.push((seq, started.elapsed()));
             }
         }
@@ -381,12 +377,54 @@ async fn a_slow_viewer_gets_no_stale_frames_and_resumes_at_a_keyframe() {
     assert!(last_at < Duration::from_millis(800), "a frame went out {last_at:?} into the stall");
     // A congested viewer lowers the shared bitrate.
     assert!(env.fake.log().iter().any(|l| l.starts_with("encode 60 0.5 1750000")), "{:?}", env.fake.log());
+    send(ws, json!({"t": "ack", "seq": last})).await;
+    (last, frame(ws).await)
+}
 
-    // Acknowledging catches up: the stream resumes at a keyframe.
-    send(&mut ws, json!({"t": "ack", "seq": last})).await;
-    let (key, seq) = frame(&mut ws).await;
+#[tokio::test]
+async fn a_slow_viewer_gets_no_stale_frames_and_resumes_at_a_refresh_frame() {
+    let env = setup_with(2, json!({"viewer": {"fps": 60}})).await;
+    let (token, lease) = device(&env, "alice").await;
+    let mut ws = open(&env, &token, &lease, false).await.ws().await;
+    format(&mut ws).await;
+    send(&mut ws, json!({"t": "decoder", "refresh": true})).await;
+    // Its acknowledgement tells the helper that every viewer has the long-term references up to
+    // there, so it resumes at a delta frame that refers to one, not at a keyframe.
+    let (last, (key, seq)) = stall_then_catch_up(&env, &mut ws).await;
+    assert!(!key, "after a gap the next frame is a refresh frame");
+    assert!(seq > last + 1, "frames were skipped, not queued");
+    assert_eq!(env.fake.refreshes.load(Ordering::SeqCst), 1);
+    assert!(env.fake.ltr_acks.lock().unwrap().iter().any(|t| *t <= u64::from(last)), "{:?}", env.fake.ltr_acks);
+}
+
+#[tokio::test]
+async fn a_slow_viewer_whose_decoder_may_not_take_refresh_frames_resumes_at_a_keyframe() {
+    let env = setup_with(2, json!({"viewer": {"fps": 60}})).await;
+    let (token, lease) = device(&env, "alice").await;
+    let mut ws = open(&env, &token, &lease, false).await.ws().await;
+    format(&mut ws).await;
+    // The page did not say its decoder takes refresh frames.
+    let (last, (key, seq)) = stall_then_catch_up(&env, &mut ws).await;
     assert!(key, "after a gap the next frame is a keyframe");
     assert!(seq > last + 1, "frames were skipped, not queued");
+    assert!(!env.fake.ltr_acks.lock().unwrap().is_empty(), "the reference was acknowledged all the same");
+    assert_eq!(env.fake.refreshes.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn a_slow_viewer_resumes_at_a_keyframe_while_another_has_no_reference() {
+    let env = setup_with(2, json!({"viewer": {"fps": 60}})).await;
+    let (token, lease) = device(&env, "alice").await;
+    let mut ws = open(&env, &token, &lease, false).await.ws().await;
+    format(&mut ws).await;
+    send(&mut ws, json!({"t": "decoder", "refresh": true})).await;
+    // A second viewer that acknowledges nothing: no long-term reference is with every viewer.
+    let _other = open(&env, &token, &lease, false).await.ws().await;
+    let (last, (key, seq)) = stall_then_catch_up(&env, &mut ws).await;
+    assert!(key, "after a gap the next frame is a keyframe");
+    assert!(seq > last + 1, "frames were skipped, not queued");
+    assert!(env.fake.ltr_acks.lock().unwrap().is_empty(), "{:?}", env.fake.ltr_acks);
+    assert_eq!(env.fake.refreshes.load(Ordering::SeqCst), 0);
 }
 
 /// A frame's flags, frame number, and whether nothing refers to it (its first NAL unit has
@@ -433,7 +471,7 @@ async fn a_viewer_a_little_behind_skips_only_frames_nothing_refers_to() {
     let got: Vec<u32> = frames.iter().map(|((_, seq, _), _)| *seq).chain(next.iter().copied()).collect();
     let missed: Vec<u32> = (got[0]..next[0]).filter(|s| !got.contains(s)).collect();
     assert!(!missed.is_empty(), "something was skipped while behind: {got:?}");
-    assert!(missed.iter().all(|s| s % 2 == 1 && s % 10 != 0), "only unreferenced frames: {missed:?}");
+    assert!(missed.iter().all(|s| s % 2 == 1), "only unreferenced frames: {missed:?}");
 }
 
 #[tokio::test]

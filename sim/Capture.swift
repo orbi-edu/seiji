@@ -57,6 +57,8 @@ final class Capture {
     private var lastCaptureNanos: UInt64 = 0
     private var lastAttemptNanos: UInt64 = 0
     private var keyframeRequested = true
+    /// The daemon asks for a refresh (see `Encoder.encode`).
+    private var refreshRequested = false
     /// The surface `sourceBuffer` wraps.
     private var bufferSurface: IOSurface?
     private var sourceBuffer: CVPixelBuffer?
@@ -126,6 +128,17 @@ final class Capture {
             keyframeRequested = true
             tick(force: true)
         }
+    }
+
+    func requestRefresh() {
+        queue.async { [self] in
+            refreshRequested = true
+            tick(force: true)
+        }
+    }
+
+    func acknowledge(ltr token: UInt64) {
+        queue.async { [self] in encoder.acknowledge(ltr: token) }
     }
 
     func update(fps: Int?, scale: Double?, bitrate: Int?) {
@@ -232,9 +245,9 @@ final class Capture {
         else { return }
         let seed = IOSurfaceGetSeed(surface)
         let changed = surface !== lastSurface || seed != lastSeed
-        // Work a static screen would never trigger again: a requested keyframe, one the encoder or
-        // stdout dropped, or a session still to be created at a new size.
-        let pending = keyframeRequested || encoder.needsKeyframe
+        // Work a static screen would never trigger again: a requested keyframe or refresh, one the
+        // encoder or stdout dropped, or a session still to be created at a new size.
+        let pending = keyframeRequested || refreshRequested || encoder.needsKeyframe
         guard changed || pending || force else { return }
         let now = monotonicNanos()
         // A keyframe line flood must not queue frames without bound: forced work over the limit
@@ -270,8 +283,10 @@ final class Capture {
         lastSeed = seed
         lastCaptureNanos = now
         let keyframe = keyframeRequested
+        let refresh = refreshRequested
         keyframeRequested = false
-        encoder.encode(output, capturedMicros: unixMicros(), forceKeyframe: keyframe)
+        refreshRequested = false
+        encoder.encode(output, capturedMicros: unixMicros(), forceKeyframe: keyframe, refresh: refresh)
         debugLog("captured seed=\(seed) force=\(force) changed=\(changed) in \(Double(monotonicNanos() - now) / 1e6) ms")
     }
 
