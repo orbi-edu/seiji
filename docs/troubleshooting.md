@@ -559,7 +559,7 @@ A view-only session answers `This viewer is view-only.` for every input. Ask for
 
 **Sign:** The frame age in **Stats** (⌥I) is high, or taps answer late.
 
-**Find the stage:** **Stats** lists "Where the time goes": encode, helper → server, in server, network, decode, capture → shown, and input in server, each as p50 / p95 ([mcp.md](mcp.md#where-the-time-goes)). The daemon logs the same numbers every 30 s for each viewer:
+**Find the stage:** **Stats** lists "Where the time goes": encode, helper → server, in server, network, decode and capture → shown for the frames, and for the input (taps, keys, buttons): upload, in server (with its lock and pacing parts), screen reacts and input → shown, each as p50 / p95 ([mcp.md](mcp.md#where-the-time-goes)). The daemon logs the same numbers every 30 s for each viewer:
 
 ```sh
 grep "viewer pipeline" /usr/local/var/log/seiji.log | tail
@@ -571,7 +571,11 @@ grep "viewer pipeline" /usr/local/var/log/seiji.log | tail
 | Helper → server, or in server | The daemon is behind (CPU), or the write waits on the viewer's socket | Check the host's load; "in server" that grows with the network means the link is full |
 | Network | The path between the host and the viewer: the TLS proxy, the internet, the viewer's own link | Compare `rtt` with a ping from the viewer's machine to `1.1.1.1`; pick **Smooth** |
 | Decode | The viewer's machine decodes slowly | Close other video in the browser; a lower `viewer.scale` |
-| Input in server | A run holds the device, or text goes through AXe (about 1 s) | Wait for the run; taps and swipes go through the helper, not AXe |
+| Upload | The path from the viewer to the host, as for the network | As for the network |
+| Input in server: lock | A run holds the device, or another viewer's finger is down | Wait for the run |
+| Input in server: pacing | The link bunched a gesture's points, and Seiji spaces them again (up to `viewer.paceMaxMs`) | A lower cap in **Viewer settings** ([tern.md](tern.md)), at the cost of swipes that fling |
+| Screen reacts | The app takes long to draw (a first launch, heavy work on the main thread), or the host is busy | Profile the app; check the host's load |
+| Text | Text goes through AXe (about 1 s) | Taps and swipes go through the helper, not AXe |
 
 ### The Tern plugin says the CLI is missing
 

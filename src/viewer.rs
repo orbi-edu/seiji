@@ -886,9 +886,14 @@ enum ClientMsg {
         usage: u8,
         #[serde(default)]
         mods: Vec<u8>,
+        /// As on `Touch`.
+        #[serde(default)]
+        ts: Option<f64>,
     },
     Button {
         name: ScreenButton,
+        #[serde(default)]
+        ts: Option<f64>,
     },
     /// Type the text (AXe, US keyboard characters).
     Type {
@@ -916,8 +921,21 @@ enum ClientMsg {
     },
     /// The page's timings of the last frames, every 5 s; see `pipeline`.
     Telemetry {
-        report: pipeline::PageReport,
+        report: Box<pipeline::PageReport>,
     },
+}
+
+impl ClientMsg {
+    /// The page's time of an input whose way to the screen the page times (`applied`): a finger
+    /// down or up, a key, a button. Moves are left out: there are too many.
+    fn timed(&self) -> Option<f64> {
+        match self {
+            ClientMsg::Touch { phase: TouchPhase::Down | TouchPhase::Up, ts, .. }
+            | ClientMsg::Key { ts, .. }
+            | ClientMsg::Button { ts, .. } => *ts,
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1048,6 +1066,7 @@ async fn session(live: Live, mut video: broadcast::Receiver<Video>, socket: WebS
         gesture: None,
         touched: None,
         pipe: pipe.clone(),
+        stamp: Stamp::default(),
     };
     let stop = CancellationToken::new();
     // Once the page is gone its queued input is dropped, even while a frame write still waits.
@@ -1244,8 +1263,9 @@ async fn read_page(
                 }
                 None
             }
-            Ok(ClientMsg::Telemetry { report }) => {
-                if ctl.send(Ctl::Report(Box::new(report.checked()))).await.is_err() {
+            Ok(ClientMsg::Telemetry { mut report }) => {
+                *report = std::mem::take(&mut *report).checked();
+                if ctl.send(Ctl::Report(report)).await.is_err() {
                     return;
                 }
                 None
@@ -1337,6 +1357,23 @@ struct Input {
     touched: Option<Instant>,
     /// Where "input in server" is recorded.
     pipe: Arc<StdMutex<pipeline::Pipeline>>,
+    /// The parts of the message being applied.
+    stamp: Stamp,
+}
+
+/// Where one input message's time went in the server, for the pipeline.
+#[derive(Default)]
+struct Stamp {
+    /// The wait for the op lock.
+    lock: Option<Duration>,
+    /// The hold that keeps a gesture's spacing.
+    pace: Option<Duration>,
+    /// The helper got it: when, and the Unix time in microseconds.
+    sent: Option<(Instant, i64)>,
+}
+
+fn sent_now() -> Option<(Instant, i64)> {
+    Some((Instant::now(), now_us()))
 }
 
 impl Input {
@@ -1347,6 +1384,14 @@ impl Input {
             self.hub.send(ScreenCommand::Touch { phase: TouchPhase::Up, x: g.x, y: g.y, edge: None });
             let _ = self.hub.sync().await;
         }
+    }
+
+    /// `hold`, timed.
+    async fn hold(&mut self) -> Result<Held, ViewError> {
+        let start = Instant::now();
+        let held = hold(&self.rt, &self.hub).await;
+        self.stamp.lock = Some(start.elapsed());
+        held
     }
 
     async fn apply(&mut self, msg: ClientMsg) -> Option<Message> {
@@ -1373,8 +1418,9 @@ impl Input {
         match msg {
             ClientMsg::Touch { phase: TouchPhase::Down, x, y, edge, ts } => {
                 point(x, y)?;
-                let held = hold(&self.rt, &hub).await?;
+                let held = self.hold().await?;
                 delivered(hub.send(ScreenCommand::Touch { phase: TouchPhase::Down, x, y, edge }))?;
+                self.stamp.sent = sent_now();
                 let clock = ts.map(|t| (t, Instant::now()));
                 self.gesture = Some(Gesture { _held: held, x, y, at: Instant::now(), clock });
             }
@@ -1384,8 +1430,10 @@ impl Input {
                 if let Some(g) = self.gesture.as_mut() {
                     if let Some(wait) = g.pace(ts, self.pool.viewers.pace_max()) {
                         tokio::time::sleep(wait).await;
+                        self.stamp.pace = Some(wait);
                     }
                     hub.send(ScreenCommand::Touch { phase, x, y, edge: None });
+                    self.stamp.sent = sent_now();
                     (g.x, g.y, g.at) = (x, y, Instant::now());
                     if phase == TouchPhase::Up {
                         // The device stays held until the helper has the lift.
@@ -1394,29 +1442,31 @@ impl Input {
                     }
                 }
             }
-            ClientMsg::Key { usage, mods } => {
+            ClientMsg::Key { usage, mods, .. } => {
                 if mods.len() > 4 || mods.iter().any(|m| !(224..=231).contains(m)) {
                     return Err(ViewError::Bad("mods must be up to 4 modifier usages (224-231)".into()));
                 }
-                let _held = hold(&self.rt, &hub).await?;
+                let _held = self.hold().await?;
                 delivered(press(&hub, usage, &mods))?;
+                self.stamp.sent = sent_now();
                 hub.sync().await?;
             }
-            ClientMsg::Button { name } => {
-                let _held = hold(&self.rt, &hub).await?;
+            ClientMsg::Button { name, .. } => {
+                let _held = self.hold().await?;
                 delivered(hub.send(ScreenCommand::Button { button: name, down: true }))?;
+                self.stamp.sent = sent_now();
                 tokio::time::sleep(BUTTON_HOLD).await;
                 hub.send(ScreenCommand::Button { button: name, down: false });
                 hub.sync().await?;
             }
             ClientMsg::Type { id, text } | ClientMsg::PasteAndType { id, text } => {
-                let _held = hold(&self.rt, &hub).await?;
+                let _held = self.hold().await?;
                 hub.sync().await?;
                 self.typed(&text).await?;
                 return Ok(Some(done(id, None)));
             }
             ClientMsg::Paste { id, text } => {
-                let _held = hold(&self.rt, &hub).await?;
+                let _held = self.hold().await?;
                 hub.sync().await?;
                 let via = self.pasted(&text).await?;
                 return Ok(Some(done(id, Some(via))));
@@ -1524,9 +1574,36 @@ async fn run_input(
             m = rx.recv() => m,
         };
         let Some((msg, read_at)) = msg else { break };
+        let timed = msg.timed();
+        let text_input =
+            matches!(msg, ClientMsg::Type { .. } | ClientMsg::Paste { .. } | ClientMsg::PasteAndType { .. });
         let reply = input.apply(msg).await;
-        // Input in server: read from the page to applied (the helper has it, or AXe is done).
-        input.pipe.lock().expect("pipeline mutex").input.push(read_at.elapsed().as_secs_f64() * 1000.0);
+        let stamp = std::mem::take(&mut input.stamp);
+        {
+            let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+            let mut pipe = input.pipe.lock().expect("pipeline mutex");
+            if let Some(d) = stamp.lock {
+                pipe.lock.push(ms(d));
+            }
+            if let Some(d) = stamp.pace {
+                pipe.pace.push(ms(d));
+            }
+            // Input in server: read from the page to the helper having it.
+            if let Some((at, _)) = stamp.sent {
+                pipe.input.push(ms(at.duration_since(read_at)));
+            }
+            if text_input {
+                pipe.text.push(ms(read_at.elapsed()));
+            }
+        }
+        // The page times the rest of the input's way to the screen from these.
+        if let (Some(ts), Some((at, sent_us))) = (timed, stamp.sent) {
+            let read_us = sent_us - at.duration_since(read_at).as_micros() as i64;
+            let applied = serde_json::json!({ "t": "applied", "ts": ts, "read_us": read_us, "sent_us": sent_us });
+            if out.send(text(applied)).await.is_err() {
+                break;
+            }
+        }
         if let Some(reply) = reply
             && out.send(reply).await.is_err()
         {
