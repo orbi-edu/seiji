@@ -138,12 +138,15 @@ local function clear_admin(state: any)
 	state.is_admin = false
 	state.data.admin_users = nil
 	state.data.admin_leases = nil
+	state.data.admin_viewer = nil
 	state.data.capacity = nil
 	state.data.in_use = nil
 	state.errs.admin_users = nil
 	state.errs.admin_leases = nil
+	state.errs.admin_viewer = nil
 	state.read_at.admin_users = nil
 	state.read_at.admin_leases = nil
+	state.read_at.admin_viewer = nil
 	state.editing = nil
 	state.edit_error = nil
 	state.saving = false
@@ -266,6 +269,40 @@ read_admin_users = function(state: any)
 	end)
 	read_admin(state, "admin_leases", apimod.admin_leases, function(data)
 		state.data.admin_leases = data.leases
+	end)
+	read_admin(state, "admin_viewer", apimod.admin_viewer, function(data)
+		state.data.admin_viewer = data
+	end)
+end
+
+-- The viewer settings (`/v1/admin/viewer`), or nil before the first read.
+function M.admin_viewer(state: any): any
+	return state.data.admin_viewer
+end
+
+-- Changes viewer settings on the server; the reply is the new state.
+local function set_viewer(state: any, body: { [string]: any })
+	if state.inflight.set_viewer then
+		return
+	end
+	state.inflight.set_viewer = true
+	apimod.admin_set_viewer(state.api, body, function(data, err)
+		state.inflight.set_viewer = nil
+		if state.stopped then
+			return
+		end
+		if err then
+			if err.code == "forbidden" then
+				clear_admin(state)
+				flash(state, "error", "You no longer have admin access.")
+			else
+				flash(state, "error", cli.describe(err))
+			end
+		elseif type(data) == "table" then
+			state.data.admin_viewer = data
+			flash(state, "success", "Viewer settings saved. They last until Seiji restarts.")
+		end
+		state.cx:render()
 	end)
 end
 
@@ -752,6 +789,14 @@ local function on_action(state: any, act: string, value: string?)
 				state.edit_error = nil
 			end
 		end
+	-- Admin viewer settings: `viewer_pace=<ms>`, `viewer_webrtc=<true|false>`.
+	elseif act == "viewer_pace" and value then
+		local ms = tonumber(value)
+		if ms and ms >= 0 and ms <= 1000 then
+			set_viewer(state, { pace_max_ms = math.floor(ms) })
+		end
+	elseif act == "viewer_webrtc" and value then
+		set_viewer(state, { webrtc = value == "true" })
 	end
 end
 

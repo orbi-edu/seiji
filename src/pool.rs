@@ -169,6 +169,7 @@ pub fn account_for(config: &Config, user: &User) -> Result<Account> {
 impl Pool {
     pub fn new(config: Arc<Config>, store: Arc<Store>, runner: Arc<Runner>, devices: Arc<dyn Devices>) -> Self {
         let maestro = Maestro::new(config.clone(), runner.clone());
+        let viewers = crate::viewer::Viewers::new(&config.viewer);
         Self {
             config,
             store,
@@ -178,7 +179,7 @@ impl Pool {
             admission: Mutex::new(()),
             runtime: StdMutex::new(HashMap::new()),
             evidence_reserved: StdMutex::new(HashMap::new()),
-            viewers: Default::default(),
+            viewers,
             forwards: Default::default(),
         }
     }

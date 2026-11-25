@@ -327,6 +327,46 @@ async fn admin_watches_another_users_device_from_the_users_tab() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn admin_changes_the_viewer_settings_from_the_users_tab() {
+    let Some(bin) = tern() else {
+        eprintln!("skipped: tern is not on PATH");
+        return;
+    };
+    let webrtc = json!({"enabled": false, "bind": "127.0.0.1", "ports": [50990, 50999]});
+    let env = setup_with(2, json!({ "adminUsers": ["alice"], "viewer": {"webrtc": webrtc} })).await;
+    let alice_token = add_user(&env, "alice", QUOTA);
+    let settings = || async {
+        let url = format!("{}/v1/admin/viewer", env.url);
+        let resp = reqwest::Client::new().get(url).bearer_auth(&alice_token).send().await.unwrap();
+        resp.json::<Value>().await.unwrap()["settings"].clone()
+    };
+
+    let mut t = Tern::start(bin, &env, &alice_token).await;
+    t.ctl(&["plugins", "run", "plugin.seiji.devices"]).await;
+    t.wait_text("No devices", "sf-main").await;
+    t.ctl(&["key", "tab"]).await;
+    t.wait_text("No runs yet", "sf-main").await;
+    t.ctl(&["key", "tab"]).await;
+    t.wait_text("Viewer settings", "sf-main").await;
+    t.wait_text("80 ms", "sf-main").await;
+
+    // The pacing cap steps by 20 ms, and the server keeps it.
+    t.click_badge("+20").await;
+    t.wait_text("Viewer settings saved", "sf-dock").await;
+    t.wait_text("100 ms", "sf-main").await;
+    assert_eq!(settings().await["pace_max_ms"], 100);
+
+    // WebRTC turns on from the same card.
+    t.click_badge("WebRTC off").await;
+    t.wait_for("WebRTC on", ".tn-pane.on .sf-main .sf-badge", |s| s.lines().any(|l| l == "WebRTC on")).await;
+    assert_eq!(settings().await["webrtc"], true);
+
+    assert_eq!(t.plugin_errors(), Vec::<String>::new());
+    let _ = t.ctl(&["quit"]).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), t.child.wait()).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn non_admin_does_not_see_users_tab_or_admin_data() {
     let Some(bin) = tern() else {
         eprintln!("skipped: tern is not on PATH");
