@@ -136,6 +136,16 @@ function M.admin_leases(c: Client, cb: (data: any, err: cli.CliError?) -> ())
 	M.request(c, "GET", "/v1/admin/leases", nil, cb)
 end
 
+-- `GET /v1/admin/viewer`: the viewer settings an admin can change while Seiji runs. Admin only.
+function M.admin_viewer(c: Client, cb: (data: any, err: cli.CliError?) -> ())
+	M.request(c, "GET", "/v1/admin/viewer", nil, cb)
+end
+
+-- `PUT /v1/admin/viewer`: change `pace_max_ms` and/or `webrtc` until the next restart. Admin only.
+function M.admin_set_viewer(c: Client, body: { [string]: any }, cb: (data: any, err: cli.CliError?) -> ())
+	M.request(c, "PUT", "/v1/admin/viewer", { body = body }, cb)
+end
+
 -- Calls MCP tool `name`; `cb(value, err)` with the tool's text decoded as JSON when it is JSON.
 -- Handles both application/json and text/event-stream responses.
 function M.tool(c: Client, name: string, args: { [string]: any }?, timeout_ms: number?, cb: (value: any, err: cli.CliError?) -> ())

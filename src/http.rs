@@ -386,6 +386,62 @@ async fn admin_viewer_link(
     }
 }
 
+/// The body of `PUT /v1/admin/viewer`: the settings to change.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ViewerSettingsBody {
+    pace_max_ms: Option<u32>,
+    webrtc: Option<bool>,
+}
+
+/// The viewer settings now, what `seiji.json` sets, and why WebRTC cannot be turned on, if so.
+fn viewer_settings(pool: &Pool) -> Response {
+    let v = &pool.config.viewer;
+    Json(serde_json::json!({
+        "settings": pool.viewers.settings(),
+        "defaults": { "pace_max_ms": v.pace_max_ms, "webrtc": v.webrtc.enabled },
+        "webrtc_problem": v.webrtc.problem(),
+    }))
+    .into_response()
+}
+
+/// `GET /v1/admin/viewer`: the viewer settings an admin can change while Seiji runs.
+async fn admin_viewer(State(pool): State<Arc<Pool>>, Extension(AuthedUser(caller)): Extension<AuthedUser>) -> Response {
+    if !pool.config.admin_users.contains(&caller.name) {
+        return bad(StatusCode::FORBIDDEN, "admin access required");
+    }
+    viewer_settings(&pool)
+}
+
+/// `PUT /v1/admin/viewer`: changes them until the next restart.
+async fn admin_set_viewer(
+    State(pool): State<Arc<Pool>>,
+    Extension(AuthedUser(caller)): Extension<AuthedUser>,
+    body: axum::body::Bytes,
+) -> Response {
+    if !pool.config.admin_users.contains(&caller.name) {
+        return bad(StatusCode::FORBIDDEN, "admin access required");
+    }
+    let body: ViewerSettingsBody = match serde_json::from_slice(&body) {
+        Ok(b) => b,
+        Err(e) => return bad(StatusCode::BAD_REQUEST, format!("invalid body: {e}")),
+    };
+    // Validate everything first, then store only what the body names, so two admins who change
+    // different settings at once both keep their change.
+    if body.pace_max_ms.is_some_and(|ms| ms > 1000) {
+        return bad(StatusCode::BAD_REQUEST, "pace_max_ms must be 0-1000");
+    }
+    if body.webrtc == Some(true)
+        && let Some(problem) = pool.config.viewer.webrtc.problem()
+    {
+        return bad(StatusCode::BAD_REQUEST, format!("WebRTC cannot be turned on: {problem}"));
+    }
+    pool.viewers.set_settings(body.pace_max_ms, body.webrtc);
+    let s = pool.viewers.settings();
+    tracing::info!(admin = %caller.name, pace_max_ms = s.pace_max_ms, webrtc = s.webrtc, "viewer settings changed");
+    viewer_settings(&pool)
+}
+
 /// `GET /v1/leases/{lease_id}/screenshot.jpg`: the screen now, as a JPEG.
 async fn lease_screenshot(
     State(pool): State<Arc<Pool>>,
@@ -479,6 +535,7 @@ pub fn router(pool: Arc<Pool>, shutdown: CancellationToken) -> Router {
         .route("/v1/admin/users/{id}/limits", put(admin_set_limits))
         .route("/v1/admin/leases", get(admin_leases))
         .route("/v1/admin/leases/{lease_id}/viewer", post(admin_viewer_link))
+        .route("/v1/admin/viewer", get(admin_viewer).put(admin_set_viewer))
         .route("/v1/leases/{lease_id}/viewer", post(viewer_link))
         .route("/v1/leases/{lease_id}/screenshot.jpg", get(lease_screenshot))
         .route("/v1/leases/{lease_id}/forward", get(forward))

@@ -17,7 +17,7 @@ mod pipeline;
 mod rtc;
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -76,8 +76,6 @@ const RTT_WINDOW: Duration = Duration::from_secs(10);
 const KEYFRAME_GAP: Duration = Duration::from_millis(500);
 /// A finger left down this long without a move is lifted, and the device is free again.
 const GESTURE_IDLE: Duration = Duration::from_secs(10);
-/// The longest a touch move or lift waits to keep the spacing the page gave the gesture.
-const PACE_MAX: Duration = Duration::from_millis(250);
 /// How long a hardware button is held.
 const BUTTON_HOLD: Duration = Duration::from_millis(60);
 /// Viewer inputs touch the lease at most this often.
@@ -422,20 +420,63 @@ fn frame_message(seq: u32, f: &VideoFrame, received_us: i64) -> Encoded {
     Encoded { seq, key: f.key, received_us, message: Bytes::from(out) }
 }
 
-/// Tickets, sessions and the one helper per watched lease. In memory: a restart ends every
-/// lease, and with it every viewer.
-#[derive(Default)]
+/// Tickets, sessions, the one helper per watched lease, and the settings an admin can change
+/// while Seiji runs. In memory: a restart ends every lease, and with it every viewer, and sets
+/// the settings back to `seiji.json`.
 pub struct Viewers {
     tickets: StdMutex<HashMap<String, Ticket>>,
     sessions: StdMutex<HashMap<String, Session>>,
     hubs: StdMutex<HashMap<String, Arc<Hub>>>,
+    /// `viewer.paceMaxMs`, as an admin last set it.
+    pace_max_ms: AtomicU32,
+    /// `viewer.webrtc.enabled`, as an admin last set it.
+    webrtc: AtomicBool,
+}
+
+/// The viewer settings an admin can change while Seiji runs (`/v1/admin/viewer`).
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct ViewerSettings {
+    pub pace_max_ms: u32,
+    pub webrtc: bool,
 }
 
 impl Viewers {
+    pub fn new(cfg: &crate::config::Viewer) -> Self {
+        Self {
+            tickets: StdMutex::default(),
+            sessions: StdMutex::default(),
+            hubs: StdMutex::default(),
+            pace_max_ms: AtomicU32::new(cfg.pace_max_ms),
+            webrtc: AtomicBool::new(cfg.webrtc.enabled),
+        }
+    }
+
     /// Drops expired tickets and sessions (the reaper calls it).
     pub fn prune(&self, at: i64) {
         self.tickets.lock().expect("tickets mutex").retain(|_, t| t.expires > at);
         self.sessions.lock().expect("sessions mutex").retain(|_, s| s.expires > at);
+    }
+
+    pub fn settings(&self) -> ViewerSettings {
+        ViewerSettings {
+            pace_max_ms: self.pace_max_ms.load(Ordering::Relaxed),
+            webrtc: self.webrtc.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Stores the settings given and leaves the others. Applies to new gestures and new pages at
+    /// once; a page already on WebRTC stays on it.
+    pub fn set_settings(&self, pace_max_ms: Option<u32>, webrtc: Option<bool>) {
+        if let Some(ms) = pace_max_ms {
+            self.pace_max_ms.store(ms, Ordering::Relaxed);
+        }
+        if let Some(on) = webrtc {
+            self.webrtc.store(on, Ordering::Relaxed);
+        }
+    }
+
+    fn pace_max(&self) -> Duration {
+        Duration::from_millis(u64::from(self.pace_max_ms.load(Ordering::Relaxed)))
     }
 }
 
@@ -1177,7 +1218,7 @@ async fn read_page(
             }
             Ok(ClientMsg::RtcOffer { sdp }) => {
                 let cfg = &pool.config.viewer.webrtc;
-                if cfg.enabled {
+                if pool.viewers.settings().webrtc {
                     // A new offer replaces the old session and frees its port first.
                     if let Some(old) = rtc.take() {
                         old.close().await;
@@ -1261,8 +1302,8 @@ struct Gesture {
 impl Gesture {
     /// How long to hold a point so the helper gets the gesture with the page's own spacing,
     /// though the link delivered its points late or in a burst. A late point starts a new anchor;
-    /// no point waits longer than `PACE_MAX`.
-    fn pace(&mut self, ts: Option<f64>) -> Option<Duration> {
+    /// no point waits longer than `max` (`viewer.paceMaxMs`, or what an admin set).
+    fn pace(&mut self, ts: Option<f64>, max: Duration) -> Option<Duration> {
         let ts = ts?;
         let now = Instant::now();
         let (c0, s0) = self.clock?;
@@ -1271,7 +1312,7 @@ impl Gesture {
             self.clock = Some((ts, now));
             return None;
         }
-        let wait = (target - now).min(PACE_MAX);
+        let wait = (target - now).min(max);
         self.clock = Some((ts, now + wait));
         Some(wait)
     }
@@ -1341,7 +1382,7 @@ impl Input {
                 point(x, y)?;
                 // Without a finger down (it was refused as busy, or timed out) there is nothing to move.
                 if let Some(g) = self.gesture.as_mut() {
-                    if let Some(wait) = g.pace(ts) {
+                    if let Some(wait) = g.pace(ts, self.pool.viewers.pace_max()) {
                         tokio::time::sleep(wait).await;
                     }
                     hub.send(ScreenCommand::Touch { phase, x, y, edge: None });
@@ -1606,7 +1647,7 @@ async fn info(
         "preset": preset,
         "stream_opts": opts,
         "server_time_ms": now_ms(),
-        "webrtc": pool.config.viewer.webrtc.enabled,
+        "webrtc": pool.viewers.settings().webrtc,
     }))
     .into_response();
     no_store(resp.headers_mut());

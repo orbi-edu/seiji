@@ -141,8 +141,8 @@ Each test acquires an iOS device for a new user and opens viewer links with `POS
 | `a_long_steady_round_trip_keeps_the_frame_rate_and_bitrate` | A page that acks each frame 400 ms after it arrives gets at least 120 frames in 3 s at 60 fps, no gap of 300 ms or more, and no lowered bitrate |
 | `a_flapping_link_resumes_at_a_keyframe_and_never_leaves_a_finger_down` | Three times, a new socket gets the format and starts at a keyframe, and dropping it mid-gesture lifts the finger: three downs, three ups |
 | `a_burst_of_input_after_a_hiccup_arrives_whole_and_in_order` | 303 touch messages and a typed text sent at once all reach the device, each one and in order, with none refused as `busy`, and the text gets `done` |
-| `a_gesture_that_arrives_in_a_burst_keeps_its_own_timing` | A down, three moves and an up that the page stamped 100 ms apart (`ts`), sent at once, reach the device 80–250 ms apart |
-| `pacing_sends_a_late_point_at_once_and_holds_none_past_250_ms` | A move that arrives after its `ts` spacing goes within 100 ms; a move stamped 5 s later waits 200–400 ms, not 5 s; the lift 1 ms after it follows at once |
+| `a_gesture_that_arrives_in_a_burst_keeps_its_own_timing` | A down, three moves and an up that the page stamped 50 ms apart (`ts`), sent at once, reach the device 40–150 ms apart |
+| `pacing_sends_a_late_point_at_once_and_holds_none_past_the_cap` | A move that arrives after its `ts` spacing goes within 60 ms; a move stamped 5 s later waits 60–200 ms (the 80 ms default), not 5 s. A non-admin cannot change the cap (`403`), 5000 ms is refused (`400`), and after an admin sets 250 ms such a move waits 230–400 ms |
 | `a_page_that_closes_on_a_stuck_link_runs_none_of_its_queued_input` | A page that reads nothing queues 50 Home presses and closes: the presses still queued then never run |
 | `agents_share_a_view_only_link` | `share_screen` with no arguments returns `control: false`, and its link opens with `303` |
 | `paste_puts_text_on_pasteboard_and_respects_guards` | `paste` sets the clipboard and then presses Cmd+V through the helper (`hid key 227 down`, `25 down`, `25 up`, `227 up`), and answers `done` with `via: "pasted"`; without a clipboard, `via: "typed"`. `paste_and_type` types. A view-only page gets `view_only`; empty or over-limit text gets `bad_request` with the input's `id` |
@@ -151,6 +151,8 @@ Each test acquires an iOS device for a new user and opens viewer links with `POS
 | `webrtc_carries_the_stream_and_the_input` | With `viewer.webrtc` on, `info` shows `webrtc: true`. A str0m peer on loopback (the page's end) gets an answer to its offer, and its first frame holds an SPS, a PPS and an IDR slice. A touch on the `input` channel reaches the device, and a `ping` there gets a `pong` with `server_ms`. After `video_via rtc` the WebSocket carries no frames for 700 ms while WebRTC frames go on; after `video_via ws` the WebSocket's next frame is a keyframe |
 | `a_view_only_page_watches_over_webrtc_but_cannot_touch` | A view-only page gets WebRTC frames; a touch on its `input` channel gets `view_only` on the WebSocket and never reaches the device |
 | `webrtc_is_refused_when_it_is_off` | Without `viewer.webrtc`, `info` shows `webrtc: false`, an offer gets `rtc_unavailable`, and the WebSocket stream goes on |
+| `an_admin_turns_webrtc_on_and_off_while_seiji_runs` | With WebRTC configured but off, an admin's `PUT /v1/admin/viewer` turns it on: `info` shows `webrtc: true` and an offer gets an answer. Turned off, `info` shows `false` and an offer gets `rtc_unavailable`. An unknown setting gets `400` |
+| `webrtc_without_addresses_cannot_be_turned_on` | Without `viewer.webrtc.candidates` (and with `bind` unspecified), turning WebRTC on gets `400` naming `viewer.webrtc.candidates`; `GET /v1/admin/viewer` shows it still off and the same problem |
 | `a_page_that_goes_away_frees_its_webrtc_port` | With one port, a second page's offer gets `rtc_unavailable`; once the first page closes, the second gets an answer within 5 s |
 
 ### `tests/forward.rs`
@@ -175,6 +177,7 @@ The test runs `tern serve` headless, with `tern-plugin/` as a fixture plugin. Th
 | `admin_sees_users_tab_edits_and_saves_limits` | An admin selects another user, edits concurrency and unlimited monthly budget through native controls, saves, and observes persisted quotas. The other user and finite session/idle limits remain unchanged |
 | `non_admin_does_not_see_users_tab_or_admin_data` | A normal user's tab navigation stays between Devices and Runs, without the Users tab or another user's data |
 | `admin_watches_another_users_device_from_the_users_tab` | An admin selects Bob in the Users tab and sees his lease. **Watch** opens a view-only screen beside the panel, **Copy link** copies a view-only link, and **Control** opens a screen with control |
+| `admin_changes_the_viewer_settings_from_the_users_tab` | The Users tab shows **Viewer settings** with 80 ms; **+20** saves 100 ms on the server, and **WebRTC off** turns it on |
 
 ### Unit tests
 

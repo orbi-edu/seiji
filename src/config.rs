@@ -265,6 +265,9 @@ pub struct Viewer {
     pub max_viewers_per_lease: usize,
     /// A viewer session lasts at most this long (and never past its lease).
     pub session_hours: i64,
+    /// The longest a touch move or lift waits to keep a gesture's own spacing, 0-1000 ms. An
+    /// admin can change it while Seiji runs (`PUT /v1/admin/viewer`).
+    pub pace_max_ms: u32,
     /// The stream and input over WebRTC (UDP), next to the WebSocket.
     pub webrtc: Webrtc,
 }
@@ -278,8 +281,23 @@ impl Default for Viewer {
             bitrate_kbps: 2500,
             max_viewers_per_lease: 4,
             session_hours: 12,
+            pace_max_ms: 80,
             webrtc: Webrtc::default(),
         }
+    }
+}
+
+impl Webrtc {
+    /// Why WebRTC cannot run with these ports and addresses; `None` when it can. Checked at load
+    /// when `enabled`, and when an admin turns it on.
+    pub fn problem(&self) -> Option<&'static str> {
+        if self.ports[0] == 0 || self.ports[0] > self.ports[1] {
+            return Some("viewer.webrtc.ports must be [first, last] with 0 < first <= last");
+        }
+        if self.candidates.is_empty() && self.bind.is_unspecified() {
+            return Some("viewer.webrtc.candidates: set the addresses that pages reach this host at");
+        }
+        None
     }
 }
 
@@ -453,19 +471,16 @@ impl Config {
             || !(100..=20_000).contains(&v.bitrate_kbps)
             || v.max_viewers_per_lease == 0
             || v.session_hours < 1
+            || v.pace_max_ms > 1000
         {
             bail!(
-                "viewer: fps 1-60, scale 0.1-1, bitrateKbps 100-20000, maxViewersPerLease and sessionHours must be > 0"
+                "viewer: fps 1-60, scale 0.1-1, bitrateKbps 100-20000, paceMaxMs 0-1000, maxViewersPerLease and sessionHours must be > 0"
             );
         }
-        let rtc = &v.webrtc;
-        if rtc.enabled {
-            if rtc.ports[0] == 0 || rtc.ports[0] > rtc.ports[1] {
-                bail!("viewer.webrtc.ports must be [first, last] with 0 < first <= last");
-            }
-            if rtc.candidates.is_empty() && rtc.bind.is_unspecified() {
-                bail!("viewer.webrtc.candidates: set the addresses that pages reach this host at");
-            }
+        if v.webrtc.enabled
+            && let Some(problem) = v.webrtc.problem()
+        {
+            bail!("{problem}");
         }
         if config.forward.max_per_lease == 0 {
             bail!("forward.maxPerLease must be > 0");

@@ -615,10 +615,10 @@ async fn a_gesture_that_arrives_in_a_burst_keeps_its_own_timing() {
     let mut ws = open(&env, &token, &lease, true).await.ws().await;
     format(&mut ws).await;
 
-    // A swipe the page drew over 400 ms, delivered all at once by a link that held it back.
+    // A swipe the page drew over 200 ms, delivered all at once by a link that held it back.
     let mut burst = vec![json!({"t": "touch", "phase": "down", "x": 0.5, "y": 0.8, "ts": 1000.0})];
-    burst.extend((1..=3).map(|i| json!({"t": "touch", "phase": "move", "x": 0.5, "y": 0.8 - 0.1 * f64::from(i), "ts": 1000.0 + 100.0 * f64::from(i)})));
-    burst.push(json!({"t": "touch", "phase": "up", "x": 0.5, "y": 0.4, "ts": 1400.0}));
+    burst.extend((1..=3).map(|i| json!({"t": "touch", "phase": "move", "x": 0.5, "y": 0.8 - 0.1 * f64::from(i), "ts": 1000.0 + 50.0 * f64::from(i)})));
+    burst.push(json!({"t": "touch", "phase": "up", "x": 0.5, "y": 0.4, "ts": 1200.0}));
     for m in burst {
         ws.feed(tungstenite::Message::text(m.to_string())).await.unwrap();
     }
@@ -628,34 +628,56 @@ async fn a_gesture_that_arrives_in_a_burst_keeps_its_own_timing() {
     let times = touch_times(&env);
     assert_eq!(times.len(), 5, "{times:?}");
     for gap in gaps_ms(&times) {
-        assert!((80..250).contains(&gap), "the device got the points {:?} ms apart, not 100", gaps_ms(&times));
+        assert!((40..150).contains(&gap), "the device got the points {:?} ms apart, not 50", gaps_ms(&times));
     }
 }
 
+/// `PUT /v1/admin/viewer` with `body`, as `token`.
+async fn set_viewer(env: &Env, token: &str, body: Value) -> reqwest::Response {
+    http().put(format!("{}/v1/admin/viewer", env.url)).bearer_auth(token).json(&body).send().await.unwrap()
+}
+
+/// A down, a move the page drew 5 s later and its lift, sent at once: how long the move waited.
+async fn far_point_wait(env: &Env, ws: &mut Socket, y: f64) -> u128 {
+    send(ws, json!({"t": "touch", "phase": "down", "x": 0.2, "y": y, "ts": 0.0})).await;
+    send(ws, json!({"t": "touch", "phase": "move", "x": 0.3, "y": y, "ts": 5000.0})).await;
+    send(ws, json!({"t": "touch", "phase": "up", "x": 0.3, "y": y, "ts": 5001.0})).await;
+    logged(env, &format!("touch up 0.30,{y:.2}")).await;
+    let times = touch_times(env);
+    let at = |line: String| times.iter().rev().find(|(_, l)| *l == line).unwrap().0;
+    (at(format!("touch move 0.30,{y:.2}")) - at(format!("touch down 0.20,{y:.2}"))).as_millis()
+}
+
 #[tokio::test]
-async fn pacing_sends_a_late_point_at_once_and_holds_none_past_250_ms() {
-    let env = setup(2).await;
+async fn pacing_sends_a_late_point_at_once_and_holds_none_past_the_cap() {
+    let env = setup_with(2, json!({ "adminUsers": ["root"] })).await;
+    let root = add_user(&env, "root", QUOTA);
     let (token, lease) = device(&env, "alice").await;
     let mut ws = open(&env, &token, &lease, true).await.ws().await;
     format(&mut ws).await;
 
     send(&mut ws, json!({"t": "touch", "phase": "down", "x": 0.5, "y": 0.5, "ts": 0.0})).await;
     logged(&env, "touch down 0.50,0.50").await;
-    // The page drew this 100 ms after the down; it arrives 400 ms after it.
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    // The page drew this 50 ms after the down; it arrives 300 ms after it, and goes at once.
+    tokio::time::sleep(Duration::from_millis(300)).await;
     let sent = std::time::Instant::now();
-    send(&mut ws, json!({"t": "touch", "phase": "move", "x": 0.5, "y": 0.6, "ts": 100.0})).await;
-    // Then a point the page says came 5 s later: it waits at most 250 ms.
-    send(&mut ws, json!({"t": "touch", "phase": "move", "x": 0.5, "y": 0.7, "ts": 5100.0})).await;
-    send(&mut ws, json!({"t": "touch", "phase": "up", "x": 0.5, "y": 0.7, "ts": 5101.0})).await;
-    logged(&env, "touch up 0.50,0.70").await;
+    send(&mut ws, json!({"t": "touch", "phase": "move", "x": 0.5, "y": 0.6, "ts": 50.0})).await;
+    send(&mut ws, json!({"t": "touch", "phase": "up", "x": 0.5, "y": 0.6, "ts": 51.0})).await;
+    logged(&env, "touch up 0.50,0.60").await;
+    let moved = touch_times(&env).iter().find(|(_, l)| l == "touch move 0.50,0.60").unwrap().0;
+    assert!((moved - sent).as_millis() < 60, "the late point waited {:?}", moved - sent);
 
-    let times = touch_times(&env);
-    assert_eq!(times.len(), 4, "{times:?}");
-    assert!((times[1].0 - sent).as_millis() < 100, "the late point waited {:?}", times[1].0 - sent);
-    let held = (times[2].0 - times[1].0).as_millis();
-    assert!((200..400).contains(&held), "a far point waited {held} ms");
-    assert!((times[3].0 - times[2].0).as_millis() < 100, "the lift kept its 1 ms spacing");
+    // A point the page says came 5 s later waits at most `viewer.paceMaxMs` (80 ms)...
+    let held = far_point_wait(&env, &mut ws, 0.2).await;
+    assert!((60..200).contains(&held), "a far point waited {held} ms, not 80");
+    // ...or what an admin sets while Seiji runs.
+    assert_eq!(set_viewer(&env, &token, json!({"pace_max_ms": 250})).await.status(), 403, "admins only");
+    assert_eq!(set_viewer(&env, &root, json!({"pace_max_ms": 5000})).await.status(), 400);
+    let set: Value = set_viewer(&env, &root, json!({"pace_max_ms": 250})).await.json().await.unwrap();
+    assert_eq!(set["settings"]["pace_max_ms"], 250);
+    assert_eq!(set["defaults"]["pace_max_ms"], 80);
+    let held = far_point_wait(&env, &mut ws, 0.4).await;
+    assert!((230..400).contains(&held), "a far point waited {held} ms, not 250");
 }
 
 #[tokio::test]
@@ -1038,4 +1060,52 @@ async fn a_page_that_goes_away_frees_its_webrtc_port() {
         assert!(started.elapsed() < Duration::from_secs(5), "the port stayed taken: {reply}");
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+#[tokio::test]
+async fn an_admin_turns_webrtc_on_and_off_while_seiji_runs() {
+    // Configured but off: an admin can turn it on.
+    let port = free_udp_port();
+    let webrtc = json!({"enabled": false, "bind": "127.0.0.1", "ports": [port, port]});
+    let env = setup_with(2, json!({ "adminUsers": ["root"], "viewer": {"webrtc": webrtc} })).await;
+    let root = add_user(&env, "root", QUOTA);
+    let (token, lease) = device(&env, "alice").await;
+    let view = open(&env, &token, &lease, true).await;
+    let webrtc_on = || async { view.get("info").await.json::<Value>().await.unwrap()["webrtc"].clone() };
+    assert_eq!(webrtc_on().await, false);
+
+    let on: Value = set_viewer(&env, &root, json!({"webrtc": true})).await.json().await.unwrap();
+    assert_eq!((on["settings"]["webrtc"].clone(), on["defaults"]["webrtc"].clone()), (json!(true), json!(false)));
+    assert_eq!(webrtc_on().await, true);
+    let mut ws = view.ws().await;
+    format(&mut ws).await;
+    let (reply, _) = offer(&mut ws).await;
+    assert_eq!(reply["t"], "rtc_answer", "{reply}");
+
+    set_viewer(&env, &root, json!({"webrtc": false})).await;
+    assert_eq!(webrtc_on().await, false);
+    let (reply, _) = offer(&mut ws).await;
+    assert_eq!(reply["code"], "rtc_unavailable", "{reply}");
+    assert_eq!(set_viewer(&env, &root, json!({"cpu": 1})).await.status(), 400, "unknown settings are refused");
+}
+
+#[tokio::test]
+async fn webrtc_without_addresses_cannot_be_turned_on() {
+    let env = setup_with(2, json!({ "adminUsers": ["root"] })).await;
+    let root = add_user(&env, "root", QUOTA);
+    let r = set_viewer(&env, &root, json!({"webrtc": true})).await;
+    assert_eq!(r.status(), 400);
+    let body: Value = r.json().await.unwrap();
+    assert!(body.to_string().contains("viewer.webrtc.candidates"), "{body}");
+    let now: Value = http()
+        .get(format!("{}/v1/admin/viewer", env.url))
+        .bearer_auth(&root)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(now["settings"]["webrtc"], false);
+    assert!(now["webrtc_problem"].as_str().is_some_and(|p| p.contains("candidates")), "{now}");
 }

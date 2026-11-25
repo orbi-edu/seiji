@@ -58,7 +58,7 @@ Seiji reads one JSON file, `seiji.json`. This document is the reference for ever
 | `maestro.flowTimeoutSeconds` (when `maestro` is set), `appRetentionHours` and `maxBuildsPerUser` are above 0 | `maestro.flowTimeoutSeconds, appRetentionHours and maxBuildsPerUser must be > 0` |
 | `evidence.retentionHours`, `evidence.maxRunSeconds`, `evidence.maxSteps`, `evidence.maxRunBytes` and `evidence.maxBytesPerUser` are above 0 | `evidence.retentionHours, maxRunSeconds, maxSteps, maxRunBytes and maxBytesPerUser must be > 0` |
 | `axe.stepTimeoutSeconds` and `xctest.timeoutSeconds` are above 0 | `axe.stepTimeoutSeconds and xctest.timeoutSeconds must be > 0` |
-| `viewer.fps` is within 1–60, `viewer.scale` within 0.1–1, `viewer.bitrateKbps` within 100–20000, and `viewer.maxViewersPerLease` and `viewer.sessionHours` are above 0 | `viewer: fps 1-60, scale 0.1-1, bitrateKbps 100-20000, maxViewersPerLease and sessionHours must be > 0` |
+| `viewer.fps` is within 1–60, `viewer.scale` within 0.1–1, `viewer.bitrateKbps` within 100–20000, `viewer.paceMaxMs` within 0–1000, and `viewer.maxViewersPerLease` and `viewer.sessionHours` are above 0 | `viewer: fps 1-60, scale 0.1-1, bitrateKbps 100-20000, paceMaxMs 0-1000, maxViewersPerLease and sessionHours must be > 0` |
 | With `viewer.webrtc.enabled`, `viewer.webrtc.ports` is `[first, last]` with `0 < first <= last` | `viewer.webrtc.ports must be [first, last] with 0 < first <= last` |
 | With `viewer.webrtc.enabled` and an unspecified `viewer.webrtc.bind` (`0.0.0.0`, `::`), `viewer.webrtc.candidates` is not empty | `viewer.webrtc.candidates: set the addresses that pages reach this host at` |
 | `forward.maxPerLease` is above 0 | `forward.maxPerLease must be > 0` |
@@ -270,6 +270,7 @@ Optional section. The viewer shows a lease's screen live in a browser or in Tern
 | `viewer.bitrateKbps` | integer | `2500` | Target H.264 bitrate in kbit/s, for the `balanced` preset. A congested viewer lowers it for a while ([mcp.md](mcp.md#the-stream)). 100–20000. |
 | `viewer.maxViewersPerLease` | integer | `4` | Viewer pages that may stream one lease at the same time. One more gets `429` `full`. Above 0. |
 | `viewer.sessionHours` | integer | `12` | Longest life of a viewer session (and of its cookie). A session also ends when its lease ends. Above 0. |
+| `viewer.paceMaxMs` | integer | `80` | The longest a touch move or lift waits to keep a gesture's own spacing when the link delivered its points late or bunched ([mcp.md](mcp.md#gesture-timing)). Higher keeps more of a jittery swipe's speed and adds more input delay; `0` sends every point at once. 0–1000. An admin can change it while Seiji runs. |
 | `viewer.webrtc.enabled` | boolean | `false` | Pages may take the stream and send their input over WebRTC (UDP) instead of the WebSocket. See below. |
 | `viewer.webrtc.bind` | IP address | `"0.0.0.0"` | The address the WebRTC UDP sockets bind to. |
 | `viewer.webrtc.ports` | `[first, last]` | `[50000, 50099]` | The UDP ports, one for each open WebRTC session. When all are in use, a page stays on the WebSocket. |
@@ -406,6 +407,7 @@ This is [`deploy/seiji.example.json`](../deploy/seiji.example.json): ten seats, 
     "bitrateKbps": 2500,
     "maxViewersPerLease": 4,
     "sessionHours": 12,
+    "paceMaxMs": 80,
     "webrtc": {
       "enabled": false,
       "bind": "0.0.0.0",

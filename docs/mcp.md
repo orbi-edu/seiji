@@ -1498,6 +1498,8 @@ These routes exist besides `/mcp`. Error bodies of `/v1/apps`, `/v1/runs/…` an
 | `PUT /v1/admin/users/{id}/limits` | Bearer token (admin) | `200`, updated user entry |
 | `GET /v1/admin/leases` | Bearer token (admin) | `200` `{"leases"}`, every active lease with its user |
 | `POST /v1/admin/leases/{lease_id}/viewer` | Bearer token (admin) | `200`, a viewer link to any user's lease |
+| `GET /v1/admin/viewer` | Bearer token (admin) | `200` `{"settings", "defaults", "webrtc_problem"}` |
+| `PUT /v1/admin/viewer` | Bearer token (admin) | `200`, the same, after the change |
 | `POST /v1/leases/{lease_id}/viewer` | Bearer token | `200`, a viewer link `{"url", "expires_in", "control", "lease_id"}` |
 | `GET /v1/leases/{lease_id}/screenshot.jpg` | Bearer token | `200`, the screen now as JPEG |
 | `GET /v1/leases/{lease_id}/forward` | Bearer token | `101`, a WebSocket that carries a tunnel for `seiji forward` |
@@ -1723,6 +1725,29 @@ The viewer session acts as the lease's owner: the page shows the owner's name, a
 curl -s -X POST -H "Authorization: Bearer $SEIJI_TOKEN" https://seiji.example.com/v1/admin/leases/l_3f9c2a7b1e04/viewer
 ```
 
+### `GET /v1/admin/viewer`, `PUT /v1/admin/viewer`
+
+The viewer settings an admin can change while Seiji runs, to try them without a restart. Authenticated admin only. A change applies at once to new gestures and to viewer pages opened after it; a page already on WebRTC stays on it. It lasts until Seiji restarts, which goes back to `seiji.json`. Seiji logs each change with the admin and the new values.
+
+| Setting | `seiji.json` | Meaning |
+|---|---|---|
+| `pace_max_ms` | `viewer.paceMaxMs` | The longest a touch move or lift waits to keep a gesture's spacing ([Gesture timing](#gesture-timing)), 0–1000. `0` sends every point at once |
+| `webrtc` | `viewer.webrtc.enabled` | Pages may use WebRTC ([WebRTC](#webrtc)). Turning it on needs `viewer.webrtc.ports` and an address (`candidates`, or a specific `bind`) |
+
+`GET` returns `{"settings": {"pace_max_ms", "webrtc"}, "defaults": {"pace_max_ms", "webrtc"}, "webrtc_problem"}`. `defaults` is what `seiji.json` sets; `webrtc_problem` is why WebRTC cannot be turned on, or `null`. `PUT` takes `{"pace_max_ms"?, "webrtc"?}` and returns the same as `GET`.
+
+| Status | Body | Cause |
+|---|---|---|
+| `200` | `{"settings", "defaults", "webrtc_problem"}` | The settings now |
+| `400` | `{"error": "<text>"}` | An unknown field, `pace_max_ms` above 1000, or `WebRTC cannot be turned on: <problem>` |
+| `401` | plain text | Missing or invalid token |
+| `403` | `{"error": "admin access required"}` | The caller is not in `adminUsers` |
+
+```sh
+curl -s -X PUT -H "Authorization: Bearer $SEIJI_TOKEN" -H "Content-Type: application/json" \
+  -d '{"pace_max_ms": 40, "webrtc": false}' https://seiji.example.com/v1/admin/viewer
+```
+
 ### `POST /v1/leases/{lease_id}/viewer`
 
 Returns a viewer link to one of your leases, like [`share_screen`](#share_screen). The body is optional: `{"control": <bool>}`. Here `control` defaults to `true`, so the link may drive the device. An unknown field is an error. The response has `Cache-Control: no-store`.
@@ -1878,8 +1903,8 @@ Input restarts the idle timer. Viewer input is not recorded as a run.
 A link can hold a gesture's points back and then deliver them together. The device would then see a swipe that is too fast, and fling. With `ts` on the points, Seiji hands each `move` and `up` to the helper with the spacing the page gave them:
 
 - The `down` sets the anchor: its `ts` and the moment it reached the helper.
-- A later point waits until the anchor plus its `ts` difference, at most 250 ms.
-- A point that is already late goes at once and becomes the new anchor. So a gesture that the link delayed keeps its shape, and it arrives late by the worst delay inside the gesture, up to 250 ms.
+- A later point waits until the anchor plus its `ts` difference, at most `viewer.paceMaxMs` (80 ms by default; an admin can change it while Seiji runs, see [`PUT /v1/admin/viewer`](#get-v1adminviewer-put-v1adminviewer)).
+- A point that is already late goes at once and becomes the new anchor. So a gesture that the link delayed keeps its shape, and it arrives late by the worst delay inside the gesture, up to that cap. A higher cap keeps more of a jittery gesture's shape and adds more delay; on a measured 133 ms link with ±60 ms jitter, 250 ms held input for up to 122 ms (p95).
 
 Points without `ts` go at once, as before.
 

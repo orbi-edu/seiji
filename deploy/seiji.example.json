@@ -63,6 +63,7 @@
     "bitrateKbps": 2500,
     "maxViewersPerLease": 4,
     "sessionHours": 12,
+    "paceMaxMs": 80,
     "webrtc": {
       "enabled": false,
       "bind": "0.0.0.0",

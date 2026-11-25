@@ -50,7 +50,7 @@ seiji --version
 
 ```sh
 tern plugin install github.com/orbi-edu/seiji/tern-plugin
-tern plugin list            # seiji 0.2.0 Seiji — 1 blocks, 0 lenses, window  ready
+tern plugin list            # seiji 0.3.0 Seiji — 1 blocks, 0 lenses, window  ready
 ```
 
 Tern loads it at once; no restart. This installs the plugin from `main`.
@@ -58,13 +58,13 @@ Tern loads it at once; no restart. This installs the plugin from `main`.
 To install the plugin of a release instead, take its `seiji-tern-plugin-<tag>.tar.gz` from the [releases](https://github.com/orbi-edu/seiji/releases) (each release carries one, with a `.sha256` file), unpack it and install the `seiji` folder:
 
 ```sh
-gh release download v0.2.0 --repo orbi-edu/seiji --pattern 'seiji-tern-plugin-*'
-shasum -a 256 -c seiji-tern-plugin-v0.2.0.tar.gz.sha256
-tar -xzf seiji-tern-plugin-v0.2.0.tar.gz
+gh release download v0.3.0 --repo orbi-edu/seiji --pattern 'seiji-tern-plugin-*'
+shasum -a 256 -c seiji-tern-plugin-v0.3.0.tar.gz.sha256
+tar -xzf seiji-tern-plugin-v0.3.0.tar.gz
 tern plugin install ./seiji --force
 ```
 
-The workflow attaches the plugin only when the release's tag matches `version` in `tern-plugin/plugin.toml` (`v0.2.0` for `0.2.0`). Otherwise it fails, and the release has no plugin: bump the version before you tag.
+The workflow attaches the plugin only when the release's tag matches `version` in `tern-plugin/plugin.toml` (`v0.3.0` for `0.3.0`). Otherwise it fails, and the release has no plugin: bump the version before you tag.
 
 **3. Let Tern find the CLI.** The plugin checks `SEIJI_BIN`, then `$CARGO_HOME/bin/seiji` (or `~/.cargo/bin/seiji`), then `PATH`. Tern started from the Dock may not have `~/.cargo/bin` on its PATH; since Cargo installs to `~/.cargo/bin` by default, the plugin finds it there without extra setup. If it still says *The seiji CLI is missing*, set the path explicitly and start Tern again:
 
@@ -186,6 +186,13 @@ Press `e` (or click **Edit**) to edit the selected user's limits:
 Press `enter` (or click **Save**) to persist the changes, or `esc` (or click **Cancel**) to discard them. While saving, edits and cancel are locked. The plugin shows a validation error for invalid inputs and a server error when the save fails. A successful save re-fetches authoritative data from the server.
 
 Session duration and idle release are set by the operator through the CLI, not from the panel.
+
+The Users tab also has a **Viewer settings** card, to try settings without a restart:
+
+- **Gesture pacing, at most**: the longest a swipe's points wait to keep the swipe's speed (`viewer.paceMaxMs`). Use −20/+20; 0–1000 ms.
+- **WebRTC on / off**: whether newly opened viewers may use WebRTC. It can be turned on only when `seiji.json` sets its ports and an address; otherwise the card says why.
+
+Each click saves at once (`PUT /v1/admin/viewer`, [mcp.md](mcp.md#get-v1adminviewer-put-v1adminviewer)). The card shows the `seiji.json` value next to each setting; a restart goes back to it.
 
 Non-admin users do not see the Users tab or any admin data. The server enforces permission on every admin request regardless of what the UI shows.
 

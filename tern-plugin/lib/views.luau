@@ -389,6 +389,44 @@ local function user_detail(state: any, A: any, u: any): Node
 	return h.card("detail", name_spans, body)
 end
 
+-- The viewer settings an admin can change while Seiji runs: the gesture pacing cap and WebRTC.
+local function viewer_settings(state: any, A: any): Node?
+	local v = A.admin_viewer(state)
+	local title = { ui.span("Viewer settings", "strong") }
+	if type(v) ~= "table" or type(v.settings) ~= "table" then
+		local err = state.errs.admin_viewer
+		if err then
+			return h.card("viewer", title, { ui.text({ ui.span(err, "error") }) })
+		end
+		return nil
+	end
+	local s, d = v.settings, if type(v.defaults) == "table" then v.defaults else {}
+	local pace = tonumber(s.pace_max_ms) or 0
+	local function pace_action(delta: number): Node
+		local next_ms = math.clamp(pace + delta, 0, 1000)
+		return h.action((if delta > 0 then "+" else "") .. tostring(delta), "viewer_pace=" .. tostring(next_ms), "neutral", "pace_" .. tostring(delta))
+	end
+	local rows: { Node } = {
+		ui.node("row", { key = "pace", gap = "sm", align = "center", wrap = true }, {
+			ui.text({ ui.span("Gesture pacing, at most  ", "muted") }),
+			pace_action(-20),
+			ui.text({ ui.span(" " .. tostring(pace) .. " ms ", "strong mono") }),
+			pace_action(20),
+			ui.text({ ui.span("  seiji.json: " .. tostring(d.pace_max_ms or "—") .. " ms", "muted") }),
+		}),
+	}
+	local rtc: { Node } = {
+		h.action(if s.webrtc then "WebRTC on" else "WebRTC off", "viewer_webrtc=" .. tostring(not s.webrtc), if s.webrtc then "accent" else "neutral", "rtc"),
+		ui.text({ ui.span("  seiji.json: " .. (if d.webrtc then "on" else "off"), "muted") }),
+	}
+	if not s.webrtc and type(v.webrtc_problem) == "string" then
+		table.insert(rtc, ui.text({ ui.span("  cannot be turned on: " .. v.webrtc_problem, "muted") }))
+	end
+	table.insert(rows, ui.node("row", { key = "rtc", gap = "sm", align = "center", wrap = true }, rtc))
+	table.insert(rows, h.muted("Changes apply to new gestures and newly opened viewers, and last until Seiji restarts."))
+	return h.card("viewer", title, rows)
+end
+
 local function users_view(state: any, A: any): Node
 	local list = A.admin_users(state)
 	local err = state.errs.admin_users
@@ -444,6 +482,10 @@ local function users_view(state: any, A: any): Node
 	local detail_parts: { Node } = {}
 	if #cap_parts > 0 then
 		table.insert(detail_parts, ui.node("row", { key = "cap", gap = "sm", align = "center" }, cap_parts))
+	end
+	local settings = viewer_settings(state, A)
+	if settings then
+		table.insert(detail_parts, settings)
 	end
 	table.insert(detail_parts, user_detail(state, A, u))
 	local detail = ui.node("col", { key = "detail", gap = "md" }, detail_parts)
