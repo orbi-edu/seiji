@@ -79,6 +79,12 @@ pub struct VideoFrame {
     pub captured_us: i64,
     /// Unix microseconds when the encoder handed the frame over; `None` from an older helper.
     pub encoded_us: Option<i64>,
+    /// The token of a long-term reference frame: `ScreenCommand::LtrAck` it once every viewer
+    /// has the frame. `None` for other frames and from an older helper.
+    pub ltr: Option<u64>,
+    /// The frame a `ScreenCommand::Refresh` asked for: a delta frame that refers only to an
+    /// acknowledged long-term reference.
+    pub refresh: bool,
     /// AVCC: a 4-byte big-endian length before each NAL unit.
     pub data: Bytes,
 }
@@ -140,6 +146,11 @@ pub enum ScreenCommand {
     },
     /// Make the next frame a keyframe, now.
     Keyframe,
+    /// Make the next frame refer only to an acknowledged long-term reference (a keyframe if none
+    /// is acknowledged), now: a viewer that skipped frames resumes there.
+    Refresh,
+    /// Every viewer has the long-term reference frame with this token.
+    LtrAck(u64),
     Encode(StreamOpts),
     /// Answered once every command before it is with the helper, so input that does not go
     /// through the helper (AXe typing) comes after it.
@@ -160,6 +171,8 @@ impl ScreenCommand {
             ScreenCommand::Key { usage, down } => serde_json::json!({ "key": usage, "down": down }),
             ScreenCommand::Button { button, down } => serde_json::json!({ "button": button, "down": down }),
             ScreenCommand::Keyframe => serde_json::json!({ "keyframe": true }),
+            ScreenCommand::Refresh => serde_json::json!({ "refresh": true }),
+            ScreenCommand::LtrAck(token) => serde_json::json!({ "ltr_ack": token }),
             ScreenCommand::Encode(o) => {
                 serde_json::json!({ "encode": { "fps": o.fps, "scale": o.scale, "bitrate": o.bitrate } })
             }
@@ -480,20 +493,23 @@ fn parse_message(kind: u8, payload: Vec<u8>) -> Result<Option<ScreenEvent>> {
     match kind {
         MSG_FORMAT => Ok(Some(ScreenEvent::Format(parse_format(&payload)?))),
         MSG_FRAME => {
-            // Flags (bit 0: keyframe; bit 1: the encode time follows), capture time, [encode time,]
-            // then the sample.
-            let timed = payload.first().is_some_and(|f| f & 2 == 2);
-            let header = if timed { 17 } else { 9 };
+            // Flags (bit 0: keyframe; bit 1: the encode time follows; bit 2: an LTR token follows;
+            // bit 3: the refresh asked for), capture time, [encode time,] [token,] then the sample.
+            let flags = payload.first().copied().unwrap_or(0);
+            let (timed, ltr) = (flags & 2 == 2, flags & 4 == 4);
+            let header = 9 + if timed { 8 } else { 0 } + if ltr { 8 } else { 0 };
             if payload.len() <= header {
                 bail!("a {}-byte frame", payload.len());
             }
-            let key = payload[0] & 1 == 1;
-            let captured_us = i64::from_be_bytes(payload[1..9].try_into().expect("8 bytes"));
-            let encoded_us = timed.then(|| i64::from_be_bytes(payload[9..17].try_into().expect("8 bytes")));
+            let word = |at: usize| u64::from_be_bytes(payload[at..at + 8].try_into().expect("8 bytes"));
+            let captured_us = word(1) as i64;
+            let encoded_us = timed.then(|| word(9) as i64);
             Ok(Some(ScreenEvent::Frame(VideoFrame {
-                key,
+                key: flags & 1 == 1,
                 captured_us,
                 encoded_us,
+                ltr: ltr.then(|| word(header - 8)),
+                refresh: flags & 8 == 8,
                 data: Bytes::from(payload).slice(header..),
             })))
         }
@@ -1050,6 +1066,16 @@ mod tests {
         assert_eq!((f.key, f.encoded_us), (true, Some(1_795_548_363_004_000)));
         assert_eq!(&f.data[..], &[0, 0, 0, 1, 0x65]);
         assert!(parse_message(MSG_FRAME, vec![3; 17]).is_err(), "a timed frame needs a sample");
+        // A refresh frame (bit 3) with an LTR token (bit 2) after the times.
+        let mut ltr = vec![2u8 | 4 | 8];
+        ltr.extend_from_slice(&1_795_548_363_000_000i64.to_be_bytes());
+        ltr.extend_from_slice(&1_795_548_363_004_000i64.to_be_bytes());
+        ltr.extend_from_slice(&42u64.to_be_bytes());
+        ltr.extend_from_slice(&[0, 0, 0, 1, 0x41]);
+        let Some(ScreenEvent::Frame(f)) = parse_message(MSG_FRAME, ltr).unwrap() else { panic!() };
+        assert_eq!((f.key, f.refresh, f.ltr, f.encoded_us), (false, true, Some(42), Some(1_795_548_363_004_000)));
+        assert_eq!(&f.data[..], &[0, 0, 0, 1, 0x41]);
+        assert!(parse_message(MSG_FRAME, vec![6; 25]).is_err(), "a frame with a token needs a sample");
         assert!(parse_message(MSG_FRAME, vec![1; 9]).is_err(), "a frame needs a sample");
         assert!(parse_message(9, vec![]).is_err(), "unknown kinds end the stream");
 
