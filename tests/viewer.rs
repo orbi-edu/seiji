@@ -389,6 +389,49 @@ async fn a_slow_viewer_gets_no_stale_frames_and_resumes_at_a_keyframe() {
     assert!(seq > last + 1, "frames were skipped, not queued");
 }
 
+/// A frame's flags, frame number, and whether nothing refers to it (its first NAL unit has
+/// `nal_ref_idc` 0; the sample starts at byte 29, after a 4-byte length).
+fn frame_kind(b: &[u8]) -> (bool, u32, bool) {
+    let key = b[0] & 1 == 1;
+    (key, u32::from_be_bytes(b[1..5].try_into().unwrap()), !key && b[33] & 0x60 == 0)
+}
+
+#[tokio::test]
+async fn a_viewer_a_little_behind_skips_only_frames_nothing_refers_to() {
+    let env = setup_with(2, json!({"viewer": {"fps": 60}})).await;
+    let (token, lease) = device(&env, "alice").await;
+    let mut ws = open(&env, &token, &lease, false).await.ws().await;
+    format(&mut ws).await;
+
+    // Acknowledge nothing for 450 ms. With no round trip yet, the viewer is behind past 400 ms
+    // (300 ms plus half the 200 ms budget) and would resync at a keyframe past 500 ms.
+    let started = std::time::Instant::now();
+    let mut frames = Vec::new();
+    let window = Duration::from_millis(450);
+    while let Some(left) = window.checked_sub(started.elapsed()) {
+        match tokio::time::timeout(left, ws.next()).await {
+            Ok(Some(Ok(tungstenite::Message::Binary(b)))) => frames.push((frame_kind(&b), started.elapsed())),
+            Ok(Some(Ok(_))) => {}
+            _ => break,
+        }
+    }
+    let ms = |d: Duration| d.as_millis();
+    assert!(frames.iter().any(|((_, _, droppable), at)| *droppable && ms(*at) < 350), "{frames:?}");
+    let late: Vec<_> = frames.iter().filter(|(_, at)| ms(*at) > 420).collect();
+    assert!(!late.is_empty(), "frames that others refer to still come: {frames:?}");
+    assert!(late.iter().all(|((_, _, droppable), _)| !droppable), "only those: {late:?}");
+
+    // Caught up, the stream goes on frame by frame, without skipping to a keyframe.
+    let ((_, last, _), _) = *frames.last().unwrap();
+    send(&mut ws, json!({"t": "ack", "seq": last})).await;
+    let mut next = Vec::new();
+    while next.len() < 5 {
+        let (_, seq) = frame(&mut ws).await;
+        next.push(seq);
+    }
+    assert!(next.windows(2).all(|w| w[1] == w[0] + 1), "no resync after a little lag: {next:?}");
+}
+
 #[tokio::test]
 async fn touches_keys_and_buttons_reach_the_device_in_order() {
     let env = setup(2).await;
