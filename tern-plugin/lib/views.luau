@@ -423,7 +423,16 @@ local function viewer_settings(state: any, A: any): Node?
 		table.insert(rtc, ui.text({ ui.span("  cannot be turned on: " .. v.webrtc_problem, "muted") }))
 	end
 	table.insert(rows, ui.node("row", { key = "rtc", gap = "sm", align = "center", wrap = true }, rtc))
-	table.insert(rows, h.muted("Changes apply to new gestures and newly opened viewers, and last until Seiji restarts."))
+	-- The viewer trace: every input and frame as a JSON line, until it is turned off or hits 64 MiB.
+	local trace: { Node } = {
+		h.action(if s.trace then "Trace on" else "Trace off", "viewer_trace=" .. tostring(not s.trace), if s.trace then "accent" else "neutral", "trace"),
+	}
+	if type(v.trace_bytes) == "number" then
+		table.insert(trace, ui.text({ ui.span("  " .. fmt.bytes(v.trace_bytes) .. "  ", "muted") }))
+		table.insert(trace, h.action("Download trace", "viewer_trace_download", "neutral", "trace_get"))
+	end
+	table.insert(rows, ui.node("row", { key = "trace", gap = "sm", align = "center", wrap = true }, trace))
+	table.insert(rows, h.muted("Changes apply to new gestures and newly opened viewers, and last until Seiji restarts. The trace holds timings only: no coordinates, keys or text."))
 	return h.card("viewer", title, rows)
 end
 

@@ -361,6 +361,11 @@ async fn admin_changes_the_viewer_settings_from_the_users_tab() {
     t.wait_for("WebRTC on", ".tn-pane.on .sf-main .sf-badge", |s| s.lines().any(|l| l == "WebRTC on")).await;
     assert_eq!(settings().await["webrtc"], true);
 
+    // So does the viewer trace; once there is one, the card offers its download.
+    t.click_badge("Trace off").await;
+    t.wait_for("Trace on", ".tn-pane.on .sf-main .sf-badge", |s| s.lines().any(|l| l == "Download trace")).await;
+    assert_eq!(settings().await["trace"], true);
+
     assert_eq!(t.plugin_errors(), Vec::<String>::new());
     let _ = t.ctl(&["quit"]).await;
     let _ = tokio::time::timeout(Duration::from_secs(5), t.child.wait()).await;

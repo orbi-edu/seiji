@@ -153,6 +153,7 @@ Each test acquires an iOS device for a new user and opens viewer links with `POS
 | `webrtc_is_refused_when_it_is_off` | Without `viewer.webrtc`, `info` shows `webrtc: false`, an offer gets `rtc_unavailable`, and the WebSocket stream goes on |
 | `an_admin_turns_webrtc_on_and_off_while_seiji_runs` | With WebRTC configured but off, an admin's `PUT /v1/admin/viewer` turns it on: `info` shows `webrtc: true` and an offer gets an answer. Turned off, `info` shows `false` and an offer gets `rtc_unavailable`. An unknown setting gets `400` |
 | `webrtc_without_addresses_cannot_be_turned_on` | Without `viewer.webrtc.candidates` (and with `bind` unspecified), turning WebRTC on gets `400` naming `viewer.webrtc.candidates`; `GET /v1/admin/viewer` shows it still off and the same problem |
+| `an_admin_traces_each_input_and_frame_without_coordinates_or_text` | Before a trace, its download gets `404`; a non-admin gets `403` turning it on or downloading it. With it on, the page's `server_stats` says `trace: true`; a down, move, up, key and typed text give `input` lines in order with `read_us` ≤ `sent_us` ≤ `done_us`, frames give `frame` lines, and the page's report gives `shown`, `answer` and `clock` lines. The file holds no coordinates, key usage or text. A report over 1024 frames gets `bad_request`. Turned off, it takes no more input; on again, it starts empty |
 | `a_page_that_goes_away_frees_its_webrtc_port` | With one port, a second page's offer gets `rtc_unavailable`; once the first page closes, the second gets an answer within 5 s |
 
 ### `tests/forward.rs`
@@ -177,7 +178,7 @@ The test runs `tern serve` headless, with `tern-plugin/` as a fixture plugin. Th
 | `admin_sees_users_tab_edits_and_saves_limits` | An admin selects another user, edits concurrency and unlimited monthly budget through native controls, saves, and observes persisted quotas. The other user and finite session/idle limits remain unchanged |
 | `non_admin_does_not_see_users_tab_or_admin_data` | A normal user's tab navigation stays between Devices and Runs, without the Users tab or another user's data |
 | `admin_watches_another_users_device_from_the_users_tab` | An admin selects Bob in the Users tab and sees his lease. **Watch** opens a view-only screen beside the panel, **Copy link** copies a view-only link, and **Control** opens a screen with control |
-| `admin_changes_the_viewer_settings_from_the_users_tab` | The Users tab shows **Viewer settings** with 80 ms; **+20** saves 100 ms on the server, and **WebRTC off** turns it on |
+| `admin_changes_the_viewer_settings_from_the_users_tab` | The Users tab shows **Viewer settings** with 80 ms; **+20** saves 100 ms on the server, **WebRTC off** turns it on, and **Trace off** turns the trace on and shows **Download trace** |
 
 ### Unit tests
 

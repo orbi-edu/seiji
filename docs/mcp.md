@@ -1498,8 +1498,9 @@ These routes exist besides `/mcp`. Error bodies of `/v1/apps`, `/v1/runs/…` an
 | `PUT /v1/admin/users/{id}/limits` | Bearer token (admin) | `200`, updated user entry |
 | `GET /v1/admin/leases` | Bearer token (admin) | `200` `{"leases"}`, every active lease with its user |
 | `POST /v1/admin/leases/{lease_id}/viewer` | Bearer token (admin) | `200`, a viewer link to any user's lease |
-| `GET /v1/admin/viewer` | Bearer token (admin) | `200` `{"settings", "defaults", "webrtc_problem"}` |
+| `GET /v1/admin/viewer` | Bearer token (admin) | `200` `{"settings", "defaults", "webrtc_problem", "trace_bytes"}` |
 | `PUT /v1/admin/viewer` | Bearer token (admin) | `200`, the same, after the change |
+| `GET /v1/admin/viewer/trace` | Bearer token (admin) | `200`, the last [viewer trace](#the-viewer-trace) as JSON lines |
 | `POST /v1/leases/{lease_id}/viewer` | Bearer token | `200`, a viewer link `{"url", "expires_in", "control", "lease_id"}` |
 | `GET /v1/leases/{lease_id}/screenshot.jpg` | Bearer token | `200`, the screen now as JPEG |
 | `GET /v1/leases/{lease_id}/forward` | Bearer token | `101`, a WebSocket that carries a tunnel for `seiji forward` |
@@ -1733,19 +1734,29 @@ The viewer settings an admin can change while Seiji runs, to try them without a 
 |---|---|---|
 | `pace_max_ms` | `viewer.paceMaxMs` | The longest a touch move or lift waits to keep a gesture's spacing ([Gesture timing](#gesture-timing)), 0–1000. `0` sends every point at once |
 | `webrtc` | `viewer.webrtc.enabled` | Pages may use WebRTC ([WebRTC](#webrtc)). Turning it on needs `viewer.webrtc.ports` and an address (`candidates`, or a specific `bind`) |
+| `trace` | (always off at start) | The [viewer trace](#the-viewer-trace). Turning it on starts a new trace in place of the last one |
 
-`GET` returns `{"settings": {"pace_max_ms", "webrtc"}, "defaults": {"pace_max_ms", "webrtc"}, "webrtc_problem"}`. `defaults` is what `seiji.json` sets; `webrtc_problem` is why WebRTC cannot be turned on, or `null`. `PUT` takes `{"pace_max_ms"?, "webrtc"?}` and returns the same as `GET`.
+`GET` returns `{"settings": {"pace_max_ms", "webrtc", "trace"}, "defaults": {"pace_max_ms", "webrtc", "trace"}, "webrtc_problem", "trace_bytes"}`. `defaults` is what `seiji.json` sets; `webrtc_problem` is why WebRTC cannot be turned on, or `null`; `trace_bytes` is the size of the last trace, or `null` before the first. `PUT` takes `{"pace_max_ms"?, "webrtc"?, "trace"?}` and returns the same as `GET`.
 
 | Status | Body | Cause |
 |---|---|---|
-| `200` | `{"settings", "defaults", "webrtc_problem"}` | The settings now |
+| `200` | `{"settings", "defaults", "webrtc_problem", "trace_bytes"}` | The settings now |
 | `400` | `{"error": "<text>"}` | An unknown field, `pace_max_ms` above 1000, or `WebRTC cannot be turned on: <problem>` |
 | `401` | plain text | Missing or invalid token |
 | `403` | `{"error": "admin access required"}` | The caller is not in `adminUsers` |
+| `500` | `{"error": "cannot start the viewer trace: <cause>"}` | Seiji cannot write `<dataDir>/viewer-trace.jsonl`; nothing changed |
 
 ```sh
 curl -s -X PUT -H "Authorization: Bearer $SEIJI_TOKEN" -H "Content-Type: application/json" \
   -d '{"pace_max_ms": 40, "webrtc": false}' https://seiji.example.com/v1/admin/viewer
+```
+
+### `GET /v1/admin/viewer/trace`
+
+Returns the last [viewer trace](#the-viewer-trace), `Content-Type: application/x-ndjson`, `Cache-Control: no-store`. Authenticated admin only. It can be read while the trace runs. `404` `{"error": "no viewer trace yet: …"}` before the first trace; `403` for a caller not in `adminUsers`.
+
+```sh
+curl -fo viewer-trace.jsonl -H "Authorization: Bearer $SEIJI_TOKEN" https://seiji.example.com/v1/admin/viewer/trace
 ```
 
 ### `POST /v1/leases/{lease_id}/viewer`
@@ -1944,6 +1955,42 @@ The line also has `rtt`, `jitter`, `lost` (percent, last 3 s), `fps`, `transport
 On a local link (the page on the host), a tap reaches the screen in about 25 ms: upload and in server about 1 ms each, screen reacts about 20 ms, then the frame's encode (3 ms) and decode (2 ms). An app's first launch takes its own time to draw, about 1.5 s. Everything over that on a remote viewer is the link: the upload and the frame's network stage, each about half the round trip.
 
 Over WebRTC the page measures only the frame age and the input's upload; the other stages show `—`.
+
+### The viewer trace
+
+The percentiles say that a stage is slow; the trace shows which input or frame was, and where its time went. While an admin has it on ([`PUT /v1/admin/viewer`](#get-v1adminviewer-put-v1adminviewer) with `{"trace": true}`, or **Viewer settings** in the Tern plugin), Seiji writes one JSON line for every event of every viewer to `<dataDir>/viewer-trace.jsonl` (mode `600`). It stops at 64 MiB by itself, logging `viewer trace reached 64 MiB and stopped`; one viewer of a busy screen writes about 12 MiB an hour. A restart turns it off and keeps the file.
+
+The trace holds timings only: no touch coordinates, no keys, no text. Every line has `ev`, `lease` and `viewer` (the first 6 characters of the session id). Times ending in `_us` are Unix microseconds on the host's clock; `_ms` are Unix milliseconds, from the page through its clock offset.
+
+| `ev` | Written by | Fields |
+|---|---|---|
+| `input` | the daemon, once it applied an input | `kind` (`down`, `move`, `up`, `key`, `button`, `type`, `paste`, `paste_and_type`), `ts` (the page's time, as sent), `read_us`, `lock_ms` (the wait for the op lock), `pace_ms` (the gesture pacing hold), `sent_us` (the helper had it), `done_us`. A field that does not apply is `null` |
+| `frame` | the daemon, for each frame it wrote to the viewer or skipped | `seq`, `key`, `bytes`, `capture_us`, `encode_us`, `read_us` (the daemon got it from the helper), `written_us` (written to the socket), `skipped` (flow control held it back) |
+| `shown` | the page, each second | `seq`, `received_ms`, `shown_ms` |
+| `answer` | the page, each second | `ts` (the input's), `seen_ms` (the page saw the input), `capture_us` (the first frame captured after the helper had it), `shown_ms` (that frame shown) |
+| `clock` | the page, each second | `at_ms`, `offset_ms` (the server's clock minus the page's), `rtt_ms` |
+
+A page learns that the trace is on from its next `server_stats` (within 5 s) and then sends `{"t": "trace", "offset_ms", "rtt_ms", "frames": [[seq, received_ms, shown_ms], …], "inputs": [[ts, seen_ms, capture_us, shown_ms], …]}` every second. A report with more than 1024 frames or inputs gets `bad_request`. Over WebRTC the page reports no `shown` or `answer`.
+
+The lines join on `viewer` plus `ts` (input and answer), `capture_us` (answer and frame) and `seq` (frame and shown). This prints each answered input's way to the screen, the slowest first, in ms:
+
+```sh
+jq -sc '
+  (map(select(.ev == "input" and .ts != null)) | INDEX("\(.viewer) \(.ts)")) as $in
+  | (map(select(.ev == "frame")) | INDEX("\(.viewer) \(.capture_us)")) as $frame
+  | (map(select(.ev == "shown")) | INDEX("\(.viewer) \(.seq)")) as $shown
+  | map(select(.ev == "answer")
+      | $in["\(.viewer) \(.ts)"] as $i | $frame["\(.viewer) \(.capture_us)"] as $f
+      | (if $f then $shown["\(.viewer) \($f.seq)"] else null end) as $s
+      | {kind: $i.kind, total: (.shown_ms - .seen_ms),
+         upload: ($i.read_us / 1000 - .seen_ms), lock: $i.lock_ms, pace: $i.pace_ms,
+         server: (($i.sent_us - $i.read_us) / 1000), react: ((.capture_us - $i.sent_us) / 1000),
+         encode: (($f.encode_us - $f.capture_us) / 1000), helper: (($f.read_us - $f.encode_us) / 1000),
+         out: (($f.written_us - $f.read_us) / 1000), network: ($s.received_ms - $f.written_us / 1000),
+         decode: ($s.shown_ms - $s.received_ms)}
+      | map_values(if type == "number" then (. * 10 | round / 10) else . end))
+  | sort_by(-.total) | .[]' viewer-trace.jsonl | head
+```
 
 ## Client setup
 

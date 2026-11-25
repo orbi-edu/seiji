@@ -392,15 +392,18 @@ async fn admin_viewer_link(
 struct ViewerSettingsBody {
     pace_max_ms: Option<u32>,
     webrtc: Option<bool>,
+    trace: Option<bool>,
 }
 
-/// The viewer settings now, what `seiji.json` sets, and why WebRTC cannot be turned on, if so.
+/// The viewer settings now, what `seiji.json` sets, why WebRTC cannot be turned on, if so, and
+/// the size of the last viewer trace.
 fn viewer_settings(pool: &Pool) -> Response {
     let v = &pool.config.viewer;
     Json(serde_json::json!({
         "settings": pool.viewers.settings(),
-        "defaults": { "pace_max_ms": v.pace_max_ms, "webrtc": v.webrtc.enabled },
+        "defaults": { "pace_max_ms": v.pace_max_ms, "webrtc": v.webrtc.enabled, "trace": false },
         "webrtc_problem": v.webrtc.problem(),
+        "trace_bytes": pool.viewers.trace_file().1,
     }))
     .into_response()
 }
@@ -436,10 +439,40 @@ async fn admin_set_viewer(
     {
         return bad(StatusCode::BAD_REQUEST, format!("WebRTC cannot be turned on: {problem}"));
     }
+    // The one change that can fail goes first: a failed trace leaves the other settings as they were.
+    if let Some(on) = body.trace
+        && let Err(e) = pool.viewers.set_trace(on)
+    {
+        tracing::error!(error = %e, "cannot start the viewer trace");
+        return bad(StatusCode::INTERNAL_SERVER_ERROR, format!("cannot start the viewer trace: {e}"));
+    }
     pool.viewers.set_settings(body.pace_max_ms, body.webrtc);
     let s = pool.viewers.settings();
-    tracing::info!(admin = %caller.name, pace_max_ms = s.pace_max_ms, webrtc = s.webrtc, "viewer settings changed");
+    tracing::info!(admin = %caller.name, pace_max_ms = s.pace_max_ms, webrtc = s.webrtc, trace = s.trace, "viewer settings changed");
     viewer_settings(&pool)
+}
+
+/// `GET /v1/admin/viewer/trace`: the last viewer trace, as JSON lines.
+async fn admin_viewer_trace(
+    State(pool): State<Arc<Pool>>,
+    Extension(AuthedUser(caller)): Extension<AuthedUser>,
+) -> Response {
+    if !pool.config.admin_users.contains(&caller.name) {
+        return bad(StatusCode::FORBIDDEN, "admin access required");
+    }
+    let file = match tokio::fs::File::open(pool.viewers.trace_file().0).await {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return bad(StatusCode::NOT_FOUND, "no viewer trace yet: turn it on with PUT /v1/admin/viewer");
+        }
+        Err(e) => return bad(StatusCode::INTERNAL_SERVER_ERROR, format!("cannot read the viewer trace: {e}")),
+    };
+    let mut resp = axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(file)).into_response();
+    let h = resp.headers_mut();
+    h.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/x-ndjson"));
+    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    h.insert(header::CONTENT_DISPOSITION, HeaderValue::from_static("attachment; filename=\"viewer-trace.jsonl\""));
+    resp
 }
 
 /// `GET /v1/leases/{lease_id}/screenshot.jpg`: the screen now, as a JPEG.
@@ -536,6 +569,7 @@ pub fn router(pool: Arc<Pool>, shutdown: CancellationToken) -> Router {
         .route("/v1/admin/leases", get(admin_leases))
         .route("/v1/admin/leases/{lease_id}/viewer", post(admin_viewer_link))
         .route("/v1/admin/viewer", get(admin_viewer).put(admin_set_viewer))
+        .route("/v1/admin/viewer/trace", get(admin_viewer_trace))
         .route("/v1/leases/{lease_id}/viewer", post(viewer_link))
         .route("/v1/leases/{lease_id}/screenshot.jpg", get(lease_screenshot))
         .route("/v1/leases/{lease_id}/forward", get(forward))
