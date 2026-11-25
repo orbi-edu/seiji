@@ -113,7 +113,7 @@ final class Encoder {
             duration: .invalid, frameProperties: properties, infoFlagsOut: nil
         ) { [weak self] status, flags, sample in
             self?.output(status: status, flags: flags, sample: sample, stream: stream,
-                         capturedMicros: capturedMicros)
+                         capturedMicros: capturedMicros, requestedKeyframe: keyframe)
         }
         if status != noErr {
             lock.lock()
@@ -127,12 +127,20 @@ final class Encoder {
     // MARK: - Output
 
     private func output(status: OSStatus, flags: VTEncodeInfoFlags, sample: CMSampleBuffer?,
-                        stream: Stream, capturedMicros: UInt64) {
+                        stream: Stream, capturedMicros: UInt64, requestedKeyframe: Bool) {
         lock.lock()
         defer { lock.unlock() }
         inFlight -= 1
-        guard status == noErr, !flags.contains(.frameDropped), let sample,
-              let block = CMSampleBufferGetDataBuffer(sample) else {
+        // The rate control skipped this frame: nothing refers to it, so the stream goes on. Only
+        // a keyframe that was asked for is still owed. (Forcing one after every skip makes things
+        // worse at a low bitrate: each keyframe is skipped or makes the next frame skip, and the
+        // stream turns into keyframes only.)
+        if status == noErr && flags.contains(.frameDropped) {
+            if requestedKeyframe { needKeyframe = true }
+            debugLog("the encoder skipped a frame\(requestedKeyframe ? " (a keyframe)" : "")")
+            return
+        }
+        guard status == noErr, let sample, let block = CMSampleBufferGetDataBuffer(sample) else {
             if status != noErr { debugLog("encode failed: \(status)") }
             needKeyframe = true
             return
@@ -297,7 +305,10 @@ final class Encoder {
         set(session, kVTCompressionPropertyKey_AverageBitRate, NSNumber(value: bitrate))
         set(session, kVTCompressionPropertyKey_DataRateLimits, dataRateLimits())
         set(session, kVTCompressionPropertyKey_ExpectedFrameRate, NSNumber(value: fps))
-        set(session, kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, NSNumber(value: 2))
+        // Viewers ask for a keyframe when they need one (joining, falling behind, a lost frame),
+        // so a periodic one is only a safety net: on a slow link each keyframe is a burst that
+        // delays the frames behind it.
+        set(session, kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, NSNumber(value: 10))
         let prepared = VTCompressionSessionPrepareToEncodeFrames(session)
         guard prepared == noErr else {
             VTCompressionSessionInvalidate(session)

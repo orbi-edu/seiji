@@ -1812,7 +1812,7 @@ The WebSocket closes with code `4401` when the session expires or its user (or t
 
 ### The stream
 
-Seiji runs one [`seiji-sim`](configuration.md#viewer) helper for each watched lease, as the user's account. It reads the simulator's framebuffer, encodes it as H.264 with VideoToolbox (no B-frames, a keyframe on request and every 2 s while the screen moves) and keeps one HID connection open for input. A static screen produces no frames. The helper starts with the first viewer and stops when the last one leaves or the lease ends. If it exits while someone watches, Seiji starts it again after 1 s. While someone watches, Seiji touches the lease every 60 s, so a watched device is not released as idle. Every 30 s, Seiji logs a structured line with the stream's fps, kbit/s, bitrate and viewer count.
+Seiji runs one [`seiji-sim`](configuration.md#viewer) helper for each watched lease, as the user's account. It reads the simulator's framebuffer, encodes it as H.264 with VideoToolbox (no B-frames; a keyframe when a viewer asks for one, and at least every 10 s while the screen moves) and keeps one HID connection open for input. At a low bitrate the encoder skips frames; a skipped frame needs no keyframe after it, so the stream stays a stream of small frames. A static screen produces no frames. The helper starts with the first viewer and stops when the last one leaves or the lease ends. If it exits while someone watches, Seiji starts it again after 1 s. While someone watches, Seiji touches the lease every 60 s, so a watched device is not released as idle. Every 30 s, Seiji logs a structured line with the stream's fps, kbit/s, bitrate and viewer count.
 
 The server sends:
 
