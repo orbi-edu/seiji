@@ -423,6 +423,14 @@ local function viewer_settings(state: any, A: any): Node?
 		table.insert(rtc, ui.text({ ui.span("  cannot be turned on: " .. v.webrtc_problem, "muted") }))
 	end
 	table.insert(rows, ui.node("row", { key = "rtc", gap = "sm", align = "center", wrap = true }, rtc))
+	-- The frame rate of every stream, at once: 60 is smoother and costs more bandwidth.
+	local fps = tonumber(s.fps) or 0
+	local rate: { Node } = { ui.text({ ui.span("Frame rate  ", "muted") }) }
+	for _, n in { 30, 60 } do
+		table.insert(rate, h.action(tostring(n) .. " fps", "viewer_fps=" .. tostring(n), if fps == n then "accent" else "neutral", "fps_" .. tostring(n)))
+	end
+	table.insert(rate, ui.text({ ui.span("  now " .. tostring(fps) .. " fps, seiji.json: " .. tostring(d.fps or "—") .. " fps", "muted") }))
+	table.insert(rows, ui.node("row", { key = "fps", gap = "sm", align = "center", wrap = true }, rate))
 	-- The viewer trace: every input and frame as a JSON line, until it is turned off or hits 64 MiB.
 	local trace: { Node } = {
 		h.action(if s.trace then "Trace on" else "Trace off", "viewer_trace=" .. tostring(not s.trace), if s.trace then "accent" else "neutral", "trace"),

@@ -265,7 +265,7 @@ Optional section. The viewer shows a lease's screen live in a browser or in Tern
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `viewer.simBin` | path | `"/usr/local/bin/seiji-sim"` | The screen helper, built from `sim/` ([install.md](install.md#3-build-and-install-the-binary)). Under `os_user` every tenant account must be able to read and run it. |
-| `viewer.fps` | integer | `30` | Highest frames per second of the stream. A still screen sends none. 1–60. |
+| `viewer.fps` | integer | `30` | Highest frames per second of the stream. A still screen sends none. 1–60. An admin can change it for every stream while Seiji runs ([mcp.md](mcp.md#get-v1adminviewer-put-v1adminviewer)): 60 is smoother and lowers the frame age by about 8 ms on average, at more bandwidth; a viewer that falls behind gets every other frame. |
 | `viewer.scale` | number | `0.5` | Frame scale. `0.5` halves each side of the simulator's pixels. 0.1–1. |
 | `viewer.bitrateKbps` | integer | `2500` | Target H.264 bitrate in kbit/s, for the `balanced` preset. A congested viewer lowers it for a while ([mcp.md](mcp.md#the-stream)). 100–20000. |
 | `viewer.maxViewersPerLease` | integer | `4` | Viewer pages that may stream one lease at the same time. One more gets `429` `full`. Above 0. |

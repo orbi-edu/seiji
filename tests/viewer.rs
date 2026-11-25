@@ -882,6 +882,29 @@ async fn presets_and_stats_describe_the_shared_stream() {
 }
 
 #[tokio::test]
+async fn an_admin_changes_the_frame_rate_of_every_stream_while_seiji_runs() {
+    let env = setup_with(2, json!({"adminUsers": ["alice"], "viewer": {"fps": 30}})).await;
+    let (alice, lease) = device(&env, "alice").await;
+    let bob = add_user(&env, "bob", QUOTA);
+    let view = open(&env, &alice, &lease, true).await;
+    let mut ws = view.ws().await;
+    frame(&mut ws).await;
+
+    assert_eq!(set_viewer(&env, &bob, json!({"fps": 60})).await.status(), 403);
+    for bad in [0, 61] {
+        assert_eq!(set_viewer(&env, &alice, json!({"fps": bad})).await.status(), 400, "fps {bad}");
+    }
+    let now: Value = set_viewer(&env, &alice, json!({"fps": 60})).await.json().await.unwrap();
+    assert_eq!((now["settings"]["fps"].as_u64(), now["defaults"]["fps"].as_u64()), (Some(60), Some(30)), "{now}");
+    // The running stream changes at once, at its bitrate now; a preset keeps the new rate.
+    logged(&env, "encode 60 0.5 2500000").await;
+    let stats: Value = view.get("stats").await.json().await.unwrap();
+    assert_eq!(stats["opts"]["fps"], 60, "{stats}");
+    send(&mut ws, json!({"t": "preset", "name": "sharp"})).await;
+    logged(&env, "encode 60 0.8 5000000").await;
+}
+
+#[tokio::test]
 async fn configure_device_sets_pasteboard() {
     let env = setup(1).await;
     let (token, _lease) = device(&env, "alice").await;

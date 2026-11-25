@@ -393,6 +393,7 @@ struct ViewerSettingsBody {
     pace_max_ms: Option<u32>,
     webrtc: Option<bool>,
     trace: Option<bool>,
+    fps: Option<u8>,
 }
 
 /// The viewer settings now, what `seiji.json` sets, why WebRTC cannot be turned on, if so, and
@@ -401,7 +402,7 @@ fn viewer_settings(pool: &Pool) -> Response {
     let v = &pool.config.viewer;
     Json(serde_json::json!({
         "settings": pool.viewers.settings(),
-        "defaults": { "pace_max_ms": v.pace_max_ms, "webrtc": v.webrtc.enabled, "trace": false },
+        "defaults": { "pace_max_ms": v.pace_max_ms, "webrtc": v.webrtc.enabled, "trace": false, "fps": v.fps },
         "webrtc_problem": v.webrtc.problem(),
         "trace_bytes": pool.viewers.trace_file().1,
     }))
@@ -434,6 +435,9 @@ async fn admin_set_viewer(
     if body.pace_max_ms.is_some_and(|ms| ms > 1000) {
         return bad(StatusCode::BAD_REQUEST, "pace_max_ms must be 0-1000");
     }
+    if body.fps.is_some_and(|fps| !(1..=60).contains(&fps)) {
+        return bad(StatusCode::BAD_REQUEST, "fps must be 1-60");
+    }
     if body.webrtc == Some(true)
         && let Some(problem) = pool.config.viewer.webrtc.problem()
     {
@@ -446,9 +450,9 @@ async fn admin_set_viewer(
         tracing::error!(error = %e, "cannot start the viewer trace");
         return bad(StatusCode::INTERNAL_SERVER_ERROR, format!("cannot start the viewer trace: {e}"));
     }
-    pool.viewers.set_settings(body.pace_max_ms, body.webrtc);
+    pool.viewers.set_settings(body.pace_max_ms, body.webrtc, body.fps);
     let s = pool.viewers.settings();
-    tracing::info!(admin = %caller.name, pace_max_ms = s.pace_max_ms, webrtc = s.webrtc, trace = s.trace, "viewer settings changed");
+    tracing::info!(admin = %caller.name, pace_max_ms = s.pace_max_ms, webrtc = s.webrtc, trace = s.trace, fps = s.fps, "viewer settings changed");
     viewer_settings(&pool)
 }
 
