@@ -45,8 +45,9 @@ pub struct FakeDevices {
     pub hang_boot: AtomicBool,
     /// Notified (with a stored permit) when `boot()` enters the `hang_boot` wait.
     pub boot_entered: tokio::sync::Notify,
-    /// Every input and operation, in order, e.g. `tap label=Sign In`, `type ana`, `op launch_app com.example.demo`.
-    pub log: Mutex<Vec<String>>,
+    /// Every input and operation, in order, with when it happened, e.g. `tap label=Sign In`,
+    /// `type ana`, `op launch_app com.example.demo`.
+    pub log: Mutex<Vec<(std::time::Instant, String)>>,
     pub signed_in: AtomicBool,
     pub stopped_captures: AtomicUsize,
     pub streams_started: AtomicUsize,
@@ -62,10 +63,13 @@ pub struct FakeDevices {
 
 impl FakeDevices {
     pub fn log(&self) -> Vec<String> {
+        self.log.lock().unwrap().iter().map(|(_, s)| s.clone()).collect()
+    }
+    pub fn timed_log(&self) -> Vec<(std::time::Instant, String)> {
         self.log.lock().unwrap().clone()
     }
     fn note(&self, s: String) {
-        self.log.lock().unwrap().push(s);
+        self.log.lock().unwrap().push((std::time::Instant::now(), s));
     }
 }
 

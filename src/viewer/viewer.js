@@ -129,6 +129,9 @@
     ws.binaryType = "arraybuffer";
     ws.onopen = () => {
       retry = 0;
+      // A new socket starts a new sample: the old one's round trips say nothing about it.
+      rtts.length = 0;
+      lastPong = performance.now();
       ping();
     };
     ws.onmessage = (ev) => (typeof ev.data === "string" ? onText(JSON.parse(ev.data)) : onFrame(ev.data));
@@ -157,7 +160,70 @@
   function ping() {
     send({ t: "ping", at: performance.now() });
   }
-  setInterval(ping, 2000);
+  setInterval(ping, 1000);
+
+  // ── link quality ───────────────────────────────────────────────────────
+
+  // The last round trips, for the jitter: how much one differs from the one before.
+  const rtts = [];
+  let lastPong = 0;
+  let poorSince = 0;
+  let poorNotedAt = -Infinity;
+  const linkEl = $("link");
+
+  function jitter() {
+    if (rtts.length < 2) return 0;
+    let sum = 0;
+    for (let i = 1; i < rtts.length; i++) sum += Math.abs(rtts[i] - rtts[i - 1]);
+    return sum / (rtts.length - 1);
+  }
+
+  function onPong(sample) {
+    rtts.push(sample);
+    if (rtts.length > 10) rtts.shift();
+    lastPong = performance.now();
+  }
+
+  function renderLink() {
+    if (ended) {
+      linkEl.hidden = true;
+      return;
+    }
+    const now = performance.now();
+    let text;
+    let quality;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      text = "offline";
+      quality = "poor";
+    } else if (lastPong && now - lastPong > 3000) {
+      // Nothing came back for a while: the link is stalled, whatever the last round trip was.
+      text = `no answer ${Math.round((now - lastPong) / 1000)} s`;
+      quality = "poor";
+    } else if (rtt !== null) {
+      const j = jitter();
+      text = `${Math.round(rtt)} ms ±${Math.round(j)}`;
+      quality = rtt < 150 && j < 30 ? "good" : rtt < 350 && j < 100 ? "fair" : "poor";
+    } else {
+      linkEl.hidden = true;
+      return;
+    }
+    linkEl.textContent = text;
+    linkEl.className = `link ${quality}`;
+    linkEl.title =
+      "Round trip to the Seiji host, and how much it varies (jitter). " +
+      "Over a poor link the picture and your input lag; Smooth needs less bandwidth.";
+    linkEl.hidden = false;
+    // Say so once a minute at most, after the link stayed poor for a few seconds.
+    if (quality !== "poor") {
+      poorSince = 0;
+    } else if (!poorSince) {
+      poorSince = now;
+    } else if (now - poorSince > 3000 && now - poorNotedAt > 60000) {
+      poorNotedAt = now;
+      flash("The link to the device is slow or unstable: the picture and your input lag. Smooth needs less bandwidth.", "warning");
+    }
+  }
+  setInterval(renderLink, 500);
 
   const pending = new Map(); // input id → what it was
   let nextId = 1;
@@ -170,6 +236,7 @@
       case "pong": {
         const now = performance.now();
         rtt = now - msg.at;
+        onPong(rtt);
         // The server's clock at the middle of the round trip.
         clockOffset = msg.server_ms - (Date.now() - rtt / 2);
         break;
@@ -337,6 +404,7 @@
       `Resolution: ${canvas.width}×${canvas.height}`,
       `Codec: ${format ? format.codec : "—"}`,
       `Round trip: ${rtt === null ? "—" : `${Math.round(rtt)} ms`}`,
+      `Jitter: ${rtts.length < 2 ? "—" : `${Math.round(jitter())} ms`}`,
       `Frame age: ${stats.age === null ? "—" : `${Math.round(stats.age)} ms`}`,
       `Decode queue: ${decoder ? decoder.decodeQueueSize : 0}`,
     ];
@@ -376,34 +444,111 @@
   }
 
   const fingerDot = $("finger");
+  // Where a 0-1 point of the picture is, in CSS pixels of the screen element.
+  function toScreen(p) {
+    const r = canvas.getBoundingClientRect();
+    const s = screen.getBoundingClientRect();
+    return { x: r.left - s.left + p.x * r.width, y: r.top - s.top + p.y * r.height };
+  }
   function showFinger(p) {
     if (!p) {
       fingerDot.hidden = true;
       return;
     }
-    const r = canvas.getBoundingClientRect();
-    const s = screen.getBoundingClientRect();
-    fingerDot.style.left = `${r.left - s.left + p.x * r.width}px`;
-    fingerDot.style.top = `${r.top - s.top + p.y * r.height}px`;
+    const q = toScreen(p);
+    fingerDot.style.left = `${q.x}px`;
+    fingerDot.style.top = `${q.y}px`;
     fingerDot.hidden = false;
+  }
+
+  // The finger's path and a ripple for each tap, drawn at once: input feels immediate though
+  // the device's answer takes a round trip.
+  const trail = $("trail");
+  const t2d = trail.getContext("2d");
+  const TRAIL_MS = 400;
+  const RIPPLE_MS = 350;
+  const accent = getComputedStyle(document.documentElement).getPropertyValue("--accent").trim() || "#2563eb";
+  const points = []; // {x, y, t, start}: screen CSS pixels; `start` begins a new stroke
+  const ripples = [];
+  let drawing = false;
+  function trailAdd(p, start) {
+    points.push({ ...toScreen(p), t: performance.now(), start });
+    kickTrail();
+  }
+  function ripple(p) {
+    ripples.push({ ...toScreen(p), t: performance.now() });
+    kickTrail();
+  }
+  function kickTrail() {
+    if (drawing) return;
+    drawing = true;
+    requestAnimationFrame(drawTrail);
+  }
+  function drawTrail() {
+    const s = screen.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    const w = Math.round(s.width * dpr);
+    const h = Math.round(s.height * dpr);
+    if (trail.width !== w || trail.height !== h) {
+      trail.width = w;
+      trail.height = h;
+    }
+    t2d.setTransform(dpr, 0, 0, dpr, 0, 0);
+    t2d.clearRect(0, 0, s.width, s.height);
+    const now = performance.now();
+    while (points.length && now - points[0].t > TRAIL_MS) points.shift();
+    while (ripples.length && now - ripples[0].t > RIPPLE_MS) ripples.shift();
+    t2d.strokeStyle = accent;
+    t2d.lineCap = "round";
+    t2d.lineWidth = 6;
+    for (let i = 1; i < points.length; i++) {
+      const a = points[i - 1];
+      const b = points[i];
+      if (b.start) continue;
+      t2d.globalAlpha = 0.55 * (1 - (now - b.t) / TRAIL_MS);
+      t2d.beginPath();
+      t2d.moveTo(a.x, a.y);
+      t2d.lineTo(b.x, b.y);
+      t2d.stroke();
+    }
+    t2d.lineWidth = 2;
+    for (const r of ripples) {
+      const k = (now - r.t) / RIPPLE_MS;
+      t2d.globalAlpha = 0.7 * (1 - k);
+      t2d.beginPath();
+      t2d.arc(r.x, r.y, 12 + 18 * k, 0, 2 * Math.PI);
+      t2d.stroke();
+    }
+    t2d.globalAlpha = 1;
+    if (points.length || ripples.length) requestAnimationFrame(drawTrail);
+    else drawing = false;
+  }
+
+  // Each touch carries when the page saw it (`ts`), so the server can hand a gesture that the
+  // link delayed or bunched to the device with its own spacing.
+  function touch(phase, p, ts, edge) {
+    send({ t: "touch", phase, x: p.x, y: p.y, edge, ts });
   }
 
   // Moves are sent at most once per animation frame, always the latest point.
   let moveAt = null;
+  let moveTs = 0;
   let moveScheduled = false;
-  function queueMove(p) {
+  function queueMove(p, ts) {
     moveAt = p;
+    moveTs = ts;
     if (moveScheduled) return;
     moveScheduled = true;
     requestAnimationFrame(flushMove);
   }
   function flushMove() {
     moveScheduled = false;
-    if (moveAt && (finger || wheel.active)) send({ t: "touch", phase: "move", x: moveAt.x, y: moveAt.y });
+    if (moveAt && (finger || wheel.active)) touch("move", moveAt, moveTs);
     moveAt = null;
   }
 
   let finger = null;
+  let downAt = null;
   canvas.addEventListener("pointerdown", (ev) => {
     if (!control || ev.button !== 0 || finger) return;
     ev.preventDefault();
@@ -412,22 +557,28 @@
     endWheel();
     const p = norm(ev);
     finger = ev.pointerId;
-    send({ t: "touch", phase: "down", x: p.x, y: p.y, edge: edgeOf(p) });
+    downAt = p;
+    touch("down", p, ev.timeStamp, edgeOf(p));
     showFinger(p);
+    trailAdd(p, true);
   });
   canvas.addEventListener("pointermove", (ev) => {
     if (ev.pointerId !== finger) return;
     const p = norm(ev);
-    queueMove(p);
+    queueMove(p, ev.timeStamp);
     showFinger(p);
+    trailAdd(p, false);
   });
   function lift(ev) {
     if (ev.pointerId !== finger) return;
     finger = null;
     flushMove();
     const p = norm(ev);
-    send({ t: "touch", phase: "up", x: p.x, y: p.y });
+    touch("up", p, ev.timeStamp);
     showFinger(null);
+    // A tap, not a drag: show where it landed.
+    if (downAt && Math.hypot(p.x - downAt.x, p.y - downAt.y) < 0.01) ripple(p);
+    downAt = null;
   }
   canvas.addEventListener("pointerup", lift);
   canvas.addEventListener("pointercancel", lift);
@@ -439,7 +590,7 @@
     if (!wheel.active) return;
     wheel.active = false;
     flushMove();
-    send({ t: "touch", phase: "up", x: wheel.at.x, y: wheel.at.y });
+    touch("up", wheel.at, performance.now());
   }
   canvas.addEventListener(
     "wheel",
@@ -452,7 +603,8 @@
         wheel.origin = { x: Math.min(0.9, Math.max(0.1, p.x)), y: Math.min(0.85, Math.max(0.15, p.y)) };
         wheel.at = { ...wheel.origin };
         wheel.active = true;
-        send({ t: "touch", phase: "down", x: wheel.at.x, y: wheel.at.y });
+        touch("down", wheel.at, ev.timeStamp);
+        trailAdd(wheel.at, true);
       }
       const scale = ev.deltaMode === 1 ? 16 : ev.deltaMode === 2 ? r.height : 1;
       const x = wheel.at.x - (ev.deltaX * scale) / r.width;
@@ -462,7 +614,8 @@
         endWheel();
       } else {
         wheel.at = { x, y };
-        queueMove(wheel.at);
+        queueMove(wheel.at, ev.timeStamp);
+        trailAdd(wheel.at, false);
       }
       clearTimeout(wheel.timer);
       wheel.timer = setTimeout(endWheel, 120);

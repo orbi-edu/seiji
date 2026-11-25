@@ -147,9 +147,11 @@ The panel polls `budget_status` every 3 s and `list_runs` every 10 s while the R
 | Paste (⌘V) | The clipboard's text |
 | ⌘⇧H, ⌘L | Home, Lock |
 | ⌘S, or **Screenshot** | A JPEG download of the screen |
-| ⌥I, or **Stats** | The stream's fps, bitrate, round trip and frame age |
+| ⌥I, or **Stats** | The stream's fps, bitrate, round trip, jitter and frame age |
 
-The screen is H.264 video decoded in the browser (WebCodecs), up to 30 frames a second. A dot shows where your finger is at once, before the device answers. On a slow link the picture skips frames rather than falling behind, and the bitrate drops until the link recovers.
+The screen is H.264 video decoded in the browser (WebCodecs), up to 30 frames a second. Your input shows at once, before the device answers: a dot where your finger is, its path as you drag, and a ripple where a tap landed. On a slow link the picture skips frames rather than falling behind, and the bitrate drops until the link recovers. A swipe that the link delayed still reaches the device with its own speed ([mcp.md](mcp.md#gesture-timing)).
+
+The badge next to the device name shows the link: its round trip and jitter, green when it is good, amber when it is fair, red when it is poor or stalled (`no answer 4 s`). When it stays red, the page says so; pick **Smooth** to need less bandwidth.
 
 The dot in the toolbar is green while the stream is live, amber while a run uses the device, and red when the device is gone. While a run holds the device, the screen keeps playing but input waits: a tap answers "A run is using the device" instead of mixing with the run's steps.
 
