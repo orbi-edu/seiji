@@ -426,20 +426,18 @@ async fn admin_set_viewer(
         Ok(b) => b,
         Err(e) => return bad(StatusCode::BAD_REQUEST, format!("invalid body: {e}")),
     };
-    let mut s = pool.viewers.settings();
-    if let Some(ms) = body.pace_max_ms {
-        if ms > 1000 {
-            return bad(StatusCode::BAD_REQUEST, "pace_max_ms must be 0-1000");
-        }
-        s.pace_max_ms = ms;
+    // Validate everything first, then store only what the body names, so two admins who change
+    // different settings at once both keep their change.
+    if body.pace_max_ms.is_some_and(|ms| ms > 1000) {
+        return bad(StatusCode::BAD_REQUEST, "pace_max_ms must be 0-1000");
     }
-    if let Some(on) = body.webrtc {
-        if on && let Some(problem) = pool.config.viewer.webrtc.problem() {
-            return bad(StatusCode::BAD_REQUEST, format!("WebRTC cannot be turned on: {problem}"));
-        }
-        s.webrtc = on;
+    if body.webrtc == Some(true)
+        && let Some(problem) = pool.config.viewer.webrtc.problem()
+    {
+        return bad(StatusCode::BAD_REQUEST, format!("WebRTC cannot be turned on: {problem}"));
     }
-    pool.viewers.set_settings(s);
+    pool.viewers.set_settings(body.pace_max_ms, body.webrtc);
+    let s = pool.viewers.settings();
     tracing::info!(admin = %caller.name, pace_max_ms = s.pace_max_ms, webrtc = s.webrtc, "viewer settings changed");
     viewer_settings(&pool)
 }

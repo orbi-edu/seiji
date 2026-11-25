@@ -270,8 +270,12 @@ read_admin_users = function(state: any)
 	read_admin(state, "admin_leases", apimod.admin_leases, function(data)
 		state.data.admin_leases = data.leases
 	end)
+	-- A read that started before a save may answer after it; keep the save's reply then.
+	local gen = state.viewer_gen or 0
 	read_admin(state, "admin_viewer", apimod.admin_viewer, function(data)
-		state.data.admin_viewer = data
+		if (state.viewer_gen or 0) == gen and not state.inflight.set_viewer then
+			state.data.admin_viewer = data
+		end
 	end)
 end
 
@@ -286,6 +290,7 @@ local function set_viewer(state: any, body: { [string]: any })
 		return
 	end
 	state.inflight.set_viewer = true
+	state.viewer_gen = (state.viewer_gen or 0) + 1
 	apimod.admin_set_viewer(state.api, body, function(data, err)
 		state.inflight.set_viewer = nil
 		if state.stopped then

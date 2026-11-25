@@ -464,10 +464,15 @@ impl Viewers {
         }
     }
 
-    /// Applies to new gestures and new pages at once; a page already on WebRTC stays on it.
-    pub fn set_settings(&self, s: ViewerSettings) {
-        self.pace_max_ms.store(s.pace_max_ms, Ordering::Relaxed);
-        self.webrtc.store(s.webrtc, Ordering::Relaxed);
+    /// Stores the settings given and leaves the others. Applies to new gestures and new pages at
+    /// once; a page already on WebRTC stays on it.
+    pub fn set_settings(&self, pace_max_ms: Option<u32>, webrtc: Option<bool>) {
+        if let Some(ms) = pace_max_ms {
+            self.pace_max_ms.store(ms, Ordering::Relaxed);
+        }
+        if let Some(on) = webrtc {
+            self.webrtc.store(on, Ordering::Relaxed);
+        }
     }
 
     fn pace_max(&self) -> Duration {
