@@ -304,6 +304,9 @@
       case "rtc_answer":
         onRtcAnswer(msg);
         break;
+      case "server_stats":
+        serverStages = { server: msg.server, input: msg.input };
+        break;
       case "done": {
         const kind = pending.get(msg.id);
         pending.delete(msg.id);
@@ -334,6 +337,22 @@
   let format = null;
   let decodeErrors = [];
   const stats = { frames: [], bytes: [], age: null, drawn: 0 };
+  // Where each frame's time goes (see `pipeline.rs`): the last samples of each stage, in
+  // milliseconds. "In server" and "input in server" come from the server every 5 s.
+  const stages = { age: [], encode: [], helper: [], down: [], decode: [] };
+  let serverStages = { server: null, input: null };
+  function sample(name, ms) {
+    if (!Number.isFinite(ms) || ms < 0 || ms > 120000) return;
+    const a = stages[name];
+    a.push(ms);
+    if (a.length > 256) a.shift();
+  }
+  function p50p95(a) {
+    if (!a.length) return null;
+    const s = [...a].sort((x, y) => x - y);
+    const at = (p) => Math.round(s[Math.round((s.length - 1) * p)] * 10) / 10;
+    return [at(0.5), at(0.95)];
+  }
   // Frames sent to the decoder and not yet shown: capture time → [frame number, when sent]. A
   // frame is acknowledged once it is shown, so a slow decoder holds the stream back like a slow
   // link.
@@ -375,6 +394,7 @@
         if (entry !== undefined) {
           decoding.delete(frame.timestamp);
           send({ t: "ack", seq: entry[0] });
+          sample("decode", performance.now() - entry[1]);
         }
         if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
           canvas.width = frame.displayWidth;
@@ -383,6 +403,7 @@
         g2d.drawImage(frame, 0, 0);
         const now = Date.now();
         stats.age = now + clockOffset - frame.timestamp / 1000;
+        sample("age", stats.age);
         stats.frames.push(now);
         frame.close();
         veil.hidden = true;
@@ -447,7 +468,13 @@
     const key = (view.getUint8(0) & 1) === 1;
     const seq = view.getUint32(1);
     const capturedUs = Number(view.getBigInt64(5));
+    const encodedUs = Number(view.getBigInt64(13));
+    const receivedUs = Number(view.getBigInt64(21));
     stats.bytes.push([Date.now(), buf.byteLength]);
+    sample("encode", (encodedUs - capturedUs) / 1000);
+    sample("helper", (receivedUs - encodedUs) / 1000);
+    // Read from the helper to here, on the server's clock: in server plus the network.
+    sample("down", Date.now() + clockOffset - receivedUs / 1000);
     countFrames(1, lastSeq !== null && seq > lastSeq ? seq - lastSeq - 1 : 0);
     lastSeq = seq;
     const ready = decoder && decoder.state === "configured" && !configuring;
@@ -463,7 +490,7 @@
     }
     waitingKey = false;
     decoding.set(capturedUs, [seq, performance.now()]);
-    decoder.decode(new EncodedVideoChunk({ type: key ? "key" : "delta", timestamp: capturedUs, data: new Uint8Array(buf, 13) }));
+    decoder.decode(new EncodedVideoChunk({ type: key ? "key" : "delta", timestamp: capturedUs, data: new Uint8Array(buf, 29) }));
   }
 
   // A decoder that holds a frame for a second has stalled: let the stream go on.
@@ -596,7 +623,10 @@
     if (meta.rtpTimestamp !== undefined) {
       const wrap = 2 ** 32 / 90;
       const age = (((Date.now() + clockOffset - meta.rtpTimestamp / 90) % wrap) + wrap) % wrap;
-      if (age < 10000) stats.age = age;
+      if (age < 10000) {
+        stats.age = age;
+        sample("age", age);
+      }
     }
     video.requestVideoFrameCallback(onRtcFrame);
   }
@@ -642,9 +672,51 @@
       `Lost (3 s): ${loss.pct === null ? "—" : `${loss.pct.toFixed(1)} %`}`,
       `Frame age: ${stats.age === null ? "—" : `${Math.round(stats.age)} ms`}`,
       `Decode queue: ${rtcOn ? "—" : decoder ? decoder.decodeQueueSize : 0}`,
+      ...pipelineLines(),
     ];
     statsOverlay.textContent = lines.join("\n");
   }
+
+  // The stages of the last frames, p50 / p95 in ms. The network is what the server's part does
+  // not explain of "read from the helper to here".
+  function pipelineLines() {
+    const f = (v) => (v ? `${v[0]} / ${v[1]} ms` : "—");
+    const down = p50p95(stages.down);
+    const server = serverStages.server;
+    const net = down && server ? [Math.max(0, Math.round(down[0] - server[0])), Math.max(0, Math.round(down[1] - server[1]))] : null;
+    return [
+      "",
+      "Where the time goes (p50 / p95):",
+      `  Encode: ${f(p50p95(stages.encode))}`,
+      `  Helper → server: ${f(p50p95(stages.helper))}`,
+      `  In server: ${rtcOn ? "—" : f(server)}`,
+      `  Network: ${rtcOn ? "—" : f(net)}`,
+      `  Decode: ${rtcOn ? "—" : f(p50p95(stages.decode))}`,
+      `  Capture → shown: ${f(p50p95(stages.age))}`,
+      `  Input in server: ${f(serverStages.input)}`,
+      `  Input upload: ${rtt === null ? "—" : `≈ ${Math.round(rtt / 2)} ms`}`,
+    ];
+  }
+
+  // The page's stages go to the server every 5 s, for its log.
+  setInterval(() => {
+    if (!stages.age.length && !stages.down.length) return;
+    send({
+      t: "telemetry",
+      report: {
+        transport: rtcOn ? "rtc" : "ws",
+        age: p50p95(stages.age),
+        encode: p50p95(stages.encode),
+        helper: p50p95(stages.helper),
+        down: rtcOn ? null : p50p95(stages.down),
+        decode: rtcOn ? null : p50p95(stages.decode),
+        rtt: rtt === null ? null : Math.round(rtt),
+        jitter: rtts.length < 2 ? null : Math.round(jitter()),
+        lost: loss.pct,
+        fps: stats.frames.filter((t) => t > Date.now() - 1000).length,
+      },
+    });
+  }, 5000);
 
   function toggleStats() {
     statsOn = !statsOn;

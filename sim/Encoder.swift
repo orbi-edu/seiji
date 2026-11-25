@@ -37,6 +37,8 @@ final class Encoder {
     private var keyframeTooBig = false
     /// Encoded frames not written (stdout backlog or over the payload limit).
     private var dropped = 0
+    /// Flags, capture time and encode time before each sample.
+    private static let frameHeader = 17
 
     init(fps: Int, bitrate: Int) {
         self.fps = fps
@@ -164,7 +166,7 @@ final class Encoder {
         }
 
         let length = CMBlockBufferGetDataLength(block)
-        guard 9 + length <= Output.maxPayload else {
+        guard Self.frameHeader + length <= Output.maxPayload else {
             // Never written. A delta loss still needs an IDR, but a keyframe this big would most
             // likely be too big again, so a static screen does not retry it (see `needsKeyframe`).
             dropped += 1
@@ -173,10 +175,14 @@ final class Encoder {
             debugLog("dropping a \(length)-byte \(keyframe ? "key" : "delta") frame over the \(Output.maxPayload)-byte payload limit (\(dropped) dropped)")
             return
         }
-        var message = Output.message(.frame, payloadLength: 9 + length)
-        message.append(keyframe ? 1 : 0)
-        for shift in stride(from: 56, through: 0, by: -8) {
-            message.append(UInt8(truncatingIfNeeded: capturedMicros >> UInt64(shift)))
+        // Flags (bit 0: keyframe; bit 1: the encode time follows), the capture time, the time the
+        // encoder handed the frame over, then the sample.
+        var message = Output.message(.frame, payloadLength: Self.frameHeader + length)
+        message.append((keyframe ? 1 : 0) | 2)
+        for time in [capturedMicros, unixMicros()] {
+            for shift in stride(from: 56, through: 0, by: -8) {
+                message.append(UInt8(truncatingIfNeeded: time >> UInt64(shift)))
+            }
         }
         let header = message.count
         message.count = header + length

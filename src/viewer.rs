@@ -13,6 +13,7 @@
 //! page can take the stream and send its input over WebRTC instead (`rtc`), and keeps the
 //! WebSocket for the rest.
 
+mod pipeline;
 mod rtc;
 
 use std::collections::{HashMap, VecDeque};
@@ -101,8 +102,9 @@ const CAP_STEP: Duration = Duration::from_secs(1);
 const CLOSE_EXPIRED: u16 = 4401;
 const CLOSE_GONE: u16 = 4410;
 const CLOSE_INTERNAL: u16 = 1011;
-/// The binary video message: flags, frame number, capture time, then the AVCC sample.
-const FRAME_HEADER: usize = 13;
+/// The binary video message: flags, frame number, the capture, encode and server-receipt times,
+/// then the AVCC sample.
+const FRAME_HEADER: usize = 29;
 
 const PAGE: &str = include_str!("viewer/index.html");
 const SCRIPT: &str = include_str!("viewer/viewer.js");
@@ -168,6 +170,8 @@ struct Encoded {
     /// The hub's frame number; viewers acknowledge it.
     seq: u32,
     key: bool,
+    /// Unix microseconds when the daemon read the frame from the helper.
+    received_us: i64,
     /// The whole binary WebSocket message.
     message: Bytes,
 }
@@ -388,7 +392,7 @@ impl Hub {
                 self.stats.frame_bytes.fetch_add(f.data.len() as u64, Ordering::Relaxed);
                 self.stats.last_frame_at_ms.store(f.captured_us / 1000, Ordering::Relaxed);
                 let seq = self.next_seq.fetch_add(1, Ordering::Relaxed) as u32;
-                let _ = self.video.send(Video::Frame(Arc::new(frame_message(seq, &f))));
+                let _ = self.video.send(Video::Frame(Arc::new(frame_message(seq, &f, now_us()))));
             }
         }
     }
@@ -405,13 +409,17 @@ fn format_message(f: &ScreenFormat) -> String {
     .to_string()
 }
 
-fn frame_message(seq: u32, f: &VideoFrame) -> Encoded {
+/// Flags (bit 0: keyframe), frame number, then the capture, encode and receipt times in Unix
+/// microseconds (the encode time is the capture time for an older helper), then the sample.
+fn frame_message(seq: u32, f: &VideoFrame, received_us: i64) -> Encoded {
     let mut out = Vec::with_capacity(FRAME_HEADER + f.data.len());
     out.push(u8::from(f.key));
     out.extend_from_slice(&seq.to_be_bytes());
     out.extend_from_slice(&f.captured_us.to_be_bytes());
+    out.extend_from_slice(&f.encoded_us.unwrap_or(f.captured_us).to_be_bytes());
+    out.extend_from_slice(&received_us.to_be_bytes());
     out.extend_from_slice(&f.data);
-    Encoded { seq, key: f.key, message: Bytes::from(out) }
+    Encoded { seq, key: f.key, received_us, message: Bytes::from(out) }
 }
 
 /// Tickets, sessions and the one helper per watched lease. In memory: a restart ends every
@@ -453,6 +461,10 @@ fn sha256_hex(s: &str) -> String {
 
 fn now_ms() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as i64
+}
+
+fn now_us() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_micros() as i64
 }
 
 /// Why a viewer request failed, as the page sees it.
@@ -861,9 +873,13 @@ enum ClientMsg {
     VideoVia {
         via: Via,
     },
+    /// The page's timings of the last frames, every 5 s; see `pipeline`.
+    Telemetry {
+        report: pipeline::PageReport,
+    },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Via {
     Ws,
@@ -965,13 +981,23 @@ enum Ctl {
     Keyframe,
     /// The page shows the WebRTC stream (`true`) or the WebSocket's.
     Rtc(bool),
+    /// The page's timings.
+    Report(Box<pipeline::PageReport>),
 }
+
+/// An input message and when the daemon read it.
+type Queued = (ClientMsg, Instant);
+
+/// How often the page gets this side's timings, and the log gets a viewer's pipeline.
+const PIPELINE_TO_PAGE: Duration = Duration::from_secs(5);
+const PIPELINE_TO_LOG: Duration = Duration::from_secs(30);
 
 async fn session(live: Live, mut video: broadcast::Receiver<Video>, socket: WebSocket) {
     let (mut sink, stream) = socket.split();
     let hub = live.joined.hub.clone();
     let (out_tx, mut out_rx) = mpsc::channel::<Message>(64);
-    let (in_tx, in_rx) = mpsc::channel::<ClientMsg>(1024);
+    let (in_tx, in_rx) = mpsc::channel::<Queued>(1024);
+    let pipe = Arc::new(StdMutex::new(pipeline::Pipeline::default()));
     let (ctl_tx, mut ctl_rx) = mpsc::channel::<Ctl>(256);
     let input = Input {
         pool: live.pool.clone(),
@@ -980,6 +1006,7 @@ async fn session(live: Live, mut video: broadcast::Receiver<Video>, socket: WebS
         hub: hub.clone(),
         gesture: None,
         touched: None,
+        pipe: pipe.clone(),
     };
     let stop = CancellationToken::new();
     // Once the page is gone its queued input is dropped, even while a frame write still waits.
@@ -1005,6 +1032,11 @@ async fn session(live: Live, mut video: broadcast::Receiver<Video>, socket: WebS
     }
     let mut recheck = tokio::time::interval(RECHECK_EVERY);
     recheck.tick().await;
+    let mut to_page = tokio::time::interval(PIPELINE_TO_PAGE);
+    to_page.tick().await;
+    let mut to_log = tokio::time::interval(PIPELINE_TO_LOG);
+    to_log.tick().await;
+    let viewer = &live.sid[..6];
     while close.is_none() {
         tokio::select! {
             v = video.recv() => match v {
@@ -1018,8 +1050,14 @@ async fn session(live: Live, mut video: broadcast::Receiver<Video>, socket: WebS
                     }
                 }
                 Ok(Video::Frame(f)) => {
-                    if !rtc_video && flow.admit(&f, &hub) && !put(&mut sink, Message::Binary(f.message.clone())).await {
-                        close = Some(None);
+                    if !rtc_video && flow.admit(&f, &hub) {
+                        if put(&mut sink, Message::Binary(f.message.clone())).await {
+                            // In server: read from the helper to written to this socket.
+                            let ms = (now_us() - f.received_us) as f64 / 1000.0;
+                            pipe.lock().expect("pipeline mutex").server.push(ms);
+                        } else {
+                            close = Some(None);
+                        }
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => {
@@ -1052,6 +1090,7 @@ async fn session(live: Live, mut video: broadcast::Receiver<Video>, socket: WebS
                         hub.keyframe(false);
                     }
                 }
+                Some(Ctl::Report(r)) => pipe.lock().expect("pipeline mutex").page = Some(*r),
                 // The page closed its socket.
                 None => close = Some(None),
             },
@@ -1065,6 +1104,13 @@ async fn session(live: Live, mut video: broadcast::Receiver<Video>, socket: WebS
                     close = Some(Some(e.close()));
                 }
             }
+            _ = to_page.tick() => {
+                let m = text(pipe.lock().expect("pipeline mutex").message());
+                if !put(&mut sink, m).await {
+                    close = Some(None);
+                }
+            }
+            _ = to_log.tick() => pipe.lock().expect("pipeline mutex").log(&live.ctx.lease_id, viewer),
             _ = hub.cancel.cancelled() => close = Some(Some(live.ended())),
         }
     }
@@ -1089,7 +1135,7 @@ async fn read_page(
     pool: Arc<Pool>,
     hub: Arc<Hub>,
     control: bool,
-    input: mpsc::Sender<ClientMsg>,
+    input: mpsc::Sender<Queued>,
     out: mpsc::Sender<Message>,
     ctl: mpsc::Sender<Ctl>,
 ) {
@@ -1157,7 +1203,13 @@ async fn read_page(
                 }
                 None
             }
-            Ok(msg) => input.try_send(msg).err().map(|_| ViewError::Busy.message(None)),
+            Ok(ClientMsg::Telemetry { report }) => {
+                if ctl.send(Ctl::Report(Box::new(report.checked()))).await.is_err() {
+                    return;
+                }
+                None
+            }
+            Ok(msg) => input.try_send((msg, Instant::now())).err().map(|_| ViewError::Busy.message(None)),
             Err(e) => Some(ViewError::Bad(format!("invalid message: {e}")).message(None)),
         };
         if let Some(r) = reply
@@ -1242,6 +1294,8 @@ struct Input {
     hub: Arc<Hub>,
     gesture: Option<Gesture>,
     touched: Option<Instant>,
+    /// Where "input in server" is recorded.
+    pipe: Arc<StdMutex<pipeline::Pipeline>>,
 }
 
 impl Input {
@@ -1332,7 +1386,8 @@ impl Input {
             | ClientMsg::Keyframe
             | ClientMsg::Preset { .. }
             | ClientMsg::RtcOffer { .. }
-            | ClientMsg::VideoVia { .. } => {}
+            | ClientMsg::VideoVia { .. }
+            | ClientMsg::Telemetry { .. } => {}
         }
         Ok(None)
     }
@@ -1412,7 +1467,7 @@ fn done(id: u32, via: Option<&str>) -> Message {
 /// Runs until the page goes away (`stop`): what is still queued then is dropped, not applied.
 async fn run_input(
     mut input: Input,
-    mut rx: mpsc::Receiver<ClientMsg>,
+    mut rx: mpsc::Receiver<Queued>,
     out: mpsc::Sender<Message>,
     stop: CancellationToken,
 ) {
@@ -1427,8 +1482,11 @@ async fn run_input(
             }
             m = rx.recv() => m,
         };
-        let Some(msg) = msg else { break };
-        if let Some(reply) = input.apply(msg).await
+        let Some((msg, read_at)) = msg else { break };
+        let reply = input.apply(msg).await;
+        // Input in server: read from the page to applied (the helper has it, or AXe is done).
+        input.pipe.lock().expect("pipeline mutex").input.push(read_at.elapsed().as_secs_f64() * 1000.0);
+        if let Some(reply) = reply
             && out.send(reply).await.is_err()
         {
             break;

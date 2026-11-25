@@ -1817,8 +1817,8 @@ Seiji runs one [`seiji-sim`](configuration.md#viewer) helper for each watched le
 The server sends:
 
 - A text message `{"t": "format", "codec": "avc1.PPCCLL", "width", "height", "description": "<base64 avcC>"}` before the first frame and after a size change: the arguments of WebCodecs `VideoDecoder.configure`.
-- One binary message for each frame: 1 byte of flags (bit 0: keyframe), the frame number (4 bytes, big-endian), the capture time in Unix microseconds (8 bytes, big-endian), then the sample in AVCC form (a 4-byte length before each NAL unit).
-- `{"t": "pong", "at", "server_ms"}` for each ping, `{"t": "preset", "preset", "opts"}` after a preset change, `{"t": "done", "id", "via"}` after a text input, and `{"t": "rtc_answer", "sdp"}` after a WebRTC offer.
+- One binary message for each frame: 1 byte of flags (bit 0: keyframe), the frame number (4 bytes, big-endian), then three times in Unix microseconds (8 bytes each, big-endian): the capture, the encoder's output (the capture again from a helper older than this version) and the daemon reading the frame, then the sample in AVCC form (a 4-byte length before each NAL unit). The sample starts at byte 29.
+- `{"t": "pong", "at", "server_ms"}` for each ping, `{"t": "preset", "preset", "opts"}` after a preset change, `{"t": "done", "id", "via"}` after a text input, `{"t": "rtc_answer", "sdp"}` after a WebRTC offer, and every 5 s `{"t": "server_stats", "server", "input"}` (see [Where the time goes](#where-the-time-goes)).
 
 The page acknowledges each frame with `{"t": "ack", "seq": <frame number>}` once it has shown it (a frame it skips, once it skipped it), so a slow decoder holds the stream back like a slow link. A viewer whose oldest unacknowledged frame is older than its lowest round trip of the last 10 s plus 200 ms (or 60 frames are in flight) is congested: Seiji sends it no more frames until it catches up, then asks the helper for a keyframe and resumes there. So a slow link shows a recent picture with gaps, never a growing delay. A joining viewer gets the current format and a keyframe at once; a viewer that fell behind the shared buffer gets the current format again if it missed one. Seiji reads the page apart from writing to it: input reaches the device while a frame is still on its way down a slow link. When one write to the page stalls for 5 s, Seiji closes the session. Once a session ends, or the page closes its socket, input still queued for it is dropped.
 
@@ -1865,6 +1865,7 @@ The page sends text messages, each a JSON object with `t`. Points are fractions 
 | `ping` | `at` | Echoed back in a `pong`. The page sends one every second, on the WebRTC `input` channel when it is open |
 | `rtc_offer` | `sdp` | A WebRTC offer; see [WebRTC](#webrtc). Also allowed in a view-only session |
 | `video_via` | `via` (`ws`, `rtc`) | Where the page shows the stream from; see [WebRTC](#webrtc). Also allowed in a view-only session |
+| `telemetry` | `report` | The page's timings, every 5 s; see [Where the time goes](#where-the-time-goes). A field the server does not know gets `bad_request`. Also allowed in a view-only session |
 
 Input restarts the idle timer. Viewer input is not recorded as a run.
 
@@ -1887,6 +1888,24 @@ Points without `ts` go at once, as before.
 - **Feedback at once:** the finger's position while it is down, its path for the last 400 ms, and a ripple where a tap landed. The page draws them before the device answers.
 - **Link:** a badge with the last round trip and the jitter (the mean change between the last 10 round trips): green under 150 ms and 30 ms, amber under 350 ms and 100 ms, red above, and red with `no answer N s` when no `pong` came back for 3 s. It also counts what is lost on the way in windows of 3 s, as Moonlight does: frames the server skipped for this page (gaps in the frame numbers) over the WebSocket, packets over WebRTC. It shows `N% lost`, turns red at 30 % in one window or 15 % in two in a row, and is fine again at 5 % or less; over 5 % it is at best amber. After 3 s of red, the page says once a minute that the picture and input lag, and that Smooth needs less bandwidth. **Stats** also shows the jitter and the loss.
 - **A keyframe dropped during setup is asked for again.** On a slow link the format and the first keyframe can arrive together, before the decoder is set up. The page drops what arrives meanwhile and, if a keyframe was among it, asks for one with `keyframe`, so a still screen does not stay on "Connecting…".
+
+### Where the time goes
+
+Each frame carries its capture, encode and server-receipt times, so the page and the server can split a frame's age into stages. **Stats** shows them, p50 / p95 over the last 256 frames, and the daemon logs one `viewer pipeline` line for each viewer every 30 s:
+
+| Stage | Measured | Clock | Log fields |
+|---|---|---|---|
+| Encode: capture to the encoder's output | by `seiji-sim` | host | `encode_p50`, `encode_p95` |
+| Helper → server: the encoder's output to the daemon reading it (stdout pipe) | page, from the header | host | `helper_p50`, `helper_p95` |
+| In server: read from the helper to written to this viewer's socket (shared buffer, flow control, a write that waits) | server | host | `server_p50`, `server_p95` |
+| Network: written to the socket to the page receiving it (TCP, the TLS proxy, the path) | page minus server | server's, through the ping offset | `network_p50`, `network_p95` |
+| Decode: received to decoded | page | page | `decode_p50`, `decode_p95` |
+| Capture → shown: the frame age | page | server's, through the ping offset | `age_p50`, `age_p95` |
+| Input in server: read from the page to applied (op lock, gesture timing, the helper, AXe for text) | server | host | `input_server_p50`, `input_server_p95` |
+
+The line also has `rtt`, `jitter`, `lost` (percent, last 3 s), `fps`, `transport`, `lease` and `viewer` (the first 6 characters of the session id). The upload of input is about half the round trip; Seiji does not measure it apart. The page's numbers go to the server as `{"t": "telemetry", "report": {"transport", "age", "encode", "helper", "down", "decode", "rtt", "jitter", "lost", "fps"}}`, each stage as `[p50, p95]` in ms (`down` is in server plus network). The server keeps only numbers between 0 and 120 000.
+
+Over WebRTC the page measures only the frame age; the other stages show `—`.
 
 ## Client setup
 

@@ -555,6 +555,24 @@ A view-only session answers `This viewer is view-only.` for every input. Ask for
 
 **Fix:** Pick **Smooth** in the toolbar, or lower `viewer.bitrateKbps` or `viewer.scale` for the host. A long round trip alone (about 140 ms was tested) does not lower the frame rate.
 
+### The picture or input lags, and you need to know where
+
+**Sign:** The frame age in **Stats** (⌥I) is high, or taps answer late.
+
+**Find the stage:** **Stats** lists "Where the time goes": encode, helper → server, in server, network, decode, capture → shown, and input in server, each as p50 / p95 ([mcp.md](mcp.md#where-the-time-goes)). The daemon logs the same numbers every 30 s for each viewer:
+
+```sh
+grep "viewer pipeline" /usr/local/var/log/seiji.log | tail
+```
+
+| The big stage | What it means | What helps |
+|---|---|---|
+| Encode | The Mac's media engine is busy (many watched leases) | Fewer streams, or a lower `viewer.scale` |
+| Helper → server, or in server | The daemon is behind (CPU), or the write waits on the viewer's socket | Check the host's load; "in server" that grows with the network means the link is full |
+| Network | The path between the host and the viewer: the TLS proxy, the internet, the viewer's own link | Compare `rtt` with a ping from the viewer's machine to `1.1.1.1`; pick **Smooth** |
+| Decode | The viewer's machine decodes slowly | Close other video in the browser; a lower `viewer.scale` |
+| Input in server | A run holds the device, or text goes through AXe (about 1 s) | Wait for the run; taps and swipes go through the helper, not AXe |
+
 ### The Tern plugin says the CLI is missing
 
 **Sign:** The plugin shows `The seiji CLI is not on Tern's PATH. Install seiji or set SEIJI_BIN to its path.`

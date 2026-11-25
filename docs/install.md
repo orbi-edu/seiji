@@ -498,7 +498,7 @@ Stopping the daemon releases every device. Tell the users first.
    ```sh
    sudo launchctl bootout system/dev.seiji.daemon
    ```
-4. Install the binaries:
+4. Install the binaries, both of them: a daemon older than its screen helper misreads the helper's frames (a newer daemon reads an older helper's frames).
    ```sh
    sudo install -o root -g wheel -m 755 target/release/seiji /usr/local/bin/seiji
    ```

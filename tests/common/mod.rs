@@ -251,7 +251,8 @@ impl Devices for FakeDevices {
             nal.resize(size.saturating_sub(4).max(nal.len()), 0);
             let mut data = (nal.len() as u32).to_be_bytes().to_vec();
             data.extend_from_slice(&nal);
-            ScreenEvent::Frame(VideoFrame { key, captured_us, data: bytes::Bytes::from(data) })
+            let encoded_us = Some(captured_us + 2_000);
+            ScreenEvent::Frame(VideoFrame { key, captured_us, encoded_us, data: bytes::Bytes::from(data) })
         };
         events.send(ScreenEvent::Ready).await?;
         events.send(ScreenEvent::Format(format)).await?;
