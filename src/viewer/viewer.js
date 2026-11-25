@@ -149,6 +149,7 @@
       retry = 0;
       // A new socket starts a new sample: the old one's round trips say nothing about it.
       rtts.length = 0;
+      resetLoss();
       lastPong = performance.now();
       ping();
       startRtc();
@@ -209,12 +210,40 @@
     lastPong = performance.now();
   }
 
+  // Frames lost on the way, in windows of 3 s, as Moonlight judges a link: poor at 30 % in one
+  // window or 15 % in two in a row, fine again at 5 % or less. Over the WebSocket a lost frame is
+  // one the server skipped for this page (a gap in the frame numbers); over WebRTC, a lost
+  // packet.
+  const loss = { got: 0, lost: 0, since: performance.now(), pct: null, last: 0, poor: false };
+  function countFrames(got, lost) {
+    loss.got += got;
+    loss.lost += lost;
+  }
+  function sampleLoss(now) {
+    if (now - loss.since < 3000) return;
+    const total = loss.got + loss.lost;
+    const pct = total ? (loss.lost * 100) / total : null;
+    if (pct !== null) {
+      if (pct >= 30 || (pct >= 15 && loss.last >= 15)) loss.poor = true;
+      else if (pct <= 5) loss.poor = false;
+      loss.last = pct;
+    }
+    loss.pct = pct;
+    loss.got = 0;
+    loss.lost = 0;
+    loss.since = now;
+  }
+  function resetLoss() {
+    Object.assign(loss, { got: 0, lost: 0, since: performance.now(), pct: null, last: 0, poor: false });
+  }
+
   function renderLink() {
     if (ended) {
       linkEl.hidden = true;
       return;
     }
     const now = performance.now();
+    sampleLoss(now);
     let text;
     let quality;
     if (!ws || ws.readyState !== WebSocket.OPEN) {
@@ -228,6 +257,9 @@
       const j = jitter();
       text = `${Math.round(rtt)} ms ±${Math.round(j)}`;
       quality = rtt < 150 && j < 30 ? "good" : rtt < 350 && j < 100 ? "fair" : "poor";
+      if (loss.pct !== null && loss.pct >= 1) text += ` · ${Math.round(loss.pct)}% lost`;
+      if (loss.poor) quality = "poor";
+      else if (quality === "good" && loss.pct !== null && loss.pct > 5) quality = "fair";
     } else {
       linkEl.hidden = true;
       return;
@@ -235,7 +267,7 @@
     linkEl.textContent = text;
     linkEl.className = `link ${quality}`;
     linkEl.title =
-      "Round trip to the Seiji host, and how much it varies (jitter). " +
+      "Round trip to the Seiji host, how much it varies (jitter), and the share of frames lost on the way. " +
       "Over a poor link the picture and your input lag; Smooth needs less bandwidth.";
     linkEl.hidden = false;
     // Say so once a minute at most, after the link stayed poor for a few seconds.
@@ -327,9 +359,13 @@
     send({ t: "keyframe" });
   }
 
+  // The last frame number seen on the socket, for the frames the server skipped.
+  let lastSeq = null;
+
   function resetVideo() {
     decoding.clear();
     waitingKey = true;
+    lastSeq = null;
   }
 
   function newDecoder() {
@@ -368,8 +404,15 @@
     });
   }
 
+  // While the decoder is being set up, frames are dropped. A still screen sends no more of them,
+  // so a keyframe dropped then is asked for again once the decoder is ready: on a slow link the
+  // format and the first keyframe arrive together, before the setup is done.
+  let configuring = false;
+  let droppedKey = false;
+
   async function configure(f) {
     format = f;
+    configuring = true;
     const config = {
       codec: f.codec,
       codedWidth: f.width,
@@ -392,6 +435,11 @@
     if (!decoder || decoder.state === "closed") decoder = newDecoder();
     decoder.configure(config);
     decoding.clear();
+    configuring = false;
+    if (droppedKey) {
+      droppedKey = false;
+      send({ t: "keyframe" });
+    }
   }
 
   function onFrame(buf) {
@@ -400,13 +448,16 @@
     const seq = view.getUint32(1);
     const capturedUs = Number(view.getBigInt64(5));
     stats.bytes.push([Date.now(), buf.byteLength]);
-    const ready = decoder && decoder.state === "configured";
+    countFrames(1, lastSeq !== null && seq > lastSeq ? seq - lastSeq - 1 : 0);
+    lastSeq = seq;
+    const ready = decoder && decoder.state === "configured" && !configuring;
     if (ready && !key && decoder.decodeQueueSize >= MAX_DECODE_QUEUE) {
       // The decoder is behind: drop up to the next keyframe rather than fall further behind.
       waitingKey = true;
       send({ t: "keyframe" });
     }
     if (!ready || (waitingKey && !key)) {
+      if (!ready && key) droppedKey = true;
       send({ t: "ack", seq });
       return;
     }
@@ -550,15 +601,24 @@
     video.requestVideoFrameCallback(onRtcFrame);
   }
 
-  // The received bytes, for the bitrate in Stats.
+  // The received bytes, for the bitrate in Stats, and the packets lost, for the link badge.
   setInterval(async () => {
     if (!pc || !rtcOn) return;
     let bytes = 0;
+    let got = 0;
+    let lost = 0;
     (await pc.getStats()).forEach((r) => {
-      if (r.type === "inbound-rtp" && r.kind === "video") bytes += r.bytesReceived;
+      if (r.type === "inbound-rtp" && r.kind === "video") {
+        bytes += r.bytesReceived;
+        got += r.packetsReceived;
+        lost += r.packetsLost;
+      }
     });
-    if (rtcBytes !== null) stats.bytes.push([Date.now(), bytes - rtcBytes]);
-    rtcBytes = bytes;
+    if (rtcBytes !== null) {
+      stats.bytes.push([Date.now(), bytes - rtcBytes.bytes]);
+      countFrames(Math.max(0, got - rtcBytes.got), Math.max(0, lost - rtcBytes.lost));
+    }
+    rtcBytes = { bytes, got, lost };
   }, 1000);
 
   // ── stats overlay ──────────────────────────────────────────────────────
@@ -579,6 +639,7 @@
       `Transport: ${rtcOn ? "WebRTC (UDP)" : "WebSocket"}`,
       `Round trip: ${rtt === null ? "—" : `${Math.round(rtt)} ms`}`,
       `Jitter: ${rtts.length < 2 ? "—" : `${Math.round(jitter())} ms`}`,
+      `Lost (3 s): ${loss.pct === null ? "—" : `${loss.pct.toFixed(1)} %`}`,
       `Frame age: ${stats.age === null ? "—" : `${Math.round(stats.age)} ms`}`,
       `Decode queue: ${rtcOn ? "—" : decoder ? decoder.decodeQueueSize : 0}`,
     ];

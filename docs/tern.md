@@ -153,7 +153,7 @@ The screen is H.264 video decoded in the browser (WebCodecs), up to 30 frames a 
 
 When the host has WebRTC on ([configuration.md](configuration.md#webrtc)) and can be reached over UDP, the picture and your input go over WebRTC instead, and **Stats** shows `Transport: WebRTC (UDP)`. A lost packet then holds back only its own frame. When WebRTC cannot connect, the page stays on the WebSocket without a word.
 
-The badge next to the device name shows the link: its round trip and jitter, green when it is good, amber when it is fair, red when it is poor or stalled (`no answer 4 s`). When it stays red, the page says so; pick **Smooth** to need less bandwidth.
+The badge next to the device name shows the link: its round trip and jitter, and the share of frames lost on the way (`3% lost`). It is green when the link is good, amber when it is fair, red when it is poor or stalled (`no answer 4 s`). When it stays red, the page says so; pick **Smooth** to need less bandwidth.
 
 The dot in the toolbar is green while the stream is live, amber while a run uses the device, and red when the device is gone. While a run holds the device, the screen keeps playing but input waits: a tap answers "A run is using the device" instead of mixing with the run's steps.
 
