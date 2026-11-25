@@ -1181,9 +1181,11 @@ async fn an_admin_traces_each_input_and_frame_without_coordinates_or_text() {
     assert_eq!(kinds, ["down", "move", "up", "key", "type"], "{lines:?}");
     let down = of("input")[0];
     assert_eq!(down["ts"], 10.0);
-    let (read, sent, done) = (down["read_us"].as_i64(), down["sent_us"].as_i64(), down["done_us"].as_i64());
+    let us = |v: &Value, k: &str| v[k].as_i64().unwrap_or_else(|| panic!("{k} is not a number: {v}"));
+    let (read, sent, done) = (us(down, "read_us"), us(down, "sent_us"), us(down, "done_us"));
     assert!(read <= sent && sent <= done && down["lease"] == lease.as_str(), "{down}");
-    assert!(of("frame").iter().any(|f| f["written_us"].as_i64() >= f["read_us"].as_i64() && f["capture_us"].is_i64()));
+    let written: Vec<_> = of("frame").into_iter().filter(|f| f["skipped"] == false).collect();
+    assert!(written.iter().any(|f| us(f, "written_us") >= us(f, "read_us") && f["capture_us"].is_i64()), "{written:?}");
     assert_eq!(of("shown")[0]["shown_ms"], 1010.0);
     assert_eq!(of("answer")[0]["capture_us"], 1_000_000);
     assert_eq!(of("shown")[0]["seq"], 1);

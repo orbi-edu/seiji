@@ -42,17 +42,22 @@ impl Trace {
         std::fs::metadata(&self.path).ok().map(|m| m.len())
     }
 
-    /// Starts a new trace, in place of the last one.
+    /// Starts a new trace, in place of the last one. The file is truncated under the lock, so a
+    /// line of the old trace cannot land in the new one.
     pub fn start(&self) -> std::io::Result<()> {
-        let file = OpenOptions::new().create(true).write(true).truncate(true).mode(0o600).open(&self.path)?;
-        *self.file.lock().expect("trace mutex") = Some((file, 0));
+        let mut file = self.file.lock().expect("trace mutex");
+        *file = None;
+        self.on.store(false, Ordering::Relaxed);
+        let new = OpenOptions::new().create(true).write(true).truncate(true).mode(0o600).open(&self.path)?;
+        *file = Some((new, 0));
         self.on.store(true, Ordering::Relaxed);
         Ok(())
     }
 
     pub fn stop(&self) {
+        let mut file = self.file.lock().expect("trace mutex");
         self.on.store(false, Ordering::Relaxed);
-        *self.file.lock().expect("trace mutex") = None;
+        *file = None;
     }
 
     /// Appends the line `event` builds; builds nothing while the trace is off.

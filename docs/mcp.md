@@ -1972,7 +1972,7 @@ The trace holds timings only: no touch coordinates, no keys, no text. Every line
 
 A page learns that the trace is on from its next `server_stats` (within 5 s) and then sends `{"t": "trace", "offset_ms", "rtt_ms", "frames": [[seq, received_ms, shown_ms], …], "inputs": [[ts, seen_ms, capture_us, shown_ms], …]}` every second. A report with more than 1024 frames or inputs gets `bad_request`. Over WebRTC the page reports no `shown` or `answer`.
 
-The lines join on `viewer` plus `ts` (input and answer), `capture_us` (answer and frame) and `seq` (frame and shown). This prints each answered input's way to the screen, the slowest first, in ms:
+The lines join on `viewer` plus `ts` (input and answer), `capture_us` (answer and frame) and `seq` (frame and shown). This prints each answered input's way to the screen, the slowest first, in ms; an answer whose input or frame fell outside the trace (just after it was turned on) is left out:
 
 ```sh
 jq -sc '
@@ -1982,6 +1982,7 @@ jq -sc '
   | map(select(.ev == "answer")
       | $in["\(.viewer) \(.ts)"] as $i | $frame["\(.viewer) \(.capture_us)"] as $f
       | (if $f then $shown["\(.viewer) \($f.seq)"] else null end) as $s
+      | select($i and $f and $s)
       | {kind: $i.kind, total: (.shown_ms - .seen_ms),
          upload: ($i.read_us / 1000 - .seen_ms), lock: $i.lock_ms, pace: $i.pace_ms,
          server: (($i.sent_us - $i.read_us) / 1000), react: ((.capture_us - $i.sent_us) / 1000),
