@@ -411,6 +411,11 @@ async fn serve(config: Config) -> Result<()> {
     pool.spawn_reaper(shutdown.clone());
     let app = http::router(pool.clone(), shutdown.child_token());
     let listener = tokio::net::TcpListener::bind(&addr).await.with_context(|| format!("binding {addr}"))?;
+    // No Nagle: a viewer's small messages (pongs, replies) and the tail of each frame go out at
+    // once, not after the peer acknowledges what came before.
+    let listener = axum::serve::ListenerExt::tap_io(listener, |tcp| {
+        let _ = tcp.set_nodelay(true);
+    });
     tracing::info!("seiji listening on http://{addr}/mcp");
     let releaser = pool.clone();
     axum::serve(listener, app)
