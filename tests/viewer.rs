@@ -417,9 +417,8 @@ async fn a_viewer_a_little_behind_skips_only_frames_nothing_refers_to() {
     }
     let ms = |d: Duration| d.as_millis();
     assert!(frames.iter().any(|((_, _, droppable), at)| *droppable && ms(*at) < 350), "{frames:?}");
-    let late: Vec<_> = frames.iter().filter(|(_, at)| ms(*at) > 420).collect();
-    assert!(!late.is_empty(), "frames that others refer to still come: {frames:?}");
-    assert!(late.iter().all(|((_, _, droppable), _)| !droppable), "only those: {late:?}");
+    let late: Vec<_> = frames.iter().filter(|(_, at)| ms(*at) > 410).collect();
+    assert!(late.iter().all(|((_, _, droppable), _)| !droppable), "only frames others refer to: {late:?}");
 
     // Caught up, the stream goes on frame by frame, without skipping to a keyframe.
     let ((_, last, _), _) = *frames.last().unwrap();
@@ -430,6 +429,11 @@ async fn a_viewer_a_little_behind_skips_only_frames_nothing_refers_to() {
         next.push(seq);
     }
     assert!(next.windows(2).all(|w| w[1] == w[0] + 1), "no resync after a little lag: {next:?}");
+    // What it missed in between were frames nothing refers to: in the fake, the odd deltas.
+    let got: Vec<u32> = frames.iter().map(|((_, seq, _), _)| *seq).chain(next.iter().copied()).collect();
+    let missed: Vec<u32> = (got[0]..next[0]).filter(|s| !got.contains(s)).collect();
+    assert!(!missed.is_empty(), "something was skipped while behind: {got:?}");
+    assert!(missed.iter().all(|s| s % 2 == 1 && s % 10 != 0), "only unreferenced frames: {missed:?}");
 }
 
 #[tokio::test]
