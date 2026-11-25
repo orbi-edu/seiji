@@ -93,6 +93,10 @@ const RATE_UP: f64 = 1.15;
 const RATE_FLOOR: f64 = 0.2;
 const RATE_STEP: Duration = Duration::from_secs(2);
 const RATE_CALM: Duration = Duration::from_secs(4);
+/// A WebRTC estimate never takes the stream below this many bits per second.
+const CAP_FLOOR: u32 = 150_000;
+/// A rising WebRTC estimate raises the stream at most this often.
+const CAP_STEP: Duration = Duration::from_secs(1);
 /// WebSocket close codes the page acts on: open a new link, or the device is gone.
 const CLOSE_EXPIRED: u16 = 4401;
 const CLOSE_GONE: u16 = 4410;
@@ -175,6 +179,40 @@ struct Rate {
     bitrate: u32,
     changed_at: Instant,
     congested_at: Option<Instant>,
+    /// The bandwidth estimate of each WebRTC viewer: the stream never goes above the lowest.
+    caps: HashMap<u64, u32>,
+    /// What the helper was last told, and when a cap last changed it.
+    sent: u32,
+    capped_at: Instant,
+}
+
+impl Rate {
+    fn new(preset: StreamPreset, target: StreamOpts, caps: HashMap<u64, u32>) -> Self {
+        let now = Instant::now();
+        Self {
+            preset,
+            target,
+            bitrate: target.bitrate,
+            // The first congestion may cut the bitrate at once.
+            changed_at: now.checked_sub(RATE_STEP).unwrap_or(now),
+            congested_at: None,
+            caps,
+            sent: target.bitrate,
+            capped_at: now,
+        }
+    }
+
+    /// The adapted bitrate, held under the lowest WebRTC estimate.
+    fn effective(&self) -> u32 {
+        let cap = self.caps.values().min().map_or(u32::MAX, |c| (*c).max(CAP_FLOOR));
+        self.bitrate.min(cap)
+    }
+
+    /// The options to send to the helper, noted as sent.
+    fn send(&mut self) -> StreamOpts {
+        self.sent = self.effective();
+        StreamOpts { bitrate: self.sent, ..self.target }
+    }
 }
 
 /// One helper per watched lease, shared by its viewers.
@@ -189,6 +227,8 @@ struct Hub {
     /// Viewer inputs that hold the lease's op lock: the page does not call that busy.
     holding: AtomicUsize,
     next_seq: AtomicU64,
+    /// Names each WebRTC viewer's bandwidth cap.
+    next_cap: AtomicU64,
     rate: StdMutex<Rate>,
     keyframe_at: StdMutex<Option<Instant>>,
     /// A keyframe was asked for inside `KEYFRAME_GAP`, or the helper was not there to take it.
@@ -207,14 +247,8 @@ impl Hub {
             viewers: AtomicUsize::new(0),
             holding: AtomicUsize::new(0),
             next_seq: AtomicU64::new(0),
-            rate: StdMutex::new(Rate {
-                preset: StreamPreset::Balanced,
-                target,
-                bitrate: target.bitrate,
-                // The first congestion may cut the bitrate at once.
-                changed_at: Instant::now().checked_sub(RATE_STEP).unwrap_or_else(Instant::now),
-                congested_at: None,
-            }),
+            next_cap: AtomicU64::new(0),
+            rate: StdMutex::new(Rate::new(StreamPreset::Balanced, target, HashMap::new())),
             keyframe_at: StdMutex::new(None),
             keyframe_pending: AtomicBool::new(false),
             stats: StreamStats {
@@ -256,7 +290,28 @@ impl Hub {
 
     fn opts(&self) -> StreamOpts {
         let rate = self.rate.lock().expect("rate mutex");
-        StreamOpts { bitrate: rate.bitrate, ..rate.target }
+        StreamOpts { bitrate: rate.effective(), ..rate.target }
+    }
+
+    /// A WebRTC viewer's bandwidth estimate (`None` when it leaves). The stream follows a falling
+    /// estimate at once and a rising one at most every `CAP_STEP`, by 10 % or more, so the
+    /// sender's pacer never holds frames back.
+    fn cap(&self, id: u64, estimate: Option<u32>) {
+        let opts = {
+            let mut rate = self.rate.lock().expect("rate mutex");
+            match estimate {
+                Some(e) => rate.caps.insert(id, e),
+                None => rate.caps.remove(&id),
+            };
+            let next = rate.effective();
+            let change = (f64::from(next) - f64::from(rate.sent)).abs() / f64::from(rate.sent.max(1));
+            if change < 0.1 || (next > rate.sent && rate.capped_at.elapsed() < CAP_STEP) {
+                return;
+            }
+            rate.capped_at = Instant::now();
+            rate.send()
+        };
+        self.send(ScreenCommand::Encode(opts));
     }
 
     /// Asks for a keyframe. A request within `KEYFRAME_GAP` of the last one stays pending and
@@ -288,7 +343,7 @@ impl Hub {
             }
             rate.bitrate = ((f64::from(rate.bitrate) * RATE_DOWN) as u32).max(floor);
             rate.changed_at = Instant::now();
-            StreamOpts { bitrate: rate.bitrate, ..rate.target }
+            rate.send()
         };
         self.send(ScreenCommand::Encode(opts));
     }
@@ -303,18 +358,18 @@ impl Hub {
             }
             rate.bitrate = ((f64::from(rate.bitrate) * RATE_UP) as u32).min(rate.target.bitrate);
             rate.changed_at = Instant::now();
-            StreamOpts { bitrate: rate.bitrate, ..rate.target }
+            rate.send()
         };
         self.send(ScreenCommand::Encode(opts));
     }
 
     fn set_preset(&self, preset: StreamPreset, cfg: &crate::config::Viewer) -> StreamOpts {
-        let opts = preset.opts(cfg);
-        {
+        let opts = {
             let mut rate = self.rate.lock().expect("rate mutex");
-            *rate =
-                Rate { preset, target: opts, bitrate: opts.bitrate, changed_at: Instant::now(), congested_at: None };
-        }
+            let caps = std::mem::take(&mut rate.caps);
+            *rate = Rate::new(preset, preset.opts(cfg), caps);
+            rate.send()
+        };
         self.send(ScreenCommand::Encode(opts));
         opts
     }

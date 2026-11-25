@@ -1885,7 +1885,8 @@ Points without `ts` go at once, as before.
 ### What the page shows
 
 - **Feedback at once:** the finger's position while it is down, its path for the last 400 ms, and a ripple where a tap landed. The page draws them before the device answers.
-- **Link:** a badge with the last round trip and the jitter (the mean change between the last 10 round trips): green under 150 ms and 30 ms, amber under 350 ms and 100 ms, red above, and red with `no answer N s` when no `pong` came back for 3 s. After 3 s of red, the page says once a minute that the picture and input lag, and that Smooth needs less bandwidth. **Stats** also shows the jitter.
+- **Link:** a badge with the last round trip and the jitter (the mean change between the last 10 round trips): green under 150 ms and 30 ms, amber under 350 ms and 100 ms, red above, and red with `no answer N s` when no `pong` came back for 3 s. It also counts what is lost on the way in windows of 3 s, as Moonlight does: frames the server skipped for this page (gaps in the frame numbers) over the WebSocket, packets over WebRTC. It shows `N% lost`, turns red at 30 % in one window or 15 % in two in a row, and is fine again at 5 % or less; over 5 % it is at best amber. After 3 s of red, the page says once a minute that the picture and input lag, and that Smooth needs less bandwidth. **Stats** also shows the jitter and the loss.
+- **A keyframe dropped during setup is asked for again.** On a slow link the format and the first keyframe can arrive together, before the decoder is set up. The page drops what arrives meanwhile and, if a keyframe was among it, asks for one with `keyframe`, so a still screen does not stay on "Connecting…".
 
 ## Client setup
 

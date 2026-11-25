@@ -10,6 +10,7 @@
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use axum::extract::ws::Message;
@@ -36,8 +37,11 @@ const CONNECT_WITHIN: Duration = Duration::from_secs(15);
 const DATAGRAM: usize = 2000;
 /// The data channel the page sends its input on.
 const INPUT_CHANNEL: &str = "input";
-/// An estimate below this share of the stream's bitrate lowers the shared bitrate.
-const ESTIMATE_LOW: f64 = 0.9;
+/// The stream takes this share of the bandwidth estimate, and leaves the rest for
+/// retransmissions, RTCP and the input channel.
+const ESTIMATE_SHARE: f64 = 0.85;
+/// The lowest rate the estimator holds traffic at.
+const BWE_MIN: u64 = 150_000;
 
 /// A running WebRTC session; dropping it ends the session.
 pub(super) struct RtcSession {
@@ -94,10 +98,14 @@ pub(super) async fn start(cfg: &Webrtc, offer: &str, peer: Peer) -> Result<(Stri
     }
     let answer =
         rtc.sdp_api().accept_offer(offer).map_err(|e| ViewError::Bad(format!("the offer cannot be answered: {e}")))?;
+    // Probe up to the preset's bitrate, not past it.
+    let desired = u64::from(peer.hub.rate.lock().expect("rate mutex").target.bitrate);
+    rtc.bwe().set_bitrate(Bitrate::bps(BWE_MIN), Bitrate::bps(desired));
     let stop = CancellationToken::new();
     let video = peer.hub.video.subscribe();
     let params = peer.hub.format.lock().expect("format mutex").as_deref().and_then(parameter_sets);
-    let state = State { mid: None, pt: None, channel: None, params, need_key: true, connected: false };
+    let cap = peer.hub.next_cap.fetch_add(1, Ordering::Relaxed);
+    let state = State { mid: None, pt: None, channel: None, params, need_key: true, connected: false, cap };
     let task = tokio::spawn(run(rtc, socket, locals, video, peer, state, stop.clone()));
     Ok((answer.to_sdp_string(), RtcSession { stop, task: Some(task) }))
 }
@@ -126,6 +134,8 @@ struct State {
     params: Option<Params>,
     need_key: bool,
     connected: bool,
+    /// This session's name for its bandwidth cap on the shared stream.
+    cap: u64,
 }
 
 async fn run(
@@ -171,6 +181,7 @@ async fn run(
         }
     }
     rtc.disconnect();
+    peer.hub.cap(s.cap, None);
 }
 
 /// Sends what `rtc` has to send and handles its events. `None`: the session is over.
@@ -207,11 +218,11 @@ impl State {
             Event::ChannelOpen(id, label) if label == INPUT_CHANNEL => self.channel = Some(id),
             Event::ChannelData(d) => self.on_input(rtc, &d, peer),
             Event::KeyframeRequest(_) => peer.hub.keyframe(false),
+            // The sender's pacer holds back what goes above the estimate, up to 2 s of it: keep
+            // the shared stream under it instead.
             Event::EgressBitrateEstimate(BweKind::Twcc { estimate, .. }) => {
-                let target = peer.hub.opts().bitrate;
-                if (estimate.as_u64() as f64) < f64::from(target) * ESTIMATE_LOW {
-                    peer.hub.congested();
-                }
+                let share = (estimate.as_u64() as f64 * ESTIMATE_SHARE).min(f64::from(u32::MAX)) as u32;
+                peer.hub.cap(self.cap, Some(share));
             }
             _ => {}
         }

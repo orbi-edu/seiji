@@ -281,7 +281,17 @@ Before this version the viewer streamed JPEG and took `viewer.quality`. That key
 
 ### WebRTC
 
-With `viewer.webrtc.enabled`, the page offers a WebRTC session over its WebSocket. Seiji answers it on one UDP port from `ports`, with a candidate for each address in `candidates`. The page then gets the stream as H.264 over SRTP and sends its input on a data channel, while the WebSocket keeps the replies and the presets. A lost packet holds back only its own frame, not the input or the frames after it, so a lossy link shows a stall less often. On a clean link WebRTC adds about 20 ms (the browser's packet pacing and decode); the page asks the browser to play each frame at once, without a jitter buffer.
+With `viewer.webrtc.enabled`, the page offers a WebRTC session over its WebSocket. Seiji answers it on one UDP port from `ports`, with a candidate for each address in `candidates`. The page then gets the stream as H.264 over SRTP and sends its input on a data channel, while the WebSocket keeps the replies and the presets. The page asks the browser to play each frame at once, without a jitter buffer.
+
+Turn it on only after you measure your users' links. On an emulated link of 150 ms round trip and 4 Mbit/s (a real simulator, Chrome in Tern), the frame age at p50 and p90 and the frames per second were:
+
+| Link | WebSocket | WebRTC |
+|---|---|---|
+| Clean | 131 / 225 ms, 22 fps | 112 / 132 ms, 26 fps |
+| ±60 ms jitter, 0.3 % loss | 132 / 245 ms, 18 fps | 154 / 842 ms, 13 fps |
+| ±20 ms jitter, 2 % loss | 150 / 401 ms, 19 fps | 128 / 700 ms, 11 fps |
+
+WebRTC wins on a clean link and loses on a bad one. Seiji sends no FEC (`str0m` has none for video), so a lost packet costs a retransmission and holds back the frames after it for a round trip. Jitter also makes the bandwidth estimate fall, and with it the bitrate. The WebSocket's own flow control copes better with both.
 
 Seiji is ICE-lite and uses no STUN or TURN server: the page must reach one of `candidates` over UDP, on the ports in `ports`. When it cannot (the ports are closed, the page is behind a proxy that carries only HTTPS), the page stays on the WebSocket after 10 s and says nothing. On EC2, `candidates` is the instance's public address (or its private one, for pages that reach it over a VPN), and the security group must allow UDP on `ports` from the pages' networks ([install.md](install.md#webrtc)).
 

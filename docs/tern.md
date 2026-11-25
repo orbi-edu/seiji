@@ -151,7 +151,7 @@ The panel polls `budget_status` every 3 s and `list_runs` every 10 s while the R
 
 The screen is H.264 video decoded in the browser (WebCodecs), up to 30 frames a second. Your input shows at once, before the device answers: a dot where your finger is, its path as you drag, and a ripple where a tap landed. On a slow link the picture skips frames rather than falling behind, and the bitrate drops until the link recovers. A swipe that the link delayed still reaches the device with its own speed ([mcp.md](mcp.md#gesture-timing)).
 
-When the host has WebRTC on ([configuration.md](configuration.md#webrtc)) and can be reached over UDP, the picture and your input go over WebRTC instead, and **Stats** shows `Transport: WebRTC (UDP)`. A lost packet then holds back only its own frame. When WebRTC cannot connect, the page stays on the WebSocket without a word.
+When the host has WebRTC on ([configuration.md](configuration.md#webrtc)) and can be reached over UDP, the picture and your input go over WebRTC instead, and **Stats** shows `Transport: WebRTC (UDP)`. When WebRTC cannot connect, the page stays on the WebSocket without a word.
 
 The badge next to the device name shows the link: its round trip and jitter, and the share of frames lost on the way (`3% lost`). It is green when the link is good, amber when it is fair, red when it is poor or stalled (`no answer 4 s`). When it stays red, the page says so; pick **Smooth** to need less bandwidth.
 
