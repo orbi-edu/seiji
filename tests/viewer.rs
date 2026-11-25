@@ -732,6 +732,37 @@ async fn paste_puts_text_on_pasteboard_and_respects_guards() {
 }
 
 #[tokio::test]
+async fn the_page_learns_where_its_frames_and_input_spend_time() {
+    let env = setup(2).await;
+    let (token, lease) = device(&env, "alice").await;
+    let mut ws = open(&env, &token, &lease, true).await.ws().await;
+    format(&mut ws).await;
+    send(&mut ws, json!({"t": "touch", "phase": "down", "x": 0.5, "y": 0.5})).await;
+    send(&mut ws, json!({"t": "touch", "phase": "up", "x": 0.5, "y": 0.5})).await;
+    // A report from the page is taken quietly; one with a field the server does not know is not.
+    let report = json!({"transport": "ws", "age": [80.5, 140.0], "down": [70.0, 120.0], "rtt": 140, "lost": 0});
+    send(&mut ws, json!({"t": "telemetry", "report": report})).await;
+    send(&mut ws, json!({"t": "telemetry", "report": {"cpu": 99}})).await;
+    assert_eq!(text(&mut ws).await["code"], "bad_request");
+
+    // Every 5 s the page gets the server's part: frames read from the helper to written to its
+    // socket, and input read from the page to applied.
+    let stats = within("server_stats", async {
+        loop {
+            let v = text(&mut ws).await;
+            if v["t"] == "server_stats" && v["server"].is_array() && v["input"].is_array() {
+                return v;
+            }
+        }
+    })
+    .await;
+    let p50 = stats["server"][0].as_f64().unwrap();
+    let p95 = stats["server"][1].as_f64().unwrap();
+    assert!((0.0..1000.0).contains(&p50) && p50 <= p95, "{stats}");
+    assert!(stats["input"][0].as_f64().unwrap() >= 0.0, "{stats}");
+}
+
+#[tokio::test]
 async fn presets_and_stats_describe_the_shared_stream() {
     let env = setup_with(2, json!({"viewer": {"fps": 20}})).await;
     let (token, lease) = device(&env, "alice").await;

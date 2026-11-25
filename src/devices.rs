@@ -77,6 +77,8 @@ pub struct VideoFrame {
     pub key: bool,
     /// Unix microseconds when the helper captured the screen.
     pub captured_us: i64,
+    /// Unix microseconds when the encoder handed the frame over; `None` from an older helper.
+    pub encoded_us: Option<i64>,
     /// AVCC: a 4-byte big-endian length before each NAL unit.
     pub data: Bytes,
 }
@@ -478,12 +480,22 @@ fn parse_message(kind: u8, payload: Vec<u8>) -> Result<Option<ScreenEvent>> {
     match kind {
         MSG_FORMAT => Ok(Some(ScreenEvent::Format(parse_format(&payload)?))),
         MSG_FRAME => {
-            if payload.len() < 10 {
+            // Flags (bit 0: keyframe; bit 1: the encode time follows), capture time, [encode time,]
+            // then the sample.
+            let timed = payload.first().is_some_and(|f| f & 2 == 2);
+            let header = if timed { 17 } else { 9 };
+            if payload.len() <= header {
                 bail!("a {}-byte frame", payload.len());
             }
-            let captured_us = i64::from_be_bytes(payload[1..9].try_into().expect("8 bytes"));
             let key = payload[0] & 1 == 1;
-            Ok(Some(ScreenEvent::Frame(VideoFrame { key, captured_us, data: Bytes::from(payload).slice(9..) })))
+            let captured_us = i64::from_be_bytes(payload[1..9].try_into().expect("8 bytes"));
+            let encoded_us = timed.then(|| i64::from_be_bytes(payload[9..17].try_into().expect("8 bytes")));
+            Ok(Some(ScreenEvent::Frame(VideoFrame {
+                key,
+                captured_us,
+                encoded_us,
+                data: Bytes::from(payload).slice(header..),
+            })))
         }
         MSG_STATUS => {
             let v: serde_json::Value = serde_json::from_slice(&payload).context("status is not JSON")?;
@@ -1030,6 +1042,14 @@ mod tests {
         assert!(f.key);
         assert_eq!(f.captured_us, 1_795_548_363_000_000);
         assert_eq!(&f.data[..], &[0, 0, 0, 1, 0x65]);
+        let mut timed = vec![3u8];
+        timed.extend_from_slice(&1_795_548_363_000_000i64.to_be_bytes());
+        timed.extend_from_slice(&1_795_548_363_004_000i64.to_be_bytes());
+        timed.extend_from_slice(&[0, 0, 0, 1, 0x65]);
+        let Some(ScreenEvent::Frame(f)) = parse_message(MSG_FRAME, timed).unwrap() else { panic!() };
+        assert_eq!((f.key, f.encoded_us), (true, Some(1_795_548_363_004_000)));
+        assert_eq!(&f.data[..], &[0, 0, 0, 1, 0x65]);
+        assert!(parse_message(MSG_FRAME, vec![3; 17]).is_err(), "a timed frame needs a sample");
         assert!(parse_message(MSG_FRAME, vec![1; 9]).is_err(), "a frame needs a sample");
         assert!(parse_message(9, vec![]).is_err(), "unknown kinds end the stream");
 

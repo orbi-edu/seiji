@@ -70,7 +70,7 @@ pub(super) struct Peer {
     pub hub: Arc<Hub>,
     pub control: bool,
     /// The session's input queue, shared with the WebSocket.
-    pub input: mpsc::Sender<ClientMsg>,
+    pub input: mpsc::Sender<super::Queued>,
     /// Replies, over the WebSocket.
     pub out: mpsc::Sender<Message>,
 }
@@ -252,7 +252,7 @@ impl State {
                 if !peer.control {
                     view_only(t)
                 } else {
-                    peer.input.try_send(msg).err().map(|_| ViewError::Busy.message(None))
+                    peer.input.try_send((msg, Instant::now())).err().map(|_| ViewError::Busy.message(None))
                 }
             }
             Ok(_) => Some(ViewError::Bad("the input channel takes input and pings only".into()).message(None)),
@@ -285,7 +285,7 @@ impl State {
         }
         let (Some(mid), Some(pt), Some(params)) = (self.mid, self.pt, self.params.as_ref()) else { return true };
         let m = &f.message;
-        let captured_us = i64::from_be_bytes(m[5..FRAME_HEADER].try_into().expect("8 bytes")).max(0) as u64;
+        let captured_us = i64::from_be_bytes(m[5..13].try_into().expect("8 bytes")).max(0) as u64;
         let Some(data) = annex_b(&m[FRAME_HEADER..], params, f.key) else { return true };
         let Some(writer) = rtc.writer(mid) else { return true };
         // RTP time is the capture time at 90 kHz, so the page can tell the frame's age. A
