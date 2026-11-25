@@ -422,7 +422,9 @@
   // link.
   const decoding = new Map();
   // At most this many frames wait in the decoder; past it, frames are dropped up to a keyframe.
-  const MAX_DECODE_QUEUE = 3;
+  // A jittery link delivers frames in bursts: the decoder takes 2–5 ms a frame and catches up,
+  // where a drop costs a keyframe's round trip.
+  const MAX_DECODE_QUEUE = 16;
 
   function base64Bytes(s) {
     const bin = atob(s);
@@ -491,11 +493,14 @@
     });
   }
 
-  // While the decoder is being set up, frames are dropped. A still screen sends no more of them,
-  // so a keyframe dropped then is asked for again once the decoder is ready: on a slow link the
-  // format and the first keyframe arrive together, before the setup is done.
+  // While the decoder is being set up, frames from a keyframe on are held and decoded once it is
+  // done, so the stream starts without asking for another keyframe. A keyframe dropped anyway
+  // (none was held) is asked for again once the decoder is ready: on a slow link the format and
+  // the first keyframe arrive together, before the setup is done.
   let configuring = false;
   let droppedKey = false;
+  let held = [];
+  const MAX_HELD = 60;
 
   async function configure(f) {
     format = f;
@@ -523,9 +528,12 @@
     decoder.configure(config);
     decoding.clear();
     configuring = false;
+    const queued = held;
+    held = [];
+    for (const [seq, key, capturedUs, buf] of queued) decode(seq, key, capturedUs, buf);
     if (droppedKey) {
       droppedKey = false;
-      send({ t: "keyframe" });
+      if (!queued.length) send({ t: "keyframe" });
     }
   }
 
@@ -549,11 +557,21 @@
       waitingKey = true;
       send({ t: "keyframe" });
     }
+    if (!ready && configuring && (key || held.length) && held.length < MAX_HELD) {
+      if (key) held = [];
+      held.push([seq, key, capturedUs, buf]);
+      return;
+    }
     if (!ready || (waitingKey && !key)) {
       if (!ready && key) droppedKey = true;
+      if (!ready) held = [];
       send({ t: "ack", seq });
       return;
     }
+    decode(seq, key, capturedUs, buf);
+  }
+
+  function decode(seq, key, capturedUs, buf) {
     waitingKey = false;
     decoding.set(capturedUs, [seq, performance.now()]);
     decoder.decode(new EncodedVideoChunk({ type: key ? "key" : "delta", timestamp: capturedUs, data: new Uint8Array(buf, 29) }));

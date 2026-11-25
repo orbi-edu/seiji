@@ -35,6 +35,9 @@ final class Encoder {
     /// The last keyframe was over the payload limit; set until a keyframe is written or the
     /// session changes, so an unchanged screen does not keep encoding one that is too big again.
     private var keyframeTooBig = false
+    /// A forced keyframe is being encoded. The frames behind it are not forced too: with three
+    /// frames in flight, a request (or the start) would otherwise send three keyframes in a row.
+    private var keyframeInFlight = false
     /// Encoded frames not written (stdout backlog or over the payload limit).
     private var dropped = 0
     /// Flags, capture time and encode time before each sample.
@@ -74,6 +77,7 @@ final class Encoder {
         lock.lock()
         needKeyframe = true
         keyframeTooBig = false
+        keyframeInFlight = false
         lock.unlock()
         generation += 1
         stream = Stream(generation: generation, width: width, height: height, screen: screen)
@@ -104,7 +108,9 @@ final class Encoder {
     func encode(_ buffer: CVPixelBuffer, capturedMicros: UInt64, forceKeyframe: Bool) {
         guard let session, let stream else { return }
         lock.lock()
-        let keyframe = forceKeyframe || needKeyframe
+        // A keyframe already on its way serves this request too: it reaches every viewer after it.
+        let keyframe = (forceKeyframe || needKeyframe) && !keyframeInFlight
+        if keyframe { keyframeInFlight = true }
         inFlight += 1
         lock.unlock()
         let properties: CFDictionary? = keyframe
@@ -121,6 +127,7 @@ final class Encoder {
             lock.lock()
             inFlight -= 1
             needKeyframe = true
+            if keyframe { keyframeInFlight = false }
             lock.unlock()
             debugLog("VTCompressionSessionEncodeFrame failed: \(status)")
         }
@@ -133,6 +140,7 @@ final class Encoder {
         lock.lock()
         defer { lock.unlock() }
         inFlight -= 1
+        if requestedKeyframe { keyframeInFlight = false }
         // The rate control skipped this frame: nothing refers to it, so the stream goes on. Only
         // a keyframe that was asked for is still owed. (Forcing one after every skip makes things
         // worse at a low bitrate: each keyframe is skipped or makes the next frame skip, and the
@@ -311,10 +319,14 @@ final class Encoder {
         set(session, kVTCompressionPropertyKey_AverageBitRate, NSNumber(value: bitrate))
         set(session, kVTCompressionPropertyKey_DataRateLimits, dataRateLimits())
         set(session, kVTCompressionPropertyKey_ExpectedFrameRate, NSNumber(value: fps))
-        // Viewers ask for a keyframe when they need one (joining, falling behind, a lost frame),
-        // so a periodic one is only a safety net: on a slow link each keyframe is a burst that
-        // delays the frames behind it.
-        set(session, kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, NSNumber(value: 10))
+        // Viewers ask for a keyframe when they need one (joining, falling behind, a decoder
+        // error), and the WebSocket loses nothing, so there is no periodic one: on a slow link
+        // each keyframe (2-4 times a delta frame) is a burst that delays the frames behind it.
+        set(session, kVTCompressionPropertyKey_MaxKeyFrameInterval, NSNumber(value: 0))
+        set(session, kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, NSNumber(value: 0))
+        // Two temporal layers: every other frame is one nothing refers to, so the daemon can skip
+        // it for a viewer that falls behind and go on without a keyframe.
+        set(session, kVTCompressionPropertyKey_BaseLayerFrameRateFraction, NSNumber(value: 0.5))
         let prepared = VTCompressionSessionPrepareToEncodeFrames(session)
         guard prepared == noErr else {
             VTCompressionSessionInvalidate(session)

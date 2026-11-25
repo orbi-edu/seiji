@@ -246,7 +246,16 @@ impl Devices for FakeDevices {
             let captured_us =
                 std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_micros()
                     as i64;
-            let mut nal = vec![if key { 0x65 } else { 0x41 }];
+            // As with the encoder's two temporal layers, every other delta is one nothing refers
+            // to (`nal_ref_idc` 0).
+            let header = if key {
+                0x65
+            } else if n % 2 == 1 {
+                0x01
+            } else {
+                0x41
+            };
+            let mut nal = vec![header];
             nal.extend_from_slice(&n.to_be_bytes());
             nal.resize(size.saturating_sub(4).max(nal.len()), 0);
             let mut data = (nal.len() as u32).to_be_bytes().to_vec();

@@ -169,6 +169,8 @@ struct Encoded {
     /// The hub's frame number; viewers acknowledge it.
     seq: u32,
     key: bool,
+    /// No other frame refers to it: a viewer may skip it without a keyframe after.
+    droppable: bool,
     /// Unix microseconds when the daemon read the frame from the helper.
     received_us: i64,
     /// The whole binary WebSocket message.
@@ -418,7 +420,26 @@ fn frame_message(seq: u32, f: &VideoFrame, received_us: i64) -> Encoded {
     out.extend_from_slice(&f.encoded_us.unwrap_or(f.captured_us).to_be_bytes());
     out.extend_from_slice(&received_us.to_be_bytes());
     out.extend_from_slice(&f.data);
-    Encoded { seq, key: f.key, received_us, message: Bytes::from(out) }
+    Encoded { seq, key: f.key, droppable: !f.key && unreferenced(&f.data), received_us, message: Bytes::from(out) }
+}
+
+/// Whether no other frame refers to this AVCC sample: every slice in it has `nal_ref_idc` 0
+/// (the encoder's temporal layers make every other frame such). A viewer can skip it and decode
+/// on without a keyframe. The helper's output is untrusted: anything odd counts as referenced.
+fn unreferenced(mut avcc: &[u8]) -> bool {
+    let mut slices = 0;
+    while avcc.len() >= 5 {
+        let len = u32::from_be_bytes([avcc[0], avcc[1], avcc[2], avcc[3]]) as usize;
+        let Some(nal) = avcc.get(4..4 + len) else { return false };
+        let Some(&header) = nal.first() else { return false };
+        match header & 0x1f {
+            1 | 5 if header & 0x60 != 0 => return false,
+            1 | 5 => slices += 1,
+            _ => {}
+        }
+        avcc = &avcc[4 + len..];
+    }
+    slices > 0 && avcc.is_empty()
 }
 
 /// Tickets, sessions, the one helper per watched lease, and the settings an admin can change
@@ -1014,7 +1035,17 @@ impl Flow {
             || self.in_flight.front().is_some_and(|(_, at)| at.elapsed() > self.limit())
     }
 
+    /// Half way to `queued`: the viewer falls behind, but skipping frames that nothing refers to
+    /// may be enough. It costs no keyframe, where `queued` costs one.
+    fn behind(&self) -> bool {
+        let half = self.base_rtt.map_or(FIRST_RTT, |(rtt, _)| rtt) + QUEUE_BUDGET / 2;
+        self.in_flight.len() >= MAX_IN_FLIGHT / 2 || self.in_flight.front().is_some_and(|(_, at)| at.elapsed() > half)
+    }
+
     fn admit(&mut self, f: &Encoded, hub: &Hub) -> bool {
+        if f.droppable && !self.need_key && self.behind() {
+            return false;
+        }
         if self.queued() {
             hub.congested();
             self.need_key = true;
@@ -1175,6 +1206,7 @@ async fn session(live: Live, mut video: broadcast::Receiver<Video>, socket: WebS
                             "ev": "frame", "lease": live.ctx.lease_id, "viewer": viewer, "seq": f.seq, "key": f.key,
                             "bytes": f.message.len(), "capture_us": at(5), "encode_us": at(13),
                             "read_us": f.received_us, "written_us": sent.then_some(written_us), "skipped": !sent,
+                            "droppable": f.droppable,
                         })
                     });
                 }
