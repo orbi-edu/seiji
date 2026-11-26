@@ -1493,7 +1493,7 @@ These routes exist besides `/mcp`. Error bodies of `/v1/apps`, `/v1/runs/…` an
 | `GET /v1/runs/{run_id}/files/{*path}` | Bearer token | `200`, one file of the run |
 | `GET /v1/runs/{run_id}/evidence.zip` | Bearer token | `200`, the whole run as a zip |
 | `GET /v1/runs/{run_id}/report.md` | Bearer token | `200`, the Markdown of `export_evidence` |
-| `GET /v1/me` | Bearer token | `200` `{"user", "quota", "is_admin"}` |
+| `GET /v1/me` | Bearer token | `200` `{"user", "quota", "is_admin", "server"}` |
 | `GET /v1/admin/users` | Bearer token (admin) | `200` `{"users", "capacity", "in_use"}` |
 | `PUT /v1/admin/users/{id}/limits` | Bearer token (admin) | `200`, updated user entry |
 | `GET /v1/admin/leases` | Bearer token (admin) | `200` `{"leases"}`, every active lease with its user |
@@ -1642,13 +1642,15 @@ Returns the Markdown of [`export_evidence`](#export_evidence) with `Content-Type
 
 ### `GET /v1/me`
 
-Returns the user that the token belongs to, its quota and whether the user is an admin. `seiji login` and the Tern plugin use it to check a token ([cli.md](cli.md#seiji-login)).
+Returns the user that the token belongs to, its quota, whether the user is an admin, and the server's build. `seiji login` and the Tern plugin use it to check a token ([cli.md](cli.md#seiji-login)).
 
 ```json
-{"user": "alice", "quota": {"monthlyMinutes": 1200, "monthlyUnlimited": false, "maxConcurrent": 2, "maxLeaseMinutes": 60, "idleMinutes": 15}, "is_admin": true}
+{"user": "alice", "quota": {"monthlyMinutes": 1200, "monthlyUnlimited": false, "maxConcurrent": 2, "maxLeaseMinutes": 60, "idleMinutes": 15}, "is_admin": true, "server": {"version": "0.1.0", "commit": "f05d477e95a5d0200598d40e2d87f0576c63f308"}}
 ```
 
 `is_admin` is `true` when the user's name is in `adminUsers` ([configuration.md](configuration.md#adminusers)). Clients use it to show or hide the admin UI; the server enforces permission on every admin request.
+
+`server.commit` is the full git commit the server is built from, or `null` for a build outside a git checkout. [`seiji update`](cli.md#seiji-update) brings the CLI and the Tern plugin to it.
 
 ### `GET /v1/admin/users`
 

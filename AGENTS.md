@@ -36,7 +36,8 @@ document in the same commit.
 
 | Path | Contents |
 |---|---|
-| `src/main.rs` | The `seiji` CLI: `serve`, `user`, `usage`, `tenant`, `doctor`, the client commands `login`, `logout`, `token print` and `forward`, and the hidden root helpers. |
+| `build.rs` | Records the git commit the binary is built from (`SEIJI_COMMIT`, `seiji --version`). |
+| `src/main.rs` | The `seiji` CLI: `serve`, `user`, `usage`, `tenant`, `doctor`, the client commands `login`, `logout`, `token print`, `update` and `forward`, and the hidden root helpers. |
 | `src/config.rs` | `seiji.json`: types, defaults, validation. |
 | `src/store.rs` | SQLite: users, leases (the usage ledger), builds, runs. Month windows and token hashing. |
 | `src/pool.rs` | Admission, acquire and release, operations on a lease, the reaper, recovery. |
@@ -54,7 +55,7 @@ document in the same commit.
 | `src/viewer/` | The viewer page assets, embedded in the binary: `index.html`, `viewer.js` (WebCodecs decoding, WebRTC, touch, keys, the pipeline timings), `viewer.css`. `rtc.rs`: WebRTC for a viewer session (`str0m`, one UDP port per session). Security-critical. `pipeline.rs`: where a viewer's frames and input spend their time, for Stats and the log. |
 | `sim/` | `seiji-sim`, the Swift screen helper of the viewer: framebuffer capture, H.264 encoding, persistent HID input. Built with `swiftc` on the host ([sim/README.md](sim/README.md)). |
 | `src/forward.rs` | `seiji forward`: the tunnel protocol (hello, OPEN, DATA and CLOSE frames), tunnel admission and the server loop on a loopback port, and the client end that dials one local port. |
-| `src/client.rs` | The client commands on a developer's Mac: `login` (token into the keychain), `logout`, `token print`, and `forward` (picks the lease, runs the tunnel, points the app at it). |
+| `src/client.rs` | The client commands on a developer's Mac: `login` (token into the keychain), `logout`, `token print`, `update` (brings the CLI and the Tern plugin to the server's commit), and `forward` (picks the lease, runs the tunnel, points the app at it). |
 | `tern-plugin/` | The Tern plugin: `plugin.toml`, `host.luau`, `window.luau`, `styles.css`, `lib/*.luau`. |
 | `tests/common/mod.rs` | Test harness: real HTTP and MCP, `FakeDevices` (a login screen and a fake screen helper), a stub `maestro`. |
 | `tests/e2e.rs`, `tests/runs.rs` | End-to-end tests: leases and billing; recorded runs and evidence. |

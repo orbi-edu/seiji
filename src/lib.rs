@@ -16,3 +16,5 @@ pub mod tenant;
 pub mod viewer;
 
 pub(crate) const USER_AGENT: &str = concat!("seiji/", env!("CARGO_PKG_VERSION"));
+/// The git commit this binary is built from (`build.rs`); `None` outside a git checkout.
+pub const COMMIT: Option<&str> = option_env!("SEIJI_COMMIT");
