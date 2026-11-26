@@ -83,8 +83,11 @@ Quota flags, for `add` and `set`:
 | `--max-concurrent N` | `maxConcurrent` | At least 1. |
 | `--max-lease-minutes N` | `maxLeaseMinutes` | At least 1. |
 | `--idle-minutes N` | `idleMinutes` | At least 1. |
+| `--max-builds N\|default` | `maxBuilds` | At least 1. `default` removes the user's own limit, so the user follows `maxBuildsPerUser`. A new user without the flag gets `defaultQuota.maxBuilds`, or follows `maxBuildsPerUser` when that is not set. |
 
-A value that breaks a rule fails with `quotas must be positive (monthly-minutes may be 0)`. A name that does not exist fails with `no user "<name>"`. Omitting a flag preserves the user's current value, so `seiji user set alice --max-lease-minutes 60` changes only the lease limit and keeps the budget, concurrency and unlimited state.
+A value that breaks a rule fails with `quotas must be positive (monthly-minutes may be 0)`. A name that does not exist fails with `no user "<name>"`. Omitting a flag preserves the user's current value, so `seiji user set alice --max-lease-minutes 60` changes only the lease limit and keeps the budget, concurrency, build limit and unlimited state.
+
+Give a service user, one account that many agents share, a higher build limit than a person, so that the builds of all its agents fit: `seiji user set ci --max-builds 50`.
 
 Output of `add`:
 
@@ -95,12 +98,12 @@ token (shown once): sj_rOp-22QxFnp6KMfO59XAHMnR2cLp01NIlueqyY83nac
 
 Tokens start with `sj_`. Seiji stores only their SHA-256 hash, so a lost token cannot be shown again: rotate it.
 
-Output of `list` (`os account` is `-` in shared mode):
+Output of `list` (`os account` is `-` in shared mode; `builds` is the build limit in effect, the user's own or `maxBuildsPerUser`):
 
 ```text
-name             os account               min/mo  conc lease-min   idle  status
-alice            seiji-alice                1200     2        60     15  active
-bob              seiji-bob             unlimited     1        60     15  disabled
+name             os account               min/mo  conc lease-min   idle builds  status
+alice            seiji-alice                1200     2        60     15     10  active
+bob              seiji-bob             unlimited     1        60     15     50  disabled
 seats: 2/10
 ```
 

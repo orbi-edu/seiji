@@ -186,6 +186,7 @@ These links come from `POST /v1/admin/leases/{lease_id}/viewer` ([mcp.md](mcp.md
 Press `e` (or click **Edit**) to edit the selected user's limits:
 
 - **Max devices**: the number of devices this user may hold at once. Use the −/+ steppers; minimum 1. Lowering the limit blocks new acquisitions but does not evict already-held devices.
+- **Max builds**: the number of builds this user may keep at once. Use the ±1 / ±10 steppers; minimum 1. A user without a limit of its own shows the server's `maxBuildsPerUser` and `(server default)`; **Default** returns the user to it. Give a service user, one account that many agents share, more than a person.
 - **Unlimited monthly budget**: a toggle. When on, the monthly budget is not enforced, but minutes continue to be metered. The saved numeric budget is preserved and shown read-only for switching back.
 - **Monthly minutes**: the numeric budget. Use the ±60 / ±600 steppers to adjust. Only editable when unlimited is off. Reducing the budget can end leases on the next reaper pass.
 

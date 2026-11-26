@@ -288,6 +288,8 @@ end
 local function user_detail(state: any, A: any, u: any): Node
 	local is_editing = state.editing and state.editing.user_id == u.id
 	local body: { Node } = {}
+	-- The server's maxBuildsPerUser, for users without a build limit of their own.
+	local default_builds = state.data.max_builds_per_user
 
 	-- Read-only fields.
 	local kv_rows = {
@@ -316,6 +318,29 @@ local function user_detail(state: any, A: any, u: any): Node
 		if cur_conc < (u.max_concurrent or 1) then
 			table.insert(edit_rows, h.muted("Lowering max devices blocks new acquisitions but does not evict held devices."))
 		end
+
+		-- Max builds (+/- steppers from the effective limit; Default drops the user's own limit).
+		local own_builds = tonumber(ed.max_builds)
+		local cur_builds = own_builds or tonumber(default_builds) or 1
+		local function builds_action(delta: number): Node
+			local label = (if delta > 0 then "+" else "") .. tostring(delta)
+			local value = tostring(math.max(1, cur_builds + delta))
+			return h.action(label, "edit_field=" .. tern.json.encode({ field = "max_builds", value = value }), "neutral", "builds_" .. tostring(delta))
+		end
+		local builds_children: { Node } = {
+			ui.text({ ui.span("Max builds  ", "muted") }),
+			builds_action(-10),
+			builds_action(-1),
+			ui.text({ ui.span(" " .. tostring(cur_builds) .. " ", "strong mono") }),
+			builds_action(1),
+			builds_action(10),
+		}
+		if own_builds then
+			table.insert(builds_children, h.action("Default", "edit_field=" .. tern.json.encode({ field = "max_builds", value = "default" }), "neutral", "builds_default"))
+		else
+			table.insert(builds_children, ui.text({ ui.span("  (server default)", "muted") }))
+		end
+		table.insert(edit_rows, ui.node("row", { key = "ed_builds", gap = "sm", align = "center", wrap = true }, builds_children))
 
 		-- Unlimited monthly budget toggle (before budget steppers so the user decides first).
 		local ulabel = if ed.monthly_unlimited then "Unlimited monthly budget  ✓" else "Unlimited monthly budget"
@@ -369,6 +394,7 @@ local function user_detail(state: any, A: any, u: any): Node
 		-- Show current limits and an Edit action.
 		local limit_rows = {
 			{ "Max devices", tostring(u.max_concurrent or 1) },
+			{ "Max builds", if type(u.max_builds) == "number" then tostring(u.max_builds) else tostring(default_builds or "—") .. " (server default)" },
 			{ "Monthly minutes", tostring(u.monthly_minutes or 0) },
 			{ "Monthly budget", if u.monthly_unlimited then "Unlimited" else fmt.num((u.monthly_minutes or 0) - (u.used_minutes or 0)) .. " min left" },
 		}

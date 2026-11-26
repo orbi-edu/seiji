@@ -167,6 +167,20 @@ struct QuotaFlags {
     /// Release after this long without a tool call.
     #[arg(long)]
     idle_minutes: Option<i64>,
+    /// Builds kept at the same time, or `default` to follow `maxBuildsPerUser`.
+    #[arg(long, value_name = "N|default", value_parser = parse_max_builds)]
+    max_builds: Option<MaxBuilds>,
+}
+
+/// `--max-builds`: a number, or `default` (no limit of its own).
+#[derive(Clone, Copy)]
+struct MaxBuilds(Option<i64>);
+
+fn parse_max_builds(s: &str) -> Result<MaxBuilds, String> {
+    if s == "default" {
+        return Ok(MaxBuilds(None));
+    }
+    s.parse().map(|n| MaxBuilds(Some(n))).map_err(|_| format!("{s:?} is not a number or `default`"))
 }
 
 impl QuotaFlags {
@@ -177,8 +191,9 @@ impl QuotaFlags {
             max_concurrent: self.max_concurrent.unwrap_or(base.max_concurrent),
             max_lease_minutes: self.max_lease_minutes.unwrap_or(base.max_lease_minutes),
             idle_minutes: self.idle_minutes.unwrap_or(base.idle_minutes),
+            max_builds: self.max_builds.map_or(base.max_builds, |m| m.0),
         };
-        if q.monthly_minutes < 0 || q.max_concurrent < 1 || q.max_lease_minutes < 1 || q.idle_minutes < 1 {
+        if !q.is_valid() {
             bail!("quotas must be positive (monthly-minutes may be 0)");
         }
         Ok(q)
@@ -309,8 +324,8 @@ fn user_cmd(config: &Config, cmd: UserCmd) -> Result<()> {
         }
         UserCmd::List => {
             println!(
-                "{:<16} {:<20} {:>10} {:>5} {:>9} {:>6}  status",
-                "name", "os account", "min/mo", "conc", "lease-min", "idle"
+                "{:<16} {:<20} {:>10} {:>5} {:>9} {:>6} {:>6}  status",
+                "name", "os account", "min/mo", "conc", "lease-min", "idle", "builds"
             );
             for u in store.users()? {
                 let budget = if u.quota.monthly_unlimited {
@@ -319,13 +334,14 @@ fn user_cmd(config: &Config, cmd: UserCmd) -> Result<()> {
                     u.quota.monthly_minutes.to_string()
                 };
                 println!(
-                    "{:<16} {:<20} {:>10} {:>5} {:>9} {:>6}  {}",
+                    "{:<16} {:<20} {:>10} {:>5} {:>9} {:>6} {:>6}  {}",
                     u.name,
                     u.os_user.as_deref().unwrap_or("-"),
                     budget,
                     u.quota.max_concurrent,
                     u.quota.max_lease_minutes,
                     u.quota.idle_minutes,
+                    config.max_builds(&u.quota),
                     if u.disabled { "disabled" } else { "active" }
                 );
             }

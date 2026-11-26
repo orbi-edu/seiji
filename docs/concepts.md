@@ -107,7 +107,7 @@ A **device** is an iOS simulator or an Android emulator. Seiji creates a fresh d
 
 ## Quotas and budget
 
-Each user has a **quota** of five values. `defaultQuota` in the config is the quota of a new user. `seiji user add` and `seiji user set` can change each value. An admin can also change three of them through `PUT /v1/admin/users/{id}/limits`.
+Each user has a **quota** of six values. `defaultQuota` in the config is the quota of a new user. `seiji user add` and `seiji user set` can change each value. An admin can also change four of them through `PUT /v1/admin/users/{id}/limits`.
 
 | Quota key | Meaning | Enforced by |
 |---|---|---|
@@ -116,8 +116,9 @@ Each user has a **quota** of five values. `defaultQuota` in the config is the qu
 | `maxConcurrent` | Devices the user holds at the same time, iOS and Android together. | admission |
 | `maxLeaseMinutes` | The maximum wall-clock length of one lease, boot included. | the reaper |
 | `idleMinutes` | The time without a lease operation after which the reaper releases a `ready` lease. | the reaper |
+| `maxBuilds` | Builds the user keeps at the same time. Optional: without it, the user follows `maxBuildsPerUser`. | upload and `install_app` with `url` |
 
-A change of quota takes effect at the next admission and the next reaper pass.
+A change of quota takes effect at the next admission, the next reaper pass and the next upload.
 
 While a user is unlimited, Seiji keeps the numeric `monthlyMinutes` in the database and continues metering the ledger. The operator can switch back to a finite budget at any time by setting `monthlyUnlimited` to false; the saved `monthlyMinutes` then applies again.
 
@@ -206,7 +207,7 @@ A **build** is an app file that a user gives Seiji to install. Its id is `a_` pl
 | Owner | A build belongs to one user. `install_app` finds only the caller's builds ("no uploaded app ..."). |
 | Storage | `<dataDir>/apps/<user id>/<app_id>/<file name>`. |
 | Size | At most `maxUploadBytes` (default 1 GiB) for uploads and downloads, counted while the file streams. |
-| Count | At most `maxBuildsPerUser` (default 10) builds for each user at a time. Above it, an upload gets HTTP `429` and a download fails with "you already keep N builds, the limit is M; they expire Hh after upload". Free room with `DELETE /v1/apps/{id}`: it deletes one of the caller's builds at once. |
+| Count | At most the user's `maxBuilds`, or `maxBuildsPerUser` (default 10) when its quota has none, builds at a time. A service user, one account that many agents share, can get a higher `maxBuilds` than a person. Above it, an upload gets HTTP `429` and a download fails with "you already keep N builds, the limit is M; they expire Hh after upload". Free room with `DELETE /v1/apps/{id}`: it deletes one of the caller's builds at once. |
 | Formats | iOS: a `.zip`, `.tar.gz` or `.tgz` that holds a simulator `.app` bundle. Android: an `.apk`. |
 | Reuse | One build can be installed on any number of the user's leases. Each install copies it into the lease dir. |
 | Retention | The reaper deletes a build `appRetentionHours` (default 72) after it arrived, then `install_app` fails with "no uploaded app ...". `DELETE /v1/apps/{id}` deletes it earlier, the same way. A device that has the app installed keeps it. |

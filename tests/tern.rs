@@ -208,7 +208,7 @@ async fn admin_sees_users_tab_edits_and_saves_limits() {
         eprintln!("skipped: tern is not on PATH");
         return;
     };
-    let env = setup_with(2, json!({ "adminUsers": ["alice"] })).await;
+    let env = setup_with(2, json!({ "adminUsers": ["alice"], "maxBuildsPerUser": 10 })).await;
     let alice_token = add_user(&env, "alice", QUOTA);
     let _bob_token = add_user(&env, "bob", QUOTA);
 
@@ -226,7 +226,7 @@ async fn admin_sees_users_tab_edits_and_saves_limits() {
 
     // The detail card shows limits of the first selected user.
     t.wait_for("user detail", ".tn-pane.on .sf-main .sf-kv", |s| {
-        s.contains("Session limit") && s.contains("Max devices")
+        s.contains("Session limit") && s.contains("Max devices") && s.contains("10 (server default)")
     })
     .await;
 
@@ -243,6 +243,11 @@ async fn admin_sees_users_tab_edits_and_saves_limits() {
     })
     .await;
 
+    // Give bob a build limit of his own: one more than the server default.
+    t.click_badge("+1").await;
+    t.wait_for("builds incremented", ".tn-pane.on .sf-main .sf-text", |s| s.lines().any(|line| line.trim() == "11"))
+        .await;
+
     // Toggle unlimited.
     t.click_badge("Unlimited monthly budget").await;
     t.wait_text("preserved for switching back", "sf-main").await;
@@ -254,6 +259,7 @@ async fn admin_sees_users_tab_edits_and_saves_limits() {
     // Verify DB: bob's quota changed, alice's unchanged.
     let bob = env.pool.store.user_by_name("bob").unwrap().unwrap();
     assert_eq!(bob.quota.max_concurrent, 2, "bob max_concurrent");
+    assert_eq!(bob.quota.max_builds, Some(11), "bob max_builds");
     assert!(bob.quota.monthly_unlimited, "bob monthly_unlimited");
     assert_eq!(bob.quota.monthly_minutes, QUOTA.monthly_minutes, "bob monthly_minutes preserved");
     assert_eq!(bob.quota.max_lease_minutes, QUOTA.max_lease_minutes, "bob lease unchanged");
@@ -270,6 +276,18 @@ async fn admin_sees_users_tab_edits_and_saves_limits() {
     t.wait_for("edit dismissed after cancel", ".tn-pane.on .sf-main .sf-card-head", |s| !s.contains("Edit limits"))
         .await;
     assert_eq!(env.pool.store.user_by_name("bob").unwrap().unwrap().quota.max_concurrent, 2);
+
+    // Default drops bob's own build limit.
+    t.ctl(&["key", "e"]).await;
+    t.wait_text("Edit limits", "sf-main").await;
+    t.click_badge("Default").await;
+    t.wait_text("(server default)", "sf-main").await;
+    t.ctl(&["key", "enter"]).await;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while env.pool.store.user_by_name("bob").unwrap().unwrap().quota.max_builds.is_some() {
+        assert!(Instant::now() < deadline, "bob's build limit was not reset");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
 
     // Refresh preserves is_admin and re-fetches users list.
     t.ctl(&["key", "r"]).await;

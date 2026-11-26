@@ -444,6 +444,7 @@ The sudo process cannot be the handle in `os_user` mode: `exec-drop` calls `sets
 | `idle_minutes` | INTEGER NOT NULL | Quota `idleMinutes`. |
 | `disabled` | INTEGER NOT NULL DEFAULT 0 | 1 when the user is disabled. |
 | `created_at` | INTEGER NOT NULL | Creation time. |
+| `max_builds` | INTEGER | Quota `maxBuilds`. NULL when the user follows `maxBuildsPerUser`; `Store::open` adds the column to older databases with NULL in every row. |
 
 ### `leases`
 
@@ -476,7 +477,7 @@ Indexes: `leases_user (user_id, started_at)` and the partial index `leases_activ
 | `size` | INTEGER NOT NULL | Bytes. |
 | `created_at` | INTEGER NOT NULL | Arrival time. Retention counts from here. |
 
-A user keeps at most `maxBuildsPerUser` rows in `apps` at a time. The reaper (`take_apps_before`) and `DELETE /v1/apps/{app_id}` (`take_app`, only the caller's row) delete the row first and then `<dataDir>/apps/<user id>/<app_id>/`.
+A user keeps at most its `maxBuilds` (or `maxBuildsPerUser` when `users.max_builds` is NULL) rows in `apps` at a time. The reaper (`take_apps_before`) and `DELETE /v1/apps/{app_id}` (`take_app`, only the caller's row) delete the row first and then `<dataDir>/apps/<user id>/<app_id>/`.
 
 The `leases` table is the only source of usage. `seiji usage`, `budget_status`, admission and the reaper all compute usage with the same query ([concepts.md](concepts.md#the-month-window)).
 

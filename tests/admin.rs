@@ -36,6 +36,8 @@ async fn me_reflects_admin_status() {
     assert_eq!(alice_me["is_admin"], true);
     assert_eq!(alice_me["user"], "alice");
     assert!(alice_me["quota"]["monthlyUnlimited"] == false);
+    assert_eq!(alice_me["quota"]["maxBuilds"], 2, "the effective limit: maxBuildsPerUser");
+    assert_eq!(alice_me["app_retention_hours"], 72);
 
     let bob_me = get_me(&env.url, &bob_token).await;
     assert_eq!(bob_me["is_admin"], false);
@@ -103,6 +105,7 @@ async fn admin_lists_users_with_capacity_and_usage() {
     assert_eq!(alice_entry["max_concurrent"], 1);
     assert_eq!(alice_entry["max_lease_minutes"], 30);
     assert_eq!(alice_entry["idle_minutes"], 10);
+    assert_eq!(alice_entry["max_builds"], Value::Null);
     assert_eq!(alice_entry["used_minutes"], 0.0);
     assert_eq!(alice_entry["active_devices"], 0);
     assert_eq!(alice_entry["disabled"], false);
@@ -114,6 +117,7 @@ async fn admin_lists_users_with_capacity_and_usage() {
     assert_eq!(resp["capacity"]["ios"], 2);
     assert_eq!(resp["capacity"]["android"], 0);
     assert_eq!(resp["in_use"]["ios"], 0);
+    assert_eq!(resp["max_builds_per_user"], 2);
 }
 
 // ---- admin PUT limits ----
@@ -129,7 +133,7 @@ async fn admin_updates_limits_and_persists() {
         &env.url,
         &alice_token,
         bob.id,
-        &json!({"monthly_minutes": 9600, "monthly_unlimited": true, "max_concurrent": 3}),
+        &json!({"monthly_minutes": 9600, "monthly_unlimited": true, "max_concurrent": 3, "max_builds": 4}),
     )
     .await;
     assert_eq!(resp.status(), 200);
@@ -137,6 +141,7 @@ async fn admin_updates_limits_and_persists() {
     assert_eq!(body["monthly_minutes"], 9600);
     assert_eq!(body["monthly_unlimited"], true);
     assert_eq!(body["max_concurrent"], 3);
+    assert_eq!(body["max_builds"], 4);
     // Lease/idle settings are preserved.
     assert_eq!(body["max_lease_minutes"], 30);
     assert_eq!(body["idle_minutes"], 10);
@@ -148,6 +153,18 @@ async fn admin_updates_limits_and_persists() {
     assert_eq!(bob_after.quota.max_concurrent, 3);
     assert_eq!(bob_after.quota.max_lease_minutes, 30);
     assert_eq!(bob_after.quota.idle_minutes, 10);
+    assert_eq!(bob_after.quota.max_builds, Some(4));
+
+    // Leaving out max_builds returns bob to maxBuildsPerUser.
+    let resp = put_limits(
+        &env.url,
+        &alice_token,
+        bob.id,
+        &json!({"monthly_minutes": 9600, "monthly_unlimited": true, "max_concurrent": 3}),
+    )
+    .await;
+    assert_eq!(resp.json::<Value>().await.unwrap()["max_builds"], Value::Null);
+    assert_eq!(env.pool.store.user_by_name("bob").unwrap().unwrap().quota.max_builds, None);
 }
 
 #[tokio::test]
@@ -176,6 +193,16 @@ async fn admin_update_rejects_bad_input_and_unknown_user() {
         &alice_token,
         alice.id,
         &json!({"monthly_minutes": 100, "monthly_unlimited": false, "max_concurrent": 0}),
+    )
+    .await;
+    assert_eq!(r.status(), 400);
+
+    // Zero builds.
+    let r = put_limits(
+        &env.url,
+        &alice_token,
+        alice.id,
+        &json!({"monthly_minutes": 100, "monthly_unlimited": false, "max_concurrent": 1, "max_builds": 0}),
     )
     .await;
     assert_eq!(r.status(), 400);
@@ -211,6 +238,7 @@ async fn unlimited_budget_admits_and_meters_usage() {
         max_concurrent: 1,
         max_lease_minutes: 30,
         idle_minutes: 10,
+        max_builds: None,
     };
     let env = setup(2).await;
     let token = add_user(&env, "alice", unlimited);
@@ -247,6 +275,7 @@ async fn zero_budget_without_unlimited_blocks_admission() {
         max_concurrent: 1,
         max_lease_minutes: 30,
         idle_minutes: 10,
+        max_builds: None,
     };
     let env = setup(2).await;
     let token = add_user(&env, "alice", zero);
@@ -267,6 +296,7 @@ async fn unlimited_preserves_concurrency_and_capacity() {
         max_concurrent: 1,
         max_lease_minutes: 30,
         idle_minutes: 10,
+        max_builds: None,
     };
     let env = setup(1).await; // capacity = 1
     let token = add_user(&env, "alice", unlimited);
@@ -295,6 +325,7 @@ async fn reaper_skips_budget_for_unlimited_but_enforces_lease_duration() {
         max_concurrent: 1,
         max_lease_minutes: 30,
         idle_minutes: 10,
+        max_builds: None,
     };
     let env = setup(2).await;
     let token = add_user(&env, "alice", unlimited);
@@ -324,6 +355,7 @@ async fn reaper_releases_idle_unlimited_leases() {
         max_concurrent: 1,
         max_lease_minutes: 60,
         idle_minutes: 5,
+        max_builds: None,
     };
     let env = setup(2).await;
     let token = add_user(&env, "alice", unlimited);
@@ -381,11 +413,12 @@ async fn cli_partial_set_preserves_budget_and_unlimited() {
         .unwrap();
     assert!(add.status.success(), "user add failed: {}", String::from_utf8_lossy(&add.stderr));
 
-    // Set alice to unlimited + concurrency 3 via the store (simulating admin PUT).
+    // Set alice to unlimited + concurrency 3 + 7 builds via the store (simulating admin PUT).
     {
         let store = seiji::store::Store::open(&dir.path().join("data").join("seiji.db")).unwrap();
         let alice = store.user_by_name("alice").unwrap().unwrap();
-        store.set_admin_limits(alice.id, 9600, true, 3).unwrap();
+        assert_eq!(alice.quota.max_builds, None, "a new user follows maxBuildsPerUser");
+        store.set_admin_limits(alice.id, 9600, true, 3, Some(7)).unwrap();
     }
 
     // Run the real CLI: `seiji user set alice --max-lease-minutes 60 --idle-minutes 15 --config <path>`
@@ -397,14 +430,33 @@ async fn cli_partial_set_preserves_budget_and_unlimited() {
     assert!(set.status.success(), "user set failed: {}", String::from_utf8_lossy(&set.stderr));
     assert!(String::from_utf8_lossy(&set.stdout).contains("updated alice"));
 
-    // Verify the database: budget, unlimited, concurrency preserved; time limits updated.
+    // Verify the database: budget, unlimited, concurrency, builds preserved; time limits updated.
     let store = seiji::store::Store::open(&dir.path().join("data").join("seiji.db")).unwrap();
     let alice = store.user_by_name("alice").unwrap().unwrap();
     assert_eq!(alice.quota.monthly_minutes, 9600, "monthly_minutes not preserved");
     assert!(alice.quota.monthly_unlimited, "monthly_unlimited not preserved");
     assert_eq!(alice.quota.max_concurrent, 3, "max_concurrent not preserved");
+    assert_eq!(alice.quota.max_builds, Some(7), "max_builds not preserved");
     assert_eq!(alice.quota.max_lease_minutes, 60, "max_lease_minutes not updated");
     assert_eq!(alice.quota.idle_minutes, 15, "idle_minutes not updated");
+
+    let seiji = |args: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_seiji"))
+            .args(args)
+            .arg("--config")
+            .arg(&config_path)
+            .output()
+            .unwrap()
+    };
+    let max_builds = || store.user_by_name("alice").unwrap().unwrap().quota.max_builds;
+    assert!(seiji(&["user", "set", "alice", "--max-builds", "4"]).status.success());
+    assert_eq!(max_builds(), Some(4));
+    let list = String::from_utf8(seiji(&["user", "list"]).stdout).unwrap();
+    assert!(list.lines().any(|l| l.starts_with("alice") && l.split_whitespace().nth(6) == Some("4")), "{list}");
+    assert!(!seiji(&["user", "set", "alice", "--max-builds", "0"]).status.success());
+    assert_eq!(max_builds(), Some(4));
+    assert!(seiji(&["user", "set", "alice", "--max-builds", "default"]).status.success());
+    assert_eq!(max_builds(), None);
 }
 
 // ---- migration ----
@@ -420,7 +472,7 @@ async fn migration_preserves_tokens_history_and_survives_reopen() {
     let real_token = "sj_test-migration-token-that-is-long-enough-xxx";
     let token_hash = hash_token(real_token);
 
-    // Create a database with the OLD schema (no monthly_unlimited column),
+    // Create a database with the OLD schema (no monthly_unlimited or max_builds column),
     // a real token hash, a lease (usage history) and a run.
     {
         let conn = rusqlite::Connection::open(&db_path).unwrap();
@@ -504,6 +556,7 @@ async fn migration_preserves_tokens_history_and_survives_reopen() {
     assert!(!user.quota.monthly_unlimited);
     assert_eq!(user.quota.monthly_minutes, 1200);
     assert_eq!(user.quota.max_concurrent, 2);
+    assert_eq!(user.quota.max_builds, None, "existing rows follow maxBuildsPerUser");
 
     // Lease/usage history survives.
     let lease = store.lease("l_oldlease0001").unwrap();
@@ -511,8 +564,8 @@ async fn migration_preserves_tokens_history_and_survives_reopen() {
     let used = store.used_seconds(user.id, 0, i64::MAX, seiji::store::now()).unwrap();
     assert!(used > 0, "usage must survive migration: got {used}");
 
-    // Set unlimited on the legacy user.
-    store.set_admin_limits(user.id, 9600, true, 5).unwrap();
+    // Set unlimited and a build limit on the legacy user.
+    store.set_admin_limits(user.id, 9600, true, 5, Some(30)).unwrap();
     let updated = store.user_by_name("legacy").unwrap().unwrap();
     assert!(updated.quota.monthly_unlimited);
 
@@ -523,6 +576,7 @@ async fn migration_preserves_tokens_history_and_survives_reopen() {
     assert!(reopened.quota.monthly_unlimited, "unlimited must persist across reopen");
     assert_eq!(reopened.quota.monthly_minutes, 9600);
     assert_eq!(reopened.quota.max_concurrent, 5);
+    assert_eq!(reopened.quota.max_builds, Some(30));
 
     // Can add a new user with the column present.
     let quota = Quota {
@@ -531,6 +585,7 @@ async fn migration_preserves_tokens_history_and_survives_reopen() {
         max_concurrent: 1,
         max_lease_minutes: 60,
         idle_minutes: 10,
+        max_builds: None,
     };
     let (new_user, _token) = store2.add_user("new-user", None, quota, 10).unwrap();
     assert!(new_user.quota.monthly_unlimited);
@@ -546,6 +601,7 @@ async fn large_finite_budget_admits_without_overflow() {
         max_concurrent: 1,
         max_lease_minutes: 30,
         idle_minutes: 10,
+        max_builds: None,
     };
     let env = setup(2).await;
     let token = add_user(&env, "alice", big);
@@ -555,4 +611,23 @@ async fn large_finite_budget_admits_without_overflow() {
     let lease = ok_json(&call(&c, "acquire_device", json!({"platform": "ios"})).await);
     assert_eq!(lease["status"], "ready");
     call(&c, "release_device", json!({})).await;
+}
+
+// ---- per-user build limit ----
+
+#[test]
+fn config_refuses_a_zero_build_limit() {
+    let config = |max_builds: i64| {
+        json!({
+            "seats": 1,
+            "capacity": { "ios": 0, "android": 0 },
+            "defaultQuota": Quota { max_builds: Some(max_builds), ..QUOTA },
+            "isolation": { "mode": "shared" },
+        })
+        .to_string()
+    };
+    let dir = std::env::temp_dir();
+    assert_eq!(seiji::config::Config::parse(&config(3), &dir).unwrap().default_quota.max_builds, Some(3));
+    let err = seiji::config::Config::parse(&config(0), &dir).unwrap_err();
+    assert_eq!(format!("{err:#}"), "defaultQuota: monthlyMinutes must be >= 0 and the other limits >= 1");
 }

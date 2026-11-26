@@ -248,7 +248,7 @@ If users must not reach each other's devices, offer only iOS: leave out the `and
 |---|---|
 | `POST /v1/apps` | Needs the token. Seiji counts the bytes while the body streams. Above `maxUploadBytes` (default 1 GiB) the response is `413` "upload exceeds maxUploadBytes (N bytes)". A broken stream gets `400` "upload failed: ...". An empty body gets `400` "empty upload". A missing `X-Filename` gets `400`. A partial file is deleted. |
 | `install_app` with `url` | Seiji checks the lease first. The URL must be `https` ("only https URLs are accepted"). A redirect must stay `https` ("redirect to a non-https URL"), and at most 5 redirects are followed ("too many redirects"). The download has a 600 s timeout. Seiji counts the bytes while it streams and stops above `maxUploadBytes` ("download exceeds N bytes"). A partial file is deleted. |
-| Count | A user keeps at most `maxBuildsPerUser` (default 10) builds. Above it, an upload gets `429` and a download fails, both with "you already keep N builds, the limit is M; they expire Hh after upload". |
+| Count | A user keeps at most its `maxBuilds`, or `maxBuildsPerUser` (default 10) when its quota has none. Above it, an upload gets `429` and a download fails, both with "you already keep N builds, the limit is M; they expire Hh after upload". |
 | File names | Every character outside `[A-Za-z0-9._-]` becomes `_`. Leading dots are removed. An empty name becomes `app`. A name cannot leave its directory. |
 | Ownership | A build belongs to the user that uploaded or downloaded it. Other users cannot install it. |
 | Retention | The reaper deletes builds `appRetentionHours` (default 72) after they arrive. |
@@ -257,7 +257,7 @@ If users must not reach each other's devices, offer only iOS: leave out the `and
 Limits of these controls:
 
 - Seiji does not restrict the download host. An agent can make the daemon fetch an `https` URL inside your network.
-- The disk can hold up to `maxBuildsPerUser` × `maxUploadBytes` of builds for each user until retention deletes them. Builds do not count against the budget. Watch the free disk space.
+- The disk can hold up to the user's build limit × `maxUploadBytes` of builds for each user until retention deletes them. Builds do not count against the budget. Watch the free disk space.
 - Evidence adds up to `evidence.maxBytesPerUser` for each user, kept `evidence.retentionHours`. The quota counts the finished runs and the byte budget that each running run reserves, so parallel runs cannot overshoot it together. A running capture still grows on disk until the run ends; only then is `app.log` cut and the budget applied.
 
 ## The viewer
@@ -415,7 +415,7 @@ An open tunnel restarts its lease's idle timer every 60 s, so the lease is not r
 9. Tell users not to put secrets in `run_flow` `env`, `launch_app` `arguments` or selectors, to mark passwords with `secret: true` in `type` steps, and that the video, screenshots and `app.log` are not redacted. Tell them that a viewer link works for anyone who opens it first within 60 s, and to share view-only links unless the other person must drive.
 10. Under `shared`, give tokens only to users who trust each other: their flows and XCTest bundles run as the daemon account. Set `xctest.enabled` to `false` if they must not run native test code.
 11. Install AXe as an admin (`brew install cameroncooke/axe/axe`). Check that `axe.bin` (default `/opt/homebrew/bin/axe`), `maestro.bin` and their directories are not writable by `seiji` or a tenant account. After each Xcode or AXe update, run `seiji doctor <user>` again before users run tests.
-12. Plan the disk for builds (`maxBuildsPerUser` × `maxUploadBytes`) and evidence (`evidence.maxBytesPerUser`) for every seat, and watch the free space.
+12. Plan the disk for builds (each user's build limit, `maxBuilds` or `maxBuildsPerUser`, × `maxUploadBytes`) and evidence (`evidence.maxBytesPerUser`) for every seat, and watch the free space.
 13. Leave out Android, or set `capacity.android` to `0`, if users must not reach each other's emulators.
 14. Set `forward.enabled` to `false` if tenants must not share the host's loopback: an open tunnel's port is open to every local account ([Tunnels](#tunnels-seiji-forward)).
 15. When a token leaks, run `seiji user rotate-token`. To stop a user at once, run `seiji user disable`.
