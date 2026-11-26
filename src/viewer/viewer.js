@@ -1051,9 +1051,26 @@
   }
   const SHIFT = 225;
   const GUI = 227;
+  const OPTION = 226;
 
-  // Characters a US keyboard cannot type (accents, emoji) go through the clipboard. While such
-  // text waits, later characters join it, so the order stays.
+  // Accented letters and a few symbols, typed as on a Mac's US keyboard: a dead key with Option
+  // (´ ` ˆ ˜ ¨), then the letter, or one Option key. Checked on the simulator. The clipboard
+  // would make iOS ask "Allow Paste" in the app, and the keys typed meanwhile go to that prompt.
+  const KEYED = {};
+  const DEAD = [[8, "\u0301", "aeiouAEIOU"], [53, "\u0300", "aeiouAEIOU"], [12, "\u0302", "aeiouAEIOU"],
+    [17, "\u0303", "anoANO"], [24, "\u0308", "aeiouyAEIOU"]];
+  for (const [usage, mark, letters] of DEAD) {
+    for (const c of letters) {
+      const [u, shift] = US[c];
+      KEYED[(c + mark).normalize("NFC")] = [[usage, [OPTION]], [u, shift ? [SHIFT] : []]];
+    }
+  }
+  for (const [c, usage, shift] of [["ç", 6], ["Ç", 6, true], ["ß", 22], ["ª", 38], ["º", 39], ["¡", 30], ["¿", 56, true], ["€", 31, true]]) {
+    KEYED[c] = [[usage, shift ? [OPTION, SHIFT] : [OPTION]]];
+  }
+
+  // Other characters a US keyboard cannot type (emoji, other scripts) go through the clipboard.
+  // While such text waits, later characters join it, so the order stays.
   let text = "";
   let textTimer = 0;
   function flushText() {
@@ -1112,8 +1129,11 @@
     } else if (ev.key.length === 1 || [...ev.key].length === 1) {
       ev.preventDefault();
       const us = US[ev.key];
+      const keyed = KEYED[ev.key];
       if (us && !text) {
         key(us[0], us[1] ? [SHIFT] : []);
+      } else if (keyed && !text) {
+        for (const [u, mods] of keyed) key(u, mods);
       } else {
         text += ev.key;
         clearTimeout(textTimer);

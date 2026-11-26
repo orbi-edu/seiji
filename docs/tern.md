@@ -141,7 +141,7 @@ The panel polls `budget_status` every 3 s and `list_runs` every 10 s while the R
 | Drag | A finger that follows the pointer while you drag: lists scroll and pages turn under it |
 | Drag from the bottom edge | The home gesture (Face ID devices) |
 | Scroll the wheel or trackpad | A drag along the scroll, lifted when you stop |
-| Type | The keys, as a hardware keyboard with a US layout. Characters that layout has no key for (accents, emoji) are pasted |
+| Type | The keys, as a hardware keyboard with a US layout. Accented letters (á à â ã ä, é ê, õ, ç, ñ and the like) and ß ª º ¡ ¿ € are typed with Option and a dead key, as on a Mac's US keyboard. Other characters (emoji, other scripts) are pasted, and iOS may ask the app to **Allow Paste** first; keys typed while that prompt shows go to it |
 | Enter, Esc, Backspace, Tab, Delete, arrows, Home, End | The matching key |
 | ⌘A, ⌘C, ⌘X, ⌘Z | The same shortcut on the device |
 | Paste (⌘V) | The clipboard's text |
