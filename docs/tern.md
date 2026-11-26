@@ -154,6 +154,7 @@ The panel polls `budget_status` every 3 s and `list_runs` every 10 s while the R
 | ⌘⇧H, ⌘L | Home, Lock |
 | ⌘S, or **Screenshot** | A JPEG download of the screen |
 | ⌥I, or **Stats** | The stream's fps, bitrate, round trip, jitter and frame age |
+| ⌃⌥D | The [viewer diagnosis](mcp.md#the-viewer-diagnosis), a developer tool: it opens a probe page on the device and measures 40 s of scripted input. Not for everyday use |
 
 The screen is H.264 video decoded in the browser (WebCodecs), up to 30 frames a second. Your input shows at once, before the device answers: a dot where your finger is, its path as you drag, and a ripple where a tap landed. On a slow link the picture skips frames rather than falling behind, and the bitrate drops until the link recovers. A swipe that the link delayed still reaches the device with its own speed ([mcp.md](mcp.md#gesture-timing)).
 

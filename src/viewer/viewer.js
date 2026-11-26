@@ -295,6 +295,7 @@
   let nextId = 1;
 
   function onText(msg) {
+    if (diagHooks.text) diagHooks.text(msg);
     switch (msg.t) {
       case "format":
         configure(msg);
@@ -479,6 +480,8 @@
         stats.age = now + clockOffset - frame.timestamp / 1000;
         sample("age", stats.age);
         stats.frames.push(now);
+        // The canvas as drawn: what the user sees.
+        if (diagHooks.frame) diagHooks.frame(canvas, canvas.width, canvas.height, frame.timestamp, entry ? entry[0] : null, performance.now());
         frame.close();
         veil.hidden = true;
       },
@@ -550,6 +553,10 @@
     const capturedUs = Number(view.getBigInt64(5));
     const encodedUs = Number(view.getBigInt64(13));
     const receivedUs = Number(view.getBigInt64(21));
+    if (diagHooks.arrive) {
+      const refresh = (view.getUint8(0) & 2) === 2;
+      diagHooks.arrive({ seq, key, refresh, capturedUs, encodedUs, receivedUs, at: performance.now(), bytes: buf.byteLength });
+    }
     stats.bytes.push([Date.now(), buf.byteLength]);
     sample("encode", (encodedUs - capturedUs) / 1000);
     sample("helper", (receivedUs - encodedUs) / 1000);
@@ -716,6 +723,7 @@
       if (age < 10000) {
         stats.age = age;
         sample("age", age);
+        if (diagHooks.frame) diagHooks.frame(video, meta.width, meta.height, (Date.now() + clockOffset - age) * 1000, null, performance.now());
       }
     }
     video.requestVideoFrameCallback(onRtcFrame);
@@ -1117,6 +1125,9 @@
     } else if (ev.altKey && ev.code === "KeyI") {
       ev.preventDefault();
       toggleStats();
+    } else if (ev.ctrlKey && ev.altKey && ev.code === "KeyD") {
+      ev.preventDefault();
+      loadDiag();
     } else if (ev.metaKey && ["a", "c", "x", "z"].includes(k)) {
       // Editing shortcuts go to the simulator; the browser keeps the rest.
       ev.preventDefault();
@@ -1208,6 +1219,26 @@
   $("home").addEventListener("click", () => sendInput({ t: "button", name: "home" }));
   $("lock").addEventListener("click", () => sendInput({ t: "button", name: "lock" }));
   $("shot").addEventListener("click", save);
+
+  // The viewer diagnosis (`diag.js`), a developer tool: ⌃⌥D, or `#diag` at the end of the address,
+  // loads it. It reads the page through these hooks; nothing calls them otherwise.
+  const diagHooks = { frame: null, arrive: null, text: null };
+  window.__seijiViewer = {
+    hooks: diagHooks,
+    send,
+    sendInput,
+    state: () => ({ rtcOn, clockOffset, rtt, control, info, format, serverStages, decodeQueue: decoder ? decoder.decodeQueueSize : 0 }),
+  };
+  function loadDiag() {
+    if (window.__seijiDiag) {
+      window.__seijiDiag.show();
+      return;
+    }
+    const s = document.createElement("script");
+    s.src = "/view/assets/diag.js";
+    document.head.appendChild(s);
+  }
+  if (/^#diag/.test(location.hash)) loadDiag();
 
   refresh().then(connect);
   setInterval(refresh, 5000);
