@@ -615,6 +615,23 @@ impl Pool {
         self.config.data_dir.join("apps").join(user_id.to_string()).join(app_id)
     }
 
+    /// Deletes one of the user's builds before it expires and frees its place in `maxBuildsPerUser`.
+    /// Returns `false` when the user has no build `app_id`. A device that has the app installed
+    /// keeps it: an install copies the build into the lease dir.
+    pub fn delete_build(&self, user: &User, app_id: &str) -> Result<bool> {
+        let Some(app) = self.store.take_app(app_id, user.id)? else { return Ok(false) };
+        self.remove_build_files(&app, "deleted");
+        Ok(true)
+    }
+
+    /// Deletes the directory of a build whose row is already gone.
+    fn remove_build_files(&self, app: &App, reason: &str) {
+        match std::fs::remove_dir_all(self.apps_dir(app.user_id, &app.id)) {
+            Ok(()) => tracing::info!(app = %app.id, user_id = app.user_id, reason, "build deleted"),
+            Err(e) => tracing::warn!(app = %app.id, "deleting {reason} build: {e}"),
+        }
+    }
+
     async fn download_app(&self, user: &User, url: &str) -> Result<App> {
         self.check_build_room(user)?;
         let parsed = reqwest::Url::parse(url).context("invalid url")?;
@@ -676,9 +693,7 @@ impl Pool {
         let t = now();
         self.viewers.prune(t);
         for app in self.store.take_apps_before(t - self.config.app_retention_hours * 3600)? {
-            if let Err(e) = std::fs::remove_dir_all(self.apps_dir(app.user_id, &app.id)) {
-                tracing::warn!(app = %app.id, "deleting expired build: {e}");
-            }
+            self.remove_build_files(&app, "expired");
         }
         for run in self.store.take_runs_before(t - self.config.evidence.retention_hours * 3600)? {
             let dir = crate::evidence::run_dir(&self.config, run.user_id, &run.id);

@@ -51,7 +51,7 @@ flowchart LR
 
 | Component | Job | Code |
 |---|---|---|
-| HTTP server | An axum router. `GET /healthz` is open. `/mcp`, `POST /v1/apps`, the evidence downloads (`GET /v1/runs/{run_id}/files/{*path}`, `/evidence.zip`, `/report.md`), `GET /v1/me`, the admin endpoints (`GET /v1/admin/users`, `PUT /v1/admin/users/{id}/limits`, `GET /v1/admin/leases`, `POST /v1/admin/leases/{lease_id}/viewer`, `GET` and `PUT /v1/admin/viewer`, `GET /v1/admin/viewer/trace`), `POST /v1/leases/{lease_id}/viewer`, `GET /v1/leases/{lease_id}/screenshot.jpg` and the WebSocket `GET /v1/leases/{lease_id}/forward` sit behind the auth middleware. The admin endpoints also check `adminUsers` and return `403` for non-admin callers. The viewer routes (`/view/…`) check a session cookie instead. | `src/http.rs` |
+| HTTP server | An axum router. `GET /healthz` is open. `/mcp`, `POST /v1/apps`, `DELETE /v1/apps/{app_id}`, the evidence downloads (`GET /v1/runs/{run_id}/files/{*path}`, `/evidence.zip`, `/report.md`), `GET /v1/me`, the admin endpoints (`GET /v1/admin/users`, `PUT /v1/admin/users/{id}/limits`, `GET /v1/admin/leases`, `POST /v1/admin/leases/{lease_id}/viewer`, `GET` and `PUT /v1/admin/viewer`, `GET /v1/admin/viewer/trace`), `POST /v1/leases/{lease_id}/viewer`, `GET /v1/leases/{lease_id}/screenshot.jpg` and the WebSocket `GET /v1/leases/{lease_id}/forward` sit behind the auth middleware. The admin endpoints also check `adminUsers` and return `403` for non-admin callers. The viewer routes (`/view/…`) check a session cookie instead. | `src/http.rs` |
 | Auth middleware | Reads `Authorization: Bearer <token>`, looks up the SHA-256 of the token, refuses a missing, unknown or disabled token with `401`, and puts the user into the request as `AuthedUser`. | `src/http.rs` |
 | MCP service | rmcp `StreamableHttpService` with `NeverSessionManager`, legacy session mode off and SSE responses with 15 s keepalive comments: every POST is handled on its own, the response starts as `text/event-stream` immediately and sends keepalive comments while the tool runs, so a TLS proxy never times out on idle reads. It checks the `Host` header against `listen.allowedHosts`. A factory builds one `SeijiMcp` for each request. | `src/http.rs`, `src/mcp.rs` |
 | `SeijiMcp` | The 23 tools and the server instructions. Reads the caller from `AuthedUser` and turns each `Pool` result into a tool result. Caches the Maestro cheat sheet for the process. | `src/mcp.rs` |
@@ -476,7 +476,7 @@ Indexes: `leases_user (user_id, started_at)` and the partial index `leases_activ
 | `size` | INTEGER NOT NULL | Bytes. |
 | `created_at` | INTEGER NOT NULL | Arrival time. Retention counts from here. |
 
-A user keeps at most `maxBuildsPerUser` rows in `apps` at a time.
+A user keeps at most `maxBuildsPerUser` rows in `apps` at a time. The reaper (`take_apps_before`) and `DELETE /v1/apps/{app_id}` (`take_app`, only the caller's row) delete the row first and then `<dataDir>/apps/<user id>/<app_id>/`.
 
 The `leases` table is the only source of usage. `seiji usage`, `budget_status`, admission and the reaper all compute usage with the same query ([concepts.md](concepts.md#the-month-window)).
 

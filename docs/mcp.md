@@ -1490,6 +1490,7 @@ These routes exist besides `/mcp`. Error bodies of `/v1/apps`, `/v1/runs/…` an
 |---|---|---|
 | `GET /healthz` | None | `200`, plain text `ok` |
 | `POST /v1/apps` | Bearer token | `200` `{"app_id", "filename", "size"}` |
+| `DELETE /v1/apps/{app_id}` | Bearer token | `204`, the build is deleted |
 | `GET /v1/runs/{run_id}/files/{*path}` | Bearer token | `200`, one file of the run |
 | `GET /v1/runs/{run_id}/evidence.zip` | Bearer token | `200`, the whole run as a zip |
 | `GET /v1/runs/{run_id}/report.md` | Bearer token | `200`, the Markdown of `export_evidence` |
@@ -1542,7 +1543,7 @@ Seiji checks the header, then the build count, then reads the body. After a `400
 - A build belongs to the user who uploaded it. Another user's `app_id` gives `no uploaded app "<app id>"`.
 - You can install one build on many leases until it expires. An XCTest bundle is a build too, and `run_xctest` takes its `app_id`.
 - The reaper deletes a build `appRetentionHours` (default 72) after it arrived. Upload it again after that. A device that has the app installed keeps it.
-- You can keep at most `maxBuildsPerUser` builds (default 10) at the same time, uploads and `url` downloads together. Older builds free their place when they expire. There is no delete route.
+- You can keep at most `maxBuildsPerUser` builds (default 10) at the same time, uploads and `url` downloads together. Older builds free their place when they expire, or earlier with [`DELETE /v1/apps/{app_id}`](#delete-v1appsapp_id).
 - `seiji user remove` deletes the user's builds and runs (`<dataDir>/apps/<user id>` and `<dataDir>/runs/<user id>`).
 
 **File name sanitizing:** Seiji replaces each character other than `A-Z`, `a-z`, `0-9`, `.`, `-` and `_` with `_`, then removes leading dots. An empty result becomes `app`. `My App.zip` becomes `My_App.zip`. The same rule applies to the last path segment of a `url`.
@@ -1591,6 +1592,27 @@ If an archive has more than one `.app`, Seiji installs the first one that `find`
    ```
 
 5. Pass the `app_id` to `install_app`.
+
+### `DELETE /v1/apps/{app_id}`
+
+Deletes one of your builds before it expires: its row and `<dataDir>/apps/<user id>/<app_id>/`. Its place in `maxBuildsPerUser` is free at once, so the next upload succeeds.
+
+| Header | Required | Meaning |
+|---|---|---|
+| `Authorization` | Yes | `Bearer <token>` |
+
+| Status | Body | Cause |
+|---|---|---|
+| `204` | None | The build is deleted |
+| `401` | `missing, invalid or disabled bearer token` | See [Authentication](#authentication) |
+| `404` | `{"error": "no uploaded app \"<app id>\""}` | You have no build with this id: it never existed, it belongs to another user, it expired, or you deleted it already |
+| `500` | `{"error": "<cause>"}` | The SQLite delete failed |
+
+A build in use is no obstacle. `install_app` and `run_xctest` copy the build into the lease dir when they start, and a device that has the app installed keeps it. Only an `install_app` or a `run_xctest` that has not yet opened the build fails, with `no uploaded app "<app id>"` or a copy error.
+
+```sh
+curl -s -o /dev/null -w '%{http_code}\n' -X DELETE -H "Authorization: Bearer $SEIJI_TOKEN" https://seiji.example.com/v1/apps/a_5e1d0c9b8a72
+```
 
 ### `GET /v1/runs/{run_id}/files/{*path}`
 

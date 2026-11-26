@@ -1,6 +1,6 @@
 //! HTTP surface: `/mcp` (Streamable HTTP MCP with SSE responses and 15 s keepalives),
-//! `POST /v1/apps` (build upload), run evidence downloads under `/v1/runs/{run_id}/`,
-//! admin endpoints under `/v1/admin/`, and `/healthz`.
+//! `POST /v1/apps` (build upload), `DELETE /v1/apps/{app_id}`, run evidence downloads under
+//! `/v1/runs/{run_id}/`, admin endpoints under `/v1/admin/`, and `/healthz`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,7 +12,7 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, post, put},
+    routing::{delete, get, post, put},
 };
 use futures_util::StreamExt;
 use rmcp::transport::streamable_http_server::{
@@ -108,6 +108,19 @@ async fn store_upload(pool: &Pool, user: &User, filename: &str, body: Body) -> R
     };
     pool.store.insert_app(&app).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     Ok(app)
+}
+
+/// `DELETE /v1/apps/{app_id}`: deletes one of the caller's builds and frees its place.
+async fn delete_app(
+    State(pool): State<Arc<Pool>>,
+    Extension(AuthedUser(user)): Extension<AuthedUser>,
+    UrlPath(app_id): UrlPath<String>,
+) -> Response {
+    match pool.delete_build(&user, &app_id) {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => bad(StatusCode::NOT_FOUND, format!("no uploaded app {app_id:?}")),
+        Err(e) => bad(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+    }
 }
 
 /// Streams a daemon-owned file as the response body.
@@ -567,6 +580,7 @@ pub fn router(pool: Arc<Pool>, shutdown: CancellationToken) -> Router {
     let protected = Router::new()
         .nest_service("/mcp", mcp)
         .route("/v1/apps", post(upload))
+        .route("/v1/apps/{app_id}", delete(delete_app))
         .route("/v1/runs/{run_id}/files/{*path}", get(run_file))
         .route("/v1/runs/{run_id}/evidence.zip", get(evidence_zip))
         .route("/v1/runs/{run_id}/report.md", get(run_report))

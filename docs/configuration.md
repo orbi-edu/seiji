@@ -335,7 +335,7 @@ The reaper checks every 15 s. A build already installed on a device stays on tha
 |---|---|---|---|
 | `maxBuildsPerUser` | integer | `10` | Builds one user may keep at the same time, uploaded and downloaded together. At least 1. |
 
-When the user already keeps this many builds, `POST /v1/apps` answers `429` and `install_app` with a `url` fails, both with `you already keep <N> builds, the limit is <maxBuildsPerUser>; they expire <appRetentionHours>h after upload`. Builds leave the count only when the reaper deletes them after `appRetentionHours`; there is no tool to delete one earlier.
+When the user already keeps this many builds, `POST /v1/apps` answers `429` and `install_app` with a `url` fails, both with `you already keep <N> builds, the limit is <maxBuildsPerUser>; they expire <appRetentionHours>h after upload`. Builds leave the count when the reaper deletes them after `appRetentionHours`, or earlier when the user deletes one with `DELETE /v1/apps/{app_id}` ([mcp.md](mcp.md#delete-v1appsapp_id)).
 
 ## Full example
 
@@ -480,7 +480,7 @@ Seiji controls the environment of every command it runs for a user:
 |---|---|---|
 | `dataDir` itself | `0711`, set at each start of `serve` and `doctor` | Tenant accounts can pass through it to reach `run/pids`, but cannot list it. Its parent directories must also let them pass. |
 | `seiji.db` (and `seiji.db-wal`, `seiji.db-shm`) | `0600` | SQLite database in WAL mode. Tables `users` (name, token hash, tenant account, quota, disabled), `leases` (the usage ledger: every lease with its times, ports, end reason and whether it is billed), `apps` (builds) and `runs` (every run with its kind, name, tags, status, times, bytes and verdict). |
-| `apps/<user id>/<app id>/<file name>` | `0700` directories, `0600` files | Builds from `POST /v1/apps` and from `install_app` URLs. `<user id>` is the numeric id of the row in `users`. The reaper deletes each one after `appRetentionHours`; `seiji user remove` deletes `apps/<user id>`. |
+| `apps/<user id>/<app id>/<file name>` | `0700` directories, `0600` files | Builds from `POST /v1/apps` and from `install_app` URLs. `<user id>` is the numeric id of the row in `users`. The reaper deletes each one after `appRetentionHours`; `DELETE /v1/apps/{app_id}` deletes one earlier; `seiji user remove` deletes `apps/<user id>`. |
 | `runs/<user id>/<run id>/` | `0700` directories, `0600` files | The evidence of one run (see below). The reaper deletes it `evidence.retentionHours` after the run ended. |
 | `run/` | `0711`, set at each start | Scratch files, each deleted when its command ends: flow YAML (`<uuid>.yaml`), typed text (`<uuid>.txt`) and APNs payloads (`<uuid>.apns`) that commands read as stdin, image previews (`<uuid>.jpg`, made by `sips` running as the daemon account on the run's copy of a tenant image), `evidence.zip` while it is sent (`<uuid>.zip`, built again for every request), the output of a screen recording (`cap-<uuid>.log`), and the log of `seiji doctor`'s capture (`doctor-<8 hex>-doctor.log`). Also emulator logs (`emulator-<lease id>.log`, deleted at release). |
 | `run/pids/` | `1733`, set at each start | Under `os_user`, `exec-drop` writes the process-group id of each command here as the tenant account (`<uuid>.pid`, mode `0644`), so the daemon can signal the group through `kill-as`. The daemon deletes the file when the command ends. The mode lets tenant accounts create files but not list or remove other files. |

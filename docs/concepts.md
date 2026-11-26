@@ -206,10 +206,10 @@ A **build** is an app file that a user gives Seiji to install. Its id is `a_` pl
 | Owner | A build belongs to one user. `install_app` finds only the caller's builds ("no uploaded app ..."). |
 | Storage | `<dataDir>/apps/<user id>/<app_id>/<file name>`. |
 | Size | At most `maxUploadBytes` (default 1 GiB) for uploads and downloads, counted while the file streams. |
-| Count | At most `maxBuildsPerUser` (default 10) builds for each user at a time. Above it, an upload gets HTTP `429` and a download fails with "you already keep N builds, the limit is M; they expire Hh after upload". |
+| Count | At most `maxBuildsPerUser` (default 10) builds for each user at a time. Above it, an upload gets HTTP `429` and a download fails with "you already keep N builds, the limit is M; they expire Hh after upload". Free room with `DELETE /v1/apps/{id}`: it deletes one of the caller's builds at once. |
 | Formats | iOS: a `.zip`, `.tar.gz` or `.tgz` that holds a simulator `.app` bundle. Android: an `.apk`. |
 | Reuse | One build can be installed on any number of the user's leases. Each install copies it into the lease dir. |
-| Retention | The reaper deletes a build `appRetentionHours` (default 72) after it arrived, then `install_app` fails with "no uploaded app ...". |
+| Retention | The reaper deletes a build `appRetentionHours` (default 72) after it arrived, then `install_app` fails with "no uploaded app ...". `DELETE /v1/apps/{id}` deletes it earlier, the same way. A device that has the app installed keeps it. |
 
 [mcp.md](mcp.md#http-api) gives the upload interface.
 

@@ -12,7 +12,7 @@ All Seiji documents use these terms with these meanings only. [concepts.md](conc
 | **AXe** | The third-party CLI ([cameroncooke/AXe](https://github.com/cameroncooke/AXe), `axe.bin`) that taps, types, swipes and reads the accessibility tree of an iOS simulator through Apple's private accessibility and HID frameworks; `run_actions`, `inspect_screen` on iOS and the viewer's text input use it. |
 | **Budget** | The monthly device-minutes of a user (`monthlyMinutes`), counted per UTC calendar month. |
 | **Budget (unlimited)** | When `monthlyUnlimited` is true, admission and the reaper skip the monthly budget check. The numeric `monthlyMinutes` is preserved for switching back, and usage is still metered. |
-| **Build** | An app file that a user uploaded (`POST /v1/apps`) or that Seiji downloaded (`install_app` with `url`), with the id `a_<12 hex>`, kept `appRetentionHours`, at most `maxBuildsPerUser` per user. |
+| **Build** | An app file that a user uploaded (`POST /v1/apps`) or that Seiji downloaded (`install_app` with `url`), with the id `a_<12 hex>`, kept `appRetentionHours` or until its owner deletes it (`DELETE /v1/apps/{app_id}`), at most `maxBuildsPerUser` per user. |
 | **Capacity** | The host-wide limit of simultaneous devices for each platform (`capacity.ios`, `capacity.android`). |
 | **Capture** | A recording that runs for the whole of an iOS run: the screen video (`simctl io recordVideo`, stopped with SIGINT) or the unified-log stream into `app.log`. |
 | **Console port** | The even port from `android.consolePortRange` that Seiji passes to the emulator as `-port`; the emulator also uses the next port, and its serial is `emulator-<console port>`. |

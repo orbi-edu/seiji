@@ -479,6 +479,20 @@ impl Store {
             .optional()?)
     }
 
+    /// Removes and returns the user's app `id`; `None` when the user has no such app.
+    pub fn take_app(&self, id: &str, user_id: i64) -> Result<Option<App>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "DELETE FROM apps WHERE id = ?1 AND user_id = ?2 RETURNING id, user_id, filename, path, size",
+                params![id, user_id],
+                |r| {
+                    Ok(App { id: r.get(0)?, user_id: r.get(1)?, filename: r.get(2)?, path: r.get(3)?, size: r.get(4)? })
+                },
+            )
+            .optional()?)
+    }
+
     /// Removes and returns the apps that arrived before `before`.
     pub fn take_apps_before(&self, before: i64) -> Result<Vec<App>> {
         let conn = self.conn();

@@ -250,6 +250,41 @@ async fn uploads_respect_size_and_count_limits() {
 }
 
 #[tokio::test]
+async fn deleting_a_build_frees_its_place() {
+    let env = setup(2).await;
+    let alice = add_user(&env, "alice", QUOTA);
+    let bob = add_user(&env, "bob", QUOTA);
+    let user = env.pool.store.user_by_name("alice").unwrap().unwrap();
+    let http = reqwest::Client::new();
+    let upload = |body: &'static str| {
+        http.post(format!("{}/v1/apps", env.url)).bearer_auth(&alice).header("X-Filename", "app.apk").body(body).send()
+    };
+    let delete = |token: &str, app_id: &str| {
+        http.delete(format!("{}/v1/apps/{app_id}", env.url)).bearer_auth(token.to_string()).send()
+    };
+    let first: Value = upload("one").await.unwrap().json().await.unwrap();
+    let app_id = first["app_id"].as_str().unwrap();
+    assert_eq!(upload("two").await.unwrap().status(), 200);
+    assert_eq!(upload("three").await.unwrap().status(), 429);
+
+    let foreign = delete(&bob, app_id).await.unwrap();
+    assert_eq!(foreign.status(), 404);
+    assert_eq!(foreign.json::<Value>().await.unwrap()["error"], format!("no uploaded app \"{app_id}\""));
+    let dir = env.pool.apps_dir(user.id, app_id);
+    assert!(dir.exists());
+
+    assert_eq!(delete(&alice, app_id).await.unwrap().status(), 204);
+    assert!(!dir.exists());
+    assert!(env.pool.store.app(app_id, user.id).unwrap().is_none());
+    assert_eq!(upload("three").await.unwrap().status(), 200);
+
+    let again = delete(&alice, app_id).await.unwrap();
+    assert_eq!(again.status(), 404);
+    assert_eq!(again.json::<Value>().await.unwrap()["error"], format!("no uploaded app \"{app_id}\""));
+    assert_eq!(delete("sj_invalid", app_id).await.unwrap().status(), 401);
+}
+
+#[tokio::test]
 async fn reaper_ends_leases_of_disabled_users_and_overlong_leases() {
     let env = setup(2).await;
     let alice = client(&env, &add_user(&env, "alice", QUOTA)).await;
