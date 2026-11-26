@@ -1501,6 +1501,7 @@ These routes exist besides `/mcp`. Error bodies of `/v1/apps`, `/v1/runs/…` an
 | `GET /v1/admin/viewer` | Bearer token (admin) | `200` `{"settings", "defaults", "webrtc_problem", "trace_bytes"}` |
 | `PUT /v1/admin/viewer` | Bearer token (admin) | `200`, the same, after the change |
 | `GET /v1/admin/viewer/trace` | Bearer token (admin) | `200`, the last [viewer trace](#the-viewer-trace) as JSON lines |
+| `GET /v1/admin/viewer/diag` | Bearer token (admin) | `200` `{"reports"}`, the last [viewer diagnosis](#the-viewer-diagnosis) reports |
 | `POST /v1/leases/{lease_id}/viewer` | Bearer token | `200`, a viewer link `{"url", "expires_in", "control", "lease_id"}` |
 | `GET /v1/leases/{lease_id}/screenshot.jpg` | Bearer token | `200`, the screen now as JPEG |
 | `GET /v1/leases/{lease_id}/forward` | Bearer token | `101`, a WebSocket that carries a tunnel for `seiji forward` |
@@ -1830,6 +1831,7 @@ These routes take no bearer token. `GET /view/open/{ticket}` trades a ticket (si
 | `GET /view/open/{ticket}` | `303` to the page with the session cookie. A used or expired ticket gets a `401` HTML page |
 | `GET /view/s/{sid}/` | The viewer page |
 | `GET /view/assets/viewer.js`, `GET /view/assets/viewer.css` | The page's script and style, embedded in the binary |
+| `GET /view/assets/diag.js`, `GET /view/assets/probe.html` | The [viewer diagnosis](#the-viewer-diagnosis): its script, and the probe page it opens on the device. No session: neither holds data |
 | `GET /view/s/{sid}/info` | JSON: `lease_id`, `user`, `model`, `device_type`, `runtime`, `udid`, `started_at`, `ends_at_latest`, `control`, `busy` (a run holds the device), `viewers`, `app`, `preset`, `stream_opts` (`fps`, `scale`, `bitrate`), `server_time_ms`, `webrtc` (`viewer.webrtc.enabled`) |
 | `GET /view/s/{sid}/stats` | JSON: `stream` (`started_at_ms`, `fps`, `kbps`, `mean_frame_bytes`, `total_frames`, `total_bytes`, `viewers`, `last_frame_at_ms`), `preset`, `opts` (`fps`, `scale`, `bitrate` now) |
 | `GET /view/s/{sid}/ws` | The WebSocket of the page: the stream out, the input in (below). The `Origin` header, when present, must name this host |
@@ -1856,7 +1858,7 @@ Seiji runs one [`seiji-sim`](configuration.md#viewer) helper for each watched le
 The server sends:
 
 - A text message `{"t": "format", "codec": "avc1.PPCCLL", "width", "height", "description": "<base64 avcC>"}` before the first frame and after a size change: the arguments of WebCodecs `VideoDecoder.configure`.
-- One binary message for each frame: 1 byte of flags (bit 0: keyframe), the frame number (4 bytes, big-endian), then three times in Unix microseconds (8 bytes each, big-endian): the capture, the encoder's output (the capture again from a helper older than this version) and the daemon reading the frame, then the sample in AVCC form (a 4-byte length before each NAL unit). The sample starts at byte 29.
+- One binary message for each frame: 1 byte of flags (bit 0: keyframe; bit 1: a refresh frame, see below), the frame number (4 bytes, big-endian), then three times in Unix microseconds (8 bytes each, big-endian): the capture, the encoder's output (the capture again from a helper older than this version) and the daemon reading the frame, then the sample in AVCC form (a 4-byte length before each NAL unit). The sample starts at byte 29.
 - `{"t": "pong", "at", "server_ms"}` for each ping, `{"t": "preset", "preset", "opts"}` after a preset change, `{"t": "done", "id", "via"}` after a text input, `{"t": "rtc_answer", "sdp"}` after a WebRTC offer, `{"t": "applied", "ts", "read_us", "sent_us"}` after a finger down or up, key or button with `ts`, and every 5 s `{"t": "server_stats", "server", "input", "lock", "pace", "text"}` (see [Where the time goes](#where-the-time-goes)).
 
 The page acknowledges each frame with `{"t": "ack", "seq": <frame number>}` once it has shown it (a frame it skips, once it skipped it), so a slow decoder holds the stream back like a slow link. A viewer whose oldest unacknowledged frame is older than its lowest round trip of the last 10 s plus 100 ms (or 30 frames are in flight) is behind: Seiji skips the frames nothing refers to for it, half of them, and needs no keyframe for that. Past plus 200 ms (or 60 frames in flight) it is congested: Seiji sends it no more frames until it catches up, then resumes it at a refresh frame, a delta frame that the encoder makes from an LTR every viewer has. That is the role of a reference frame invalidation in other streamers, and the frame is about half a keyframe's size, often less. It resumes at a keyframe instead when no LTR is with every viewer yet, or when its page did not say `{"t": "decoder", "refresh": true}`; the page says so in WebKit and Chrome on macOS, where the pictures after a refresh frame were checked to match the full stream (a decoder that took it wrong would show a corrupt picture without an error). So a slow link shows a recent picture at a lower frame rate first, and with gaps if that is not enough, never with a growing delay. A joining viewer gets the current format and a keyframe at once; a viewer that fell behind the shared buffer gets the current format again if it missed one. The page holds the frames that arrive while its decoder is being set up and decodes them after, so a stream starts without a second keyframe; a decoder with up to 16 frames waiting catches up rather than drops them. Seiji reads the page apart from writing to it: input reaches the device while a frame is still on its way down a slow link. When one write to the page stalls for 5 s, Seiji closes the session. Once a session ends, or the page closes its socket, input still queued for it is dropped.
@@ -1906,6 +1908,8 @@ The page sends text messages, each a JSON object with `t`. Points are fractions 
 | `rtc_offer` | `sdp` | A WebRTC offer; see [WebRTC](#webrtc). Also allowed in a view-only session |
 | `video_via` | `via` (`ws`, `rtc`) | Where the page shows the stream from; see [WebRTC](#webrtc). Also allowed in a view-only session |
 | `telemetry` | `report` | The page's timings, every 5 s; see [Where the time goes](#where-the-time-goes). A field the server does not know gets `bad_request`. Also allowed in a view-only session |
+| `diag_open` | `id` | Opens the probe page of the [viewer diagnosis](#the-viewer-diagnosis) in Safari on the device. Answers `done` |
+| `diag_report` | `report` | A [viewer diagnosis](#the-viewer-diagnosis) report, any JSON object, kept for `GET /v1/admin/viewer/diag` |
 
 Input restarts the idle timer. Viewer input is not recorded as a run.
 
@@ -1996,6 +2000,23 @@ jq -sc '
       | map_values(if type == "number" then (. * 10 | round / 10) else . end))
   | sort_by(-.total) | .[]' viewer-trace.jsonl | head
 ```
+
+### The viewer diagnosis
+
+The diagnosis is a developer tool, not a feature for users: it tells where the time of an input goes, end to end, through the real page in a real browser, and which inputs and frames go wrong. In a viewer with control, press ⌃⌥D (or open the viewer link with `#diag` at the end; `#diag=auto` also starts a run) and press **Run**. Leave the screen alone for the 40 s of the run.
+
+1. The page sends `diag_open`. Seiji opens `http://127.0.0.1:<listen.port>/view/assets/probe.html` on the device with `simctl openurl` (the simulator shares the host's network; a `listen.host` other than `0.0.0.0`, `::` or `localhost` is used as is).
+2. The probe draws, at the top, a grid of 11 × 6 cells: a red and a blue corner cell, a calibration row, and 45 bits with the touches and keys it saw, its animation frame, the last key's character, where the last touch was, and a check. Below are a still texture and a bar that moves on every animation frame, so the screen always changes.
+3. The page finds the grid in the canvas, then reads it from every frame it shows (a crop with `createImageBitmap`, 1–4 ms a frame), and every 8th frame the texture too. It plays a fixed script: 5 s idle, 20 taps 400 ms apart, 15 taps 100 ms apart, 43 keys 140 ms apart, 35 keys 30 ms apart, 4 drags of 24 moves, 3 s idle.
+4. For each input it takes the first frame captured after the input went out whose grid shows it. With `applied`, the input's way splits into upload, in server, device (the helper having it to that frame's capture: iOS, the app drawing, the capture) and pipeline (capture to shown: encode, helper to server, server queue and network, decode).
+
+The panel shows, for each phase, the frame rates (shown, arrived, captured, and the probe's own), keyframes, refresh frames, frames the server skipped, damaged frames (the grid unreadable, or the texture off by more than 12 lumas on average), the input stages at p50 and p95, inputs lost (with how many of them the helper had), wrong keys, and the touches and keys the device saw more than were sent. It also lists stalls (no frame shown for 150 ms) and where each one came from. **Copy JSON** copies the report; the page also sends it as `diag_report`, and Seiji keeps the last 20 in memory:
+
+```sh
+curl -fsS -H "Authorization: Bearer $SEIJI_TOKEN" https://seiji.example.com/v1/admin/viewer/diag | jq '.reports[-1].report.verdict'
+```
+
+`GET /v1/admin/viewer/diag` answers `{"reports": [{"received_ms", "report"}, …]}`, oldest first, to an admin; others get `403`. A report holds at most 64 KiB, like any page message.
 
 ## Client setup
 

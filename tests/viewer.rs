@@ -71,7 +71,7 @@ type Socket = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStre
 #[derive(Debug)]
 enum Msg {
     Text(Value),
-    Frame { key: bool, seq: u32 },
+    Frame { key: bool, seq: u32, refresh: bool },
     Closed(u16, String),
 }
 
@@ -108,7 +108,8 @@ async fn next(ws: &mut Socket) -> Msg {
         match m {
             Some(Ok(tungstenite::Message::Text(t))) => return Msg::Text(serde_json::from_str(&t).unwrap()),
             Some(Ok(tungstenite::Message::Binary(b))) => {
-                return Msg::Frame { key: b[0] & 1 == 1, seq: u32::from_be_bytes(b[1..5].try_into().unwrap()) };
+                let seq = u32::from_be_bytes(b[1..5].try_into().unwrap());
+                return Msg::Frame { key: b[0] & 1 == 1, seq, refresh: b[0] & 2 == 2 };
             }
             Some(Ok(tungstenite::Message::Close(f))) => {
                 return f.map_or(Msg::Closed(1005, String::new()), |f| {
@@ -157,12 +158,18 @@ async fn format(ws: &mut Socket) -> Value {
 
 /// The next frame, acknowledged; text messages on the way are skipped.
 async fn frame(ws: &mut Socket) -> (bool, u32) {
+    let (key, seq, _) = frame_flags(ws).await;
+    (key, seq)
+}
+
+/// As `frame`, with whether it is a refresh frame.
+async fn frame_flags(ws: &mut Socket) -> (bool, u32, bool) {
     within("frame", async {
         loop {
             match next(ws).await {
-                Msg::Frame { key, seq } => {
+                Msg::Frame { key, seq, refresh } => {
                     send(ws, json!({"t": "ack", "seq": seq})).await;
-                    return (key, seq);
+                    return (key, seq, refresh);
                 }
                 Msg::Text(_) => {}
                 Msg::Closed(code, why) => panic!("closed {code}: {why}"),
@@ -359,7 +366,7 @@ async fn a_still_screen_reaches_a_viewer_that_joins_later() {
 
 /// Acknowledges nothing for 1.5 s, then the last frame it got: returns that frame's number and
 /// the next frame.
-async fn stall_then_catch_up(env: &Env, ws: &mut Socket) -> (u32, (bool, u32)) {
+async fn stall_then_catch_up(env: &Env, ws: &mut Socket) -> (u32, (bool, u32, bool)) {
     // Frames queue up on the way, and past half a second the server stops sending instead of
     // queueing more.
     let started = std::time::Instant::now();
@@ -378,7 +385,7 @@ async fn stall_then_catch_up(env: &Env, ws: &mut Socket) -> (u32, (bool, u32)) {
     // A congested viewer lowers the shared bitrate.
     assert!(env.fake.log().iter().any(|l| l.starts_with("encode 60 0.5 1750000")), "{:?}", env.fake.log());
     send(ws, json!({"t": "ack", "seq": last})).await;
-    (last, frame(ws).await)
+    (last, frame_flags(ws).await)
 }
 
 #[tokio::test]
@@ -390,8 +397,8 @@ async fn a_slow_viewer_gets_no_stale_frames_and_resumes_at_a_refresh_frame() {
     send(&mut ws, json!({"t": "decoder", "refresh": true})).await;
     // Its acknowledgement tells the helper that every viewer has the long-term references up to
     // there, so it resumes at a delta frame that refers to one, not at a keyframe.
-    let (last, (key, seq)) = stall_then_catch_up(&env, &mut ws).await;
-    assert!(!key, "after a gap the next frame is a refresh frame");
+    let (last, (key, seq, refresh)) = stall_then_catch_up(&env, &mut ws).await;
+    assert!(!key && refresh, "after a gap the next frame is a refresh frame, and says so");
     assert!(seq > last + 1, "frames were skipped, not queued");
     assert_eq!(env.fake.refreshes.load(Ordering::SeqCst), 1);
     assert!(env.fake.ltr_acks.lock().unwrap().iter().any(|t| *t <= u64::from(last)), "{:?}", env.fake.ltr_acks);
@@ -404,8 +411,8 @@ async fn a_slow_viewer_whose_decoder_may_not_take_refresh_frames_resumes_at_a_ke
     let mut ws = open(&env, &token, &lease, false).await.ws().await;
     format(&mut ws).await;
     // The page did not say its decoder takes refresh frames.
-    let (last, (key, seq)) = stall_then_catch_up(&env, &mut ws).await;
-    assert!(key, "after a gap the next frame is a keyframe");
+    let (last, (key, seq, refresh)) = stall_then_catch_up(&env, &mut ws).await;
+    assert!(key && !refresh, "after a gap the next frame is a keyframe");
     assert!(seq > last + 1, "frames were skipped, not queued");
     assert!(!env.fake.ltr_acks.lock().unwrap().is_empty(), "the reference was acknowledged all the same");
     assert_eq!(env.fake.refreshes.load(Ordering::SeqCst), 0);
@@ -420,8 +427,8 @@ async fn a_slow_viewer_resumes_at_a_keyframe_while_another_has_no_reference() {
     send(&mut ws, json!({"t": "decoder", "refresh": true})).await;
     // A second viewer that acknowledges nothing: no long-term reference is with every viewer.
     let _other = open(&env, &token, &lease, false).await.ws().await;
-    let (last, (key, seq)) = stall_then_catch_up(&env, &mut ws).await;
-    assert!(key, "after a gap the next frame is a keyframe");
+    let (last, (key, seq, refresh)) = stall_then_catch_up(&env, &mut ws).await;
+    assert!(key && !refresh, "after a gap the next frame is a keyframe");
     assert!(seq > last + 1, "frames were skipped, not queued");
     assert!(env.fake.ltr_acks.lock().unwrap().is_empty(), "{:?}", env.fake.ltr_acks);
     assert_eq!(env.fake.refreshes.load(Ordering::SeqCst), 0);
@@ -1339,4 +1346,49 @@ async fn an_admin_traces_each_input_and_frame_without_coordinates_or_text() {
     assert_eq!(trace_lines(&env, &alice).await.1.len(), before);
     set_viewer(&env, &alice, json!({"trace": true})).await;
     assert!(trace_lines(&env, &alice).await.1.iter().all(|l| l["ev"] != "input"), "a new trace starts empty");
+}
+
+#[tokio::test]
+async fn the_diagnosis_opens_its_probe_on_the_device_and_an_admin_reads_the_reports() {
+    let listen = json!({"host": "0.0.0.0", "port": 4780});
+    let env = setup_with(2, json!({ "adminUsers": ["alice"], "listen": listen })).await;
+    let (alice, lease) = device(&env, "alice").await;
+    let bob = add_user(&env, "bob", QUOTA);
+
+    // The device reaches the probe page on loopback, where Seiji serves it without a session.
+    let mut ws = open(&env, &alice, &lease, true).await.ws().await;
+    format(&mut ws).await;
+    send(&mut ws, json!({"t": "diag_open", "id": 7})).await;
+    within("done", async { while text(&mut ws).await != json!({"t": "done", "id": 7}) {} }).await;
+    logged(&env, r#"op open_url OpenUrl("http://127.0.0.1:4780/view/assets/probe.html")"#).await;
+    let probe = http().get(format!("{}/view/assets/probe.html", env.url)).send().await.unwrap();
+    assert_eq!(probe.status(), 200);
+    assert!(probe.headers()["content-type"].to_str().unwrap().starts_with("text/html"));
+
+    let reports = |token: String| {
+        let url = format!("{}/v1/admin/viewer/diag", env.url);
+        async move { http().get(url).bearer_auth(token).send().await.unwrap() }
+    };
+    send(&mut ws, json!({"t": "diag_report", "report": {"version": 1, "transport": "ws"}})).await;
+    let got: Value = within("report", async {
+        loop {
+            let v: Value = reports(alice.clone()).await.json().await.unwrap();
+            if !v["reports"].as_array().unwrap().is_empty() {
+                return v;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert_eq!(got["reports"][0]["report"], json!({"version": 1, "transport": "ws"}), "{got}");
+    assert!(got["reports"][0]["received_ms"].is_i64(), "{got}");
+    assert_eq!(reports(bob.clone()).await.status(), 403);
+
+    // A view-only page opens nothing on the device.
+    let mut watch = open(&env, &alice, &lease, false).await.ws().await;
+    format(&mut watch).await;
+    send(&mut watch, json!({"t": "diag_open", "id": 8})).await;
+    assert_eq!(text(&mut watch).await["code"], "view_only");
+    let opens = env.fake.log().iter().filter(|l| l.starts_with("op open_url")).count();
+    assert_eq!(opens, 1, "{:?}", env.fake.log());
 }

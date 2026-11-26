@@ -115,6 +115,12 @@ const FRAME_HEADER: usize = 29;
 const PAGE: &str = include_str!("viewer/index.html");
 const SCRIPT: &str = include_str!("viewer/viewer.js");
 const STYLE: &str = include_str!("viewer/viewer.css");
+/// The viewer diagnosis, a developer tool: the page's half, and the page it opens on the device.
+const DIAG: &str = include_str!("viewer/diag.js");
+const PROBE: &str = include_str!("viewer/probe.html");
+/// How many diagnosis reports the server keeps. A report, like any page message, holds at most
+/// `MAX_CLIENT_MESSAGE` bytes.
+const MAX_DIAGS: usize = 20;
 
 struct Ticket {
     /// The lease's owner: the session acts as this user's account.
@@ -512,11 +518,12 @@ fn format_message(f: &ScreenFormat) -> String {
     .to_string()
 }
 
-/// Flags (bit 0: keyframe), frame number, then the capture, encode and receipt times in Unix
-/// microseconds (the encode time is the capture time for an older helper), then the sample.
+/// Flags (bit 0: keyframe, bit 1: a refresh frame, a delta frame that refers only to a long-term
+/// reference), frame number, then the capture, encode and receipt times in Unix microseconds (the
+/// encode time is the capture time for an older helper), then the sample.
 fn frame_message(seq: u32, f: &VideoFrame, received_us: i64) -> Encoded {
     let mut out = Vec::with_capacity(FRAME_HEADER + f.data.len());
-    out.push(u8::from(f.key));
+    out.push(u8::from(f.key) | (u8::from(f.refresh && !f.key) << 1));
     out.extend_from_slice(&seq.to_be_bytes());
     out.extend_from_slice(&f.captured_us.to_be_bytes());
     out.extend_from_slice(&f.encoded_us.unwrap_or(f.captured_us).to_be_bytes());
@@ -567,6 +574,8 @@ pub struct Viewers {
     fps: AtomicU8,
     /// The viewer trace, off until an admin turns it on.
     trace: trace::Trace,
+    /// The last diagnosis reports pages sent, oldest first (`/v1/admin/viewer/diag`).
+    diags: StdMutex<VecDeque<serde_json::Value>>,
 }
 
 /// The viewer settings an admin can change while Seiji runs (`/v1/admin/viewer`).
@@ -590,6 +599,7 @@ impl Viewers {
             webrtc: AtomicBool::new(cfg.webrtc.enabled),
             fps: AtomicU8::new(cfg.fps),
             trace: trace::Trace::new(data_dir.join("viewer-trace.jsonl")),
+            diags: StdMutex::default(),
         }
     }
 
@@ -638,6 +648,21 @@ impl Viewers {
             self.trace.stop();
             Ok(())
         }
+    }
+
+    /// Keeps a page's diagnosis report, with when it came, and drops the oldest past
+    /// `MAX_DIAGS`.
+    fn add_diag(&self, report: serde_json::Value) {
+        let mut diags = self.diags.lock().expect("diags mutex");
+        diags.push_back(serde_json::json!({ "received_ms": now_ms(), "report": report }));
+        while diags.len() > MAX_DIAGS {
+            diags.pop_front();
+        }
+    }
+
+    /// The diagnosis reports pages sent since Seiji started, at most `MAX_DIAGS`, oldest first.
+    pub fn diags(&self) -> Vec<serde_json::Value> {
+        self.diags.lock().expect("diags mutex").iter().cloned().collect()
     }
 
     /// The trace file, and its size when there is one.
@@ -1109,6 +1134,14 @@ enum ClientMsg {
     },
     /// What the page showed, every second while the viewer trace is on; see `trace`.
     Trace(Box<trace::PageTrace>),
+    /// The viewer diagnosis: open the probe page on the device; answered with `done`.
+    DiagOpen {
+        id: u32,
+    },
+    /// The viewer diagnosis: the page's report, kept for `GET /v1/admin/viewer/diag`.
+    DiagReport {
+        report: serde_json::Value,
+    },
 }
 
 impl ClientMsg {
@@ -1137,6 +1170,7 @@ impl ClientMsg {
             ClientMsg::Type { .. } => "type",
             ClientMsg::Paste { .. } => "paste",
             ClientMsg::PasteAndType { .. } => "paste_and_type",
+            ClientMsg::DiagOpen { .. } => "diag_open",
             _ => "other",
         }
     }
@@ -1499,7 +1533,9 @@ async fn read_page(
                 | ClientMsg::Button { .. }
                 | ClientMsg::Type { .. }
                 | ClientMsg::Paste { .. }
-                | ClientMsg::PasteAndType { .. },
+                | ClientMsg::PasteAndType { .. }
+                | ClientMsg::DiagOpen { .. }
+                | ClientMsg::DiagReport { .. },
             ) if !control => view_only(&t),
             Ok(ClientMsg::Preset { name }) => {
                 let opts = hub.set_preset(name, &pool.config.viewer, pool.viewers.fps());
@@ -1557,6 +1593,10 @@ async fn read_page(
                 } else {
                     None
                 }
+            }
+            Ok(ClientMsg::DiagReport { report }) => {
+                pool.viewers.add_diag(report);
+                None
             }
             Ok(msg) => input.try_send((msg, Instant::now())).err().map(|_| ViewError::Busy.message(None)),
             Err(e) => Some(ViewError::Bad(format!("invalid message: {e}")).message(None)),
@@ -1686,7 +1726,10 @@ impl Input {
 
     async fn apply(&mut self, msg: ClientMsg) -> Option<Message> {
         let id = match &msg {
-            ClientMsg::Type { id, .. } | ClientMsg::Paste { id, .. } | ClientMsg::PasteAndType { id, .. } => Some(*id),
+            ClientMsg::Type { id, .. }
+            | ClientMsg::Paste { id, .. }
+            | ClientMsg::PasteAndType { id, .. }
+            | ClientMsg::DiagOpen { id } => Some(*id),
             _ => None,
         };
         let reply = match self.apply_inner(msg).await {
@@ -1761,6 +1804,13 @@ impl Input {
                 let via = self.pasted(&text).await?;
                 return Ok(Some(done(id, Some(via))));
             }
+            ClientMsg::DiagOpen { id } => {
+                let _held = self.hold().await?;
+                hub.sync().await?;
+                let url = probe_url(&self.pool.config.listen);
+                self.pool.devices.device_op(&self.ctx, &DeviceOp::OpenUrl(url)).await?;
+                return Ok(Some(done(id, None)));
+            }
             // The reader handles these; they never reach the input queue.
             ClientMsg::Ack { .. }
             | ClientMsg::Ping { .. }
@@ -1770,7 +1820,8 @@ impl Input {
             | ClientMsg::VideoVia { .. }
             | ClientMsg::Decoder { .. }
             | ClientMsg::Telemetry { .. }
-            | ClientMsg::Trace(_) => {}
+            | ClientMsg::Trace(_)
+            | ClientMsg::DiagReport { .. } => {}
         }
         Ok(None)
     }
@@ -1980,10 +2031,23 @@ async fn page(State(pool): State<Arc<Pool>>, Path(sid): Path<String>, headers: H
     resp
 }
 
+/// The probe page of the viewer diagnosis, as the device reaches this server: the simulator
+/// shares the host's network, so an address Seiji listens on everywhere is reached on loopback.
+fn probe_url(listen: &crate::config::Listen) -> String {
+    let host = match listen.host.as_str() {
+        "" | "0.0.0.0" | "::" | "localhost" => "127.0.0.1".to_string(),
+        h if h.contains(':') => format!("[{h}]"),
+        h => h.to_string(),
+    };
+    format!("http://{host}:{}/view/assets/probe.html", listen.port)
+}
+
 async fn asset(Path(name): Path<String>) -> Response {
     let (body, kind) = match name.as_str() {
         "viewer.js" => (SCRIPT, "text/javascript; charset=utf-8"),
         "viewer.css" => (STYLE, "text/css; charset=utf-8"),
+        "diag.js" => (DIAG, "text/javascript; charset=utf-8"),
+        "probe.html" => (PROBE, "text/html; charset=utf-8"),
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
     let mut resp = ([(header::CONTENT_TYPE, kind)], body).into_response();

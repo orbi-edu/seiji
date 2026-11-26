@@ -314,12 +314,14 @@ With `viewer.webrtc.enabled`, a page can take the stream and send its input over
 
 ### The page
 
-The page and its assets (`/view/assets/viewer.js`, `/view/assets/viewer.css`) are embedded in the binary. The page carries:
+The page and its assets (`/view/assets/viewer.js`, `/view/assets/viewer.css`, and the [viewer diagnosis](mcp.md#the-viewer-diagnosis)'s `diag.js` and `probe.html`) are embedded in the binary. The assets need no session: they hold no data. The page carries:
 
 - `Content-Security-Policy: default-src 'none'; img-src 'self' blob:; script-src 'self'; style-src 'self'; connect-src 'self' wss://<host> ws://<host>; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`, where `<host>` is the request's `Host` (not every browser counts a WebSocket to the same host as `'self'`)
 - `Cache-Control: no-store`, `Referrer-Policy: no-referrer` and `X-Content-Type-Options: nosniff`
 
 No inline script runs, and no other site can frame the page.
+
+The diagnosis (a developer tool) adds two messages to a session with control. `diag_open` opens one fixed URL on the device, the probe page on this server's loopback port: the page gives no part of it, and it goes through `Runner` as the user's account like any `open_url`. `diag_report` keeps the page's report in memory, at most 20 of them, for `GET /v1/admin/viewer/diag`, which only an admin reads. A report holds what the page measured of its own run; the probe shows nothing but its own counters.
 
 ### What the viewer does not give
 

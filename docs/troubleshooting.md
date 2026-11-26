@@ -567,12 +567,14 @@ grep "viewer pipeline" /usr/local/var/log/seiji.log | tail
 
 To see which tap or frame was slow, and where its time went, turn the [viewer trace](mcp.md#the-viewer-trace) on (**Viewer settings** in the Tern plugin, or `PUT /v1/admin/viewer` with `{"trace": true}`), use the viewer, download the trace and run the `jq` in [mcp.md](mcp.md#the-viewer-trace). Turn it off afterwards.
 
+To measure a browser end to end, with known inputs, run the [viewer diagnosis](mcp.md#the-viewer-diagnosis): ⌃⌥D in a viewer with control, then **Run**. It opens a probe page on the device, plays 40 s of taps, keys and drags, and tells which stage takes the time, which inputs were lost and which frames were damaged. Admins read every report with `GET /v1/admin/viewer/diag`.
+
 | The big stage | What it means | What helps |
 |---|---|---|
 | Encode | The Mac's media engine is busy (many watched leases) | Fewer streams, or a lower `viewer.scale` |
 | Helper → server, or in server | The daemon is behind (CPU), or the write waits on the viewer's socket | Check the host's load; "in server" that grows with the network means the link is full |
 | Network | The path between the host and the viewer: the TLS proxy, the internet, the viewer's own link | Compare `rtt` with a ping from the viewer's machine to `1.1.1.1`; pick **Smooth** |
-| Decode | The viewer's machine decodes slowly | Close other video in the browser; a lower `viewer.scale` |
+| Decode | The viewer's machine decodes slowly. In Safari and Tern (WebKit), the decoder holds about 7 frames before it shows one: the diagnosis measured 120 ms at 60 fps and 240 ms at 30 fps, where Chrome took 2 ms | Close other video in the browser; a lower `viewer.scale`; Chrome |
 | Upload | The path from the viewer to the host, as for the network | As for the network |
 | Input in server: lock | A run holds the device, or another viewer's finger is down | Wait for the run |
 | Input in server: pacing | The link bunched a gesture's points, and Seiji spaces them again (up to `viewer.paceMaxMs`) | A lower cap in **Viewer settings** ([tern.md](tern.md)), at the cost of swipes that fling |

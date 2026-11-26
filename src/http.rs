@@ -459,6 +459,17 @@ async fn admin_set_viewer(
     viewer_settings(&pool)
 }
 
+/// `GET /v1/admin/viewer/diag`: the last viewer diagnosis reports, oldest first.
+async fn admin_viewer_diag(
+    State(pool): State<Arc<Pool>>,
+    Extension(AuthedUser(caller)): Extension<AuthedUser>,
+) -> Response {
+    if !pool.config.admin_users.contains(&caller.name) {
+        return bad(StatusCode::FORBIDDEN, "admin access required");
+    }
+    Json(serde_json::json!({ "reports": pool.viewers.diags() })).into_response()
+}
+
 /// `GET /v1/admin/viewer/trace`: the last viewer trace, as JSON lines.
 async fn admin_viewer_trace(
     State(pool): State<Arc<Pool>>,
@@ -577,6 +588,7 @@ pub fn router(pool: Arc<Pool>, shutdown: CancellationToken) -> Router {
         .route("/v1/admin/leases/{lease_id}/viewer", post(admin_viewer_link))
         .route("/v1/admin/viewer", get(admin_viewer).put(admin_set_viewer))
         .route("/v1/admin/viewer/trace", get(admin_viewer_trace))
+        .route("/v1/admin/viewer/diag", get(admin_viewer_diag))
         .route("/v1/leases/{lease_id}/viewer", post(viewer_link))
         .route("/v1/leases/{lease_id}/screenshot.jpg", get(lease_screenshot))
         .route("/v1/leases/{lease_id}/forward", get(forward))

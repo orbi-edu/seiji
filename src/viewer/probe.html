@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Seiji probe</title>
+<style>
+html, body { margin: 0; height: 100%; overflow: hidden; background: #808080; touch-action: none;
+  -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
+canvas { position: fixed; left: 0; top: 0; }
+input { position: fixed; left: 0; top: 0; width: 1px; height: 1px; opacity: 0; border: 0; padding: 0; font-size: 16px; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<input id="k" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
+<script>
+// The probe page of Seiji's viewer diagnosis (`diag.js` reads it back from the decoded video).
+// It draws, at the top, a grid of 11 x 6 cells:
+//   row 0: a red cell, the calibration cells 1 0 1 0 1 0 1 0 1 (white is 1), a blue cell;
+//   rows 1-5: a black cell, 9 data cells, a black cell. The 45 data bits, row by row: the touches
+//   seen (8 bits), the keys seen (8), the animation frame (8), the last key's character (7), the
+//   last touch's x and y in 32ths of the page (5 + 5), and a check (4).
+// Below the grid, a still texture shows what the video does to detail, and a bar moves on every
+// animation frame, so the screen always changes.
+"use strict";
+(() => {
+  const canvas = document.getElementById("c");
+  const input = document.getElementById("k");
+  const g = canvas.getContext("2d", { alpha: false });
+  const COLS = 11;
+  let w = 0, h = 0, cell = 0, x0 = 0, y0 = 8;
+  let taps = 0, keys = 0, frame = 0, last = 0, px = 0, py = 0;
+
+  function texture() {
+    const tx = x0 + cell / 2, ty = y0 + 6.5 * cell, tw = 10 * cell, th = 6 * cell;
+    const q = cell / 4;
+    for (let r = 0; r < 24; r++) {
+      for (let c = 0; c < 40; c++) {
+        const v = (r * 7 + c * 13 + ((r * c) % 5) * 29) % 64;
+        const on = (r + c) % 2 === 0;
+        g.fillStyle = on ? `rgb(${40 + v * 3}, ${200 - v * 2}, ${90 + (v % 7) * 20})` : `rgb(${20 + (v % 9) * 9}, ${20 + (v % 5) * 12}, ${30 + v})`;
+        g.fillRect(tx + c * q, ty + r * q, q, q);
+      }
+    }
+    g.fillStyle = "#fff";
+    g.font = `${Math.round(cell * 0.45)}px -apple-system, sans-serif`;
+    g.fillText("Seiji probe 0123456789 ABCDEFGH", tx + 4, ty + th - cell * 0.3);
+    const grad = g.createLinearGradient(tx, 0, tx + tw, 0);
+    grad.addColorStop(0, "#000");
+    grad.addColorStop(0.5, "#f0a");
+    grad.addColorStop(1, "#fff");
+    g.fillStyle = grad;
+    g.fillRect(tx, ty + th - cell * 0.15 - cell * 1.2, tw, cell * 0.5);
+  }
+
+  function layout() {
+    w = window.innerWidth;
+    h = window.innerHeight;
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = Math.round(w * dpr);
+    canvas.height = Math.round(h * dpr);
+    canvas.style.width = `${w}px`;
+    canvas.style.height = `${h}px`;
+    g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    cell = Math.floor(w / COLS);
+    x0 = Math.floor((w - COLS * cell) / 2);
+    g.fillStyle = "#808080";
+    g.fillRect(0, 0, w, h);
+    texture();
+  }
+
+  function cellAt(r, c, color) {
+    g.fillStyle = color;
+    g.fillRect(x0 + c * cell, y0 + r * cell, cell, cell);
+  }
+
+  function draw() {
+    frame = (frame + 1) & 255;
+    const check = (taps + 3 * keys + 5 * frame + 7 * last + 11 * px + 13 * py) & 15;
+    const bits = [];
+    for (const [v, n] of [[taps & 255, 8], [keys & 255, 8], [frame, 8], [last, 7], [px, 5], [py, 5], [check, 4]]) {
+      for (let i = 0; i < n; i++) bits.push((v >> i) & 1);
+    }
+    cellAt(0, 0, "#ff0000");
+    cellAt(0, COLS - 1, "#0000ff");
+    for (let c = 1; c < COLS - 1; c++) cellAt(0, c, c % 2 ? "#ffffff" : "#000000");
+    for (let r = 1; r <= 5; r++) {
+      cellAt(r, 0, "#000000");
+      cellAt(r, COLS - 1, "#000000");
+      for (let c = 1; c < COLS - 1; c++) cellAt(r, c, bits[(r - 1) * 9 + (c - 1)] ? "#ffffff" : "#000000");
+    }
+    // The moving bar, under the texture.
+    const by = y0 + 13 * cell;
+    g.fillStyle = "#808080";
+    g.fillRect(x0, by, COLS * cell, cell);
+    g.fillStyle = "#ffd400";
+    g.fillRect(x0 + ((frame * 4) % (9 * cell)), by, 2 * cell, cell);
+    requestAnimationFrame(draw);
+  }
+
+  function at(t) {
+    px = Math.max(0, Math.min(31, Math.round((t.clientX / w) * 31)));
+    py = Math.max(0, Math.min(31, Math.round((t.clientY / h) * 31)));
+  }
+  // `touch-action: none` keeps the page from scrolling and zooming; the touches are not
+  // cancelled, so a tap still clicks.
+  window.addEventListener("touchstart", (ev) => {
+    taps += ev.changedTouches.length;
+    at(ev.changedTouches[0]);
+  });
+  window.addEventListener("touchmove", (ev) => at(ev.changedTouches[0]));
+  // Keys reach the page only while something in it has focus. On the simulator, focus given in
+  // a touch handler did not take; given in the tap's click, it does.
+  window.addEventListener("click", () => {
+    if (document.activeElement !== input) input.focus();
+  });
+  window.addEventListener("keydown", (ev) => {
+    if (["Shift", "Control", "Alt", "Meta", "CapsLock"].includes(ev.key)) return;
+    ev.preventDefault();
+    keys += 1;
+    last = ev.key.length === 1 ? ev.key.charCodeAt(0) & 127 : 0;
+  }, true);
+  window.addEventListener("resize", layout);
+  layout();
+  requestAnimationFrame(draw);
+})();
+</script>
+</body>
+</html>
