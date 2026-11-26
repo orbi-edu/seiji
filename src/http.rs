@@ -1,6 +1,6 @@
 //! HTTP surface: `/mcp` (Streamable HTTP MCP with SSE responses and 15 s keepalives),
-//! `POST /v1/apps` (build upload), run evidence downloads under `/v1/runs/{run_id}/`,
-//! admin endpoints under `/v1/admin/`, and `/healthz`.
+//! `POST /v1/apps` (build upload), `DELETE /v1/apps/{app_id}`, run evidence downloads under
+//! `/v1/runs/{run_id}/`, admin endpoints under `/v1/admin/`, and `/healthz`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,7 +12,7 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, post, put},
+    routing::{delete, get, post, put},
 };
 use futures_util::StreamExt;
 use rmcp::transport::streamable_http_server::{
@@ -110,6 +110,19 @@ async fn store_upload(pool: &Pool, user: &User, filename: &str, body: Body) -> R
     Ok(app)
 }
 
+/// `DELETE /v1/apps/{app_id}`: deletes one of the caller's builds and frees its place.
+async fn delete_app(
+    State(pool): State<Arc<Pool>>,
+    Extension(AuthedUser(user)): Extension<AuthedUser>,
+    UrlPath(app_id): UrlPath<String>,
+) -> Response {
+    match pool.delete_build(&user, &app_id) {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => bad(StatusCode::NOT_FOUND, format!("no uploaded app {app_id:?}")),
+        Err(e) => bad(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+    }
+}
+
 /// Streams a daemon-owned file as the response body.
 async fn file_response(path: &std::path::Path, content_type: &str, download_name: Option<&str>) -> Response {
     let file = match tokio::fs::File::open(path).await {
@@ -198,13 +211,21 @@ async fn run_report(
     }
 }
 
-/// `GET /v1/me`: who the token belongs to, for clients that sign in (`seiji login`, Tern), and
-/// the server's build, which `seiji update` brings the clients to.
+/// `GET /v1/me`: who the token belongs to, for clients that sign in (`seiji login`, Tern), its
+/// limits (`quota.maxBuilds` is the effective build limit), how long builds are kept, and the
+/// server's build, which `seiji update` brings the clients to.
 async fn me(State(pool): State<Arc<Pool>>, Extension(AuthedUser(user)): Extension<AuthedUser>) -> Response {
     let is_admin = pool.config.admin_users.contains(&user.name);
+    let quota = crate::config::Quota { max_builds: Some(pool.config.max_builds(&user.quota)), ..user.quota };
     let server = serde_json::json!({ "version": env!("CARGO_PKG_VERSION"), "commit": crate::COMMIT });
-    Json(serde_json::json!({ "user": user.name, "quota": user.quota, "is_admin": is_admin, "server": server }))
-        .into_response()
+    Json(serde_json::json!({
+        "user": user.name,
+        "quota": quota,
+        "app_retention_hours": pool.config.app_retention_hours,
+        "is_admin": is_admin,
+        "server": server,
+    }))
+    .into_response()
 }
 
 /// A user entry for the admin endpoints.
@@ -219,6 +240,8 @@ struct AdminUserEntry {
     max_concurrent: i64,
     max_lease_minutes: i64,
     idle_minutes: i64,
+    /// The user's own build limit; `None` (JSON null) follows `maxBuildsPerUser`.
+    max_builds: Option<i64>,
     used_minutes: f64,
     active_devices: usize,
 }
@@ -234,6 +257,7 @@ fn admin_entry(user: &User, is_admin: bool, used_seconds: i64, active_devices: u
         max_concurrent: user.quota.max_concurrent,
         max_lease_minutes: user.quota.max_lease_minutes,
         idle_minutes: user.quota.idle_minutes,
+        max_builds: user.quota.max_builds,
         used_minutes: (used_seconds as f64 / 60.0 * 10.0).round() / 10.0,
         active_devices,
     }
@@ -269,6 +293,7 @@ async fn admin_users(State(pool): State<Arc<Pool>>, Extension(AuthedUser(caller)
         "users": entries,
         "capacity": { "ios": pool.config.capacity.ios, "android": pool.config.capacity.android },
         "in_use": { "ios": ios_in_use, "android": android_in_use },
+        "max_builds_per_user": pool.config.max_builds_per_user,
     }))
     .into_response()
 }
@@ -279,6 +304,9 @@ struct AdminLimitsBody {
     monthly_minutes: i64,
     monthly_unlimited: bool,
     max_concurrent: i64,
+    /// Missing or null: the user follows `maxBuildsPerUser`.
+    #[serde(default)]
+    max_builds: Option<i64>,
 }
 
 /// `PUT /v1/admin/users/{id}/limits`: update a user's admin-editable limits.
@@ -301,8 +329,18 @@ async fn admin_set_limits(
     if body.max_concurrent < 1 {
         return bad(StatusCode::BAD_REQUEST, "max_concurrent must be >= 1");
     }
+    if body.max_builds.is_some_and(|n| n < 1) {
+        return bad(StatusCode::BAD_REQUEST, "max_builds must be >= 1 or null");
+    }
     let outcome = match pool
-        .set_admin_limits(caller.id, user_id, body.monthly_minutes, body.monthly_unlimited, body.max_concurrent)
+        .set_admin_limits(
+            caller.id,
+            user_id,
+            body.monthly_minutes,
+            body.monthly_unlimited,
+            body.max_concurrent,
+            body.max_builds,
+        )
         .await
     {
         Ok(o) => o,
@@ -578,6 +616,7 @@ pub fn router(pool: Arc<Pool>, shutdown: CancellationToken) -> Router {
     let protected = Router::new()
         .nest_service("/mcp", mcp)
         .route("/v1/apps", post(upload))
+        .route("/v1/apps/{app_id}", delete(delete_app))
         .route("/v1/runs/{run_id}/files/{*path}", get(run_file))
         .route("/v1/runs/{run_id}/evidence.zip", get(evidence_zip))
         .route("/v1/runs/{run_id}/report.md", get(run_report))

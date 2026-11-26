@@ -470,7 +470,7 @@ Without `predicate`, `get_logs` uses the installed app's process and subsystem. 
 | `empty upload` | `POST /v1/apps`, `400` | The body was empty. Use `curl --data-binary @file`, not `-d`. |
 | `upload failed: <cause>` | `POST /v1/apps`, `400` | Reading the body failed, for example when the client closed the connection. |
 | `upload exceeds maxUploadBytes (<N> bytes)` | `POST /v1/apps`, `413` | The build is larger than `maxUploadBytes`. Seiji deletes the partial file. |
-| `you already keep <N> builds, the limit is <M>; they expire <H>h after upload` | `POST /v1/apps` (`429`) and `install_app` with `url` | The user keeps `maxBuildsPerUser` builds. Wait until the oldest ones expire after `appRetentionHours`, or raise `maxBuildsPerUser`. |
+| `you already keep <N> builds, the limit is <M>; they expire <H>h after upload` | `POST /v1/apps` (`429`) and `install_app` with `url` | The user keeps its limit of builds: `maxBuilds`, or `maxBuildsPerUser` when its quota has none (`budget_status` shows `max_builds`). Delete builds it no longer needs with `DELETE /v1/apps/{app_id}`, wait until the oldest ones expire after `appRetentionHours`, or raise the limit: `seiji user set <name> --max-builds N` for one user (a service user that many agents share), `maxBuildsPerUser` for everyone. |
 | `pass exactly one of app_id or url` | `install_app` | Pass `app_id` or `url`, not both and not neither. |
 | `no uploaded app "<app_id>"` | `install_app` | The id is wrong, belongs to another user, or the build expired after `appRetentionHours`. Upload it again. |
 | `only https URLs are accepted`, `invalid url`, `url has no file name` | `install_app` with `url` | Use an `https` URL whose path ends with the file name. |

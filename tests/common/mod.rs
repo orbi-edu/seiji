@@ -356,8 +356,14 @@ impl Drop for Env {
     }
 }
 
-pub const QUOTA: Quota =
-    Quota { monthly_minutes: 60, monthly_unlimited: false, max_concurrent: 1, max_lease_minutes: 30, idle_minutes: 10 };
+pub const QUOTA: Quota = Quota {
+    monthly_minutes: 60,
+    monthly_unlimited: false,
+    max_concurrent: 1,
+    max_lease_minutes: 30,
+    idle_minutes: 10,
+    max_builds: None,
+};
 
 pub async fn setup(ios_capacity: i64) -> Env {
     setup_with(ios_capacity, json!({})).await

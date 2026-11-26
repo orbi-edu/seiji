@@ -126,7 +126,8 @@ CREATE TABLE IF NOT EXISTS users (
   max_lease_minutes INTEGER NOT NULL,
   idle_minutes INTEGER NOT NULL,
   disabled INTEGER NOT NULL DEFAULT 0,
-  created_at INTEGER NOT NULL
+  created_at INTEGER NOT NULL,
+  max_builds INTEGER
 );
 CREATE TABLE IF NOT EXISTS leases (
   id TEXT PRIMARY KEY,
@@ -169,8 +170,7 @@ CREATE TABLE IF NOT EXISTS runs (
 CREATE INDEX IF NOT EXISTS runs_user ON runs(user_id, started_at);
 "#;
 
-const USER_COLS: &str =
-    "id, name, os_user, monthly_minutes, monthly_unlimited, max_concurrent, max_lease_minutes, idle_minutes, disabled";
+const USER_COLS: &str = "id, name, os_user, monthly_minutes, monthly_unlimited, max_concurrent, max_lease_minutes, idle_minutes, disabled, max_builds";
 const LEASE_COLS: &str = "id, user_id, platform, model, device_id, driver_port, console_port, status, started_at, last_activity_at, ended_at, end_reason";
 
 fn user_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<User> {
@@ -184,6 +184,7 @@ fn user_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<User> {
             max_concurrent: r.get(5)?,
             max_lease_minutes: r.get(6)?,
             idle_minutes: r.get(7)?,
+            max_builds: r.get(9)?,
         },
         disabled: r.get::<_, i64>(8)? != 0,
     })
@@ -226,13 +227,18 @@ impl Store {
         conn.execute_batch(SCHEMA)?;
         // Serialize schema inspection and migration across concurrent CLI/server opens.
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let has_col: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('users') WHERE name = 'monthly_unlimited')",
-            [],
-            |r| r.get(0),
-        )?;
-        if !has_col {
-            tx.execute_batch("ALTER TABLE users ADD COLUMN monthly_unlimited INTEGER NOT NULL DEFAULT 0")?;
+        // Columns added after the first release; existing rows get the default.
+        for (col, ddl) in [
+            ("monthly_unlimited", "ALTER TABLE users ADD COLUMN monthly_unlimited INTEGER NOT NULL DEFAULT 0"),
+            ("max_builds", "ALTER TABLE users ADD COLUMN max_builds INTEGER"),
+        ] {
+            let has_col: bool =
+                tx.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('users') WHERE name = ?1)", [col], |r| {
+                    r.get(0)
+                })?;
+            if !has_col {
+                tx.execute_batch(ddl)?;
+            }
         }
         tx.commit()?;
         Ok(Self { conn: Mutex::new(conn) })
@@ -253,8 +259,8 @@ impl Store {
         }
         let token = new_token();
         conn.execute(
-            "INSERT INTO users (name, token_hash, os_user, monthly_minutes, monthly_unlimited, max_concurrent, max_lease_minutes, idle_minutes, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO users (name, token_hash, os_user, monthly_minutes, monthly_unlimited, max_concurrent, max_lease_minutes, idle_minutes, max_builds, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 name,
                 hash_token(&token),
@@ -264,6 +270,7 @@ impl Store {
                 quota.max_concurrent,
                 quota.max_lease_minutes,
                 quota.idle_minutes,
+                quota.max_builds,
                 now()
             ],
         )
@@ -302,8 +309,16 @@ impl Store {
 
     pub fn set_quota(&self, name: &str, quota: Quota) -> Result<()> {
         let n = self.conn().execute(
-            "UPDATE users SET monthly_minutes = ?2, monthly_unlimited = ?3, max_concurrent = ?4, max_lease_minutes = ?5, idle_minutes = ?6 WHERE name = ?1",
-            params![name, quota.monthly_minutes, quota.monthly_unlimited as i64, quota.max_concurrent, quota.max_lease_minutes, quota.idle_minutes],
+            "UPDATE users SET monthly_minutes = ?2, monthly_unlimited = ?3, max_concurrent = ?4, max_lease_minutes = ?5, idle_minutes = ?6, max_builds = ?7 WHERE name = ?1",
+            params![
+                name,
+                quota.monthly_minutes,
+                quota.monthly_unlimited as i64,
+                quota.max_concurrent,
+                quota.max_lease_minutes,
+                quota.idle_minutes,
+                quota.max_builds
+            ],
         )?;
         if n == 0 {
             bail!("no user {name:?}");
@@ -311,17 +326,18 @@ impl Store {
         Ok(())
     }
 
-    /// Updates only the admin-editable limits (budget, unlimited flag, concurrency).
+    /// Updates only the admin-editable limits (budget, unlimited flag, concurrency, builds).
     pub fn set_admin_limits(
         &self,
         id: i64,
         monthly_minutes: i64,
         monthly_unlimited: bool,
         max_concurrent: i64,
+        max_builds: Option<i64>,
     ) -> Result<bool> {
         let n = self.conn().execute(
-            "UPDATE users SET monthly_minutes = ?2, monthly_unlimited = ?3, max_concurrent = ?4 WHERE id = ?1",
-            params![id, monthly_minutes, monthly_unlimited as i64, max_concurrent],
+            "UPDATE users SET monthly_minutes = ?2, monthly_unlimited = ?3, max_concurrent = ?4, max_builds = ?5 WHERE id = ?1",
+            params![id, monthly_minutes, monthly_unlimited as i64, max_concurrent, max_builds],
         )?;
         Ok(n > 0)
     }
@@ -471,6 +487,20 @@ impl Store {
             .conn()
             .query_row(
                 "SELECT id, user_id, filename, path, size FROM apps WHERE id = ?1 AND user_id = ?2",
+                params![id, user_id],
+                |r| {
+                    Ok(App { id: r.get(0)?, user_id: r.get(1)?, filename: r.get(2)?, path: r.get(3)?, size: r.get(4)? })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Removes and returns the user's app `id`; `None` when the user has no such app.
+    pub fn take_app(&self, id: &str, user_id: i64) -> Result<Option<App>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "DELETE FROM apps WHERE id = ?1 AND user_id = ?2 RETURNING id, user_id, filename, path, size",
                 params![id, user_id],
                 |r| {
                     Ok(App { id: r.get(0)?, user_id: r.get(1)?, filename: r.get(2)?, path: r.get(3)?, size: r.get(4)? })

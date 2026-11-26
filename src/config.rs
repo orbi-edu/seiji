@@ -73,6 +73,20 @@ pub struct Quota {
     pub max_lease_minutes: i64,
     /// A lease with no tool call for this long is released.
     pub idle_minutes: i64,
+    /// Builds the user may keep at the same time; `None` falls back to `maxBuildsPerUser`.
+    #[serde(default)]
+    pub max_builds: Option<i64>,
+}
+
+impl Quota {
+    /// The budget may be 0; every other limit, `maxBuilds` included when set, is at least 1.
+    pub fn is_valid(&self) -> bool {
+        self.monthly_minutes >= 0
+            && self.max_concurrent >= 1
+            && self.max_lease_minutes >= 1
+            && self.idle_minutes >= 1
+            && self.max_builds.is_none_or(|n| n >= 1)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -379,7 +393,8 @@ pub struct Config {
     /// Uploaded and downloaded builds are deleted this long after they arrive.
     #[serde(default = "default_app_retention")]
     pub app_retention_hours: i64,
-    /// Builds one user may keep at the same time; older ones expire with `appRetentionHours`.
+    /// Builds a user without its own `maxBuilds` may keep at the same time; older ones expire
+    /// with `appRetentionHours`.
     #[serde(default = "default_max_builds")]
     pub max_builds_per_user: i64,
     /// User names allowed to call admin endpoints. Authority is config-only, never client-supplied.
@@ -439,8 +454,7 @@ impl Config {
         if config.capacity.ios < 0 || config.capacity.android < 0 {
             bail!("capacity values must be >= 0");
         }
-        let q = config.default_quota;
-        if q.monthly_minutes < 0 || q.max_concurrent < 1 || q.max_lease_minutes < 1 || q.idle_minutes < 1 {
+        if !config.default_quota.is_valid() {
             bail!("defaultQuota: monthlyMinutes must be >= 0 and the other limits >= 1");
         }
         if config.listen.allowed_hosts.is_empty() {
@@ -502,6 +516,11 @@ impl Config {
             config.data_dir = base_dir.join(&config.data_dir);
         }
         Ok(config)
+    }
+
+    /// Builds `quota`'s user may keep: its own `maxBuilds`, or `maxBuildsPerUser`.
+    pub fn max_builds(&self, quota: &Quota) -> i64 {
+        quota.max_builds.unwrap_or(self.max_builds_per_user)
     }
 
     pub fn capacity(&self, platform: Platform) -> i64 {

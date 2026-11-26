@@ -81,6 +81,10 @@ pub struct BudgetView {
     pub max_concurrent: i64,
     pub max_lease_minutes: i64,
     pub idle_minutes: i64,
+    /// Builds the user may keep at the same time: its `maxBuilds`, or `maxBuildsPerUser`.
+    pub max_builds: i64,
+    /// Hours a build is kept after it arrives.
+    pub app_retention_hours: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub estimated_cost_usd: Option<f64>,
     pub active_leases: Vec<LeaseView>,
@@ -246,6 +250,8 @@ impl Pool {
             max_concurrent: user.quota.max_concurrent,
             max_lease_minutes: user.quota.max_lease_minutes,
             idle_minutes: user.quota.idle_minutes,
+            max_builds: self.config.max_builds(&user.quota),
+            app_retention_hours: self.config.app_retention_hours,
             estimated_cost_usd: self.config.cost_per_device_hour_usd.map(|r| (used / 60.0 * r * 100.0).round() / 100.0),
             active_leases: active,
         })
@@ -275,6 +281,7 @@ impl Pool {
         monthly_minutes: i64,
         monthly_unlimited: bool,
         max_concurrent: i64,
+        max_builds: Option<i64>,
     ) -> Result<AdminLimitsOutcome> {
         let _guard = self.admission.lock().await;
         // Re-check caller under the lock: they may have been disabled/deleted while queued.
@@ -285,7 +292,7 @@ impl Pool {
         if !self.config.admin_users.contains(&caller.name) {
             return Ok(AdminLimitsOutcome::Forbidden);
         }
-        if !self.store.set_admin_limits(target_id, monthly_minutes, monthly_unlimited, max_concurrent)? {
+        if !self.store.set_admin_limits(target_id, monthly_minutes, monthly_unlimited, max_concurrent, max_builds)? {
             return Ok(AdminLimitsOutcome::NotFound);
         }
         Ok(AdminLimitsOutcome::Ok(self.store.user_by_id(target_id)?.context("user vanished after update")?))
@@ -598,13 +605,14 @@ impl Pool {
         .await
     }
 
-    /// Refuses a new build when the user already keeps `maxBuildsPerUser`.
+    /// Refuses a new build when the user already keeps its build limit (`maxBuilds`, or
+    /// `maxBuildsPerUser`).
     pub fn check_build_room(&self, user: &User) -> Result<()> {
         let held = self.store.count_apps(user.id)?;
-        if held >= self.config.max_builds_per_user {
+        let limit = self.config.max_builds(&user.quota);
+        if held >= limit {
             bail!(
-                "you already keep {held} builds, the limit is {}; they expire {}h after upload",
-                self.config.max_builds_per_user,
+                "you already keep {held} builds, the limit is {limit}; they expire {}h after upload",
                 self.config.app_retention_hours
             );
         }
@@ -613,6 +621,23 @@ impl Pool {
 
     pub fn apps_dir(&self, user_id: i64, app_id: &str) -> PathBuf {
         self.config.data_dir.join("apps").join(user_id.to_string()).join(app_id)
+    }
+
+    /// Deletes one of the user's builds before it expires and frees its place in the build limit.
+    /// Returns `false` when the user has no build `app_id`. A device that has the app installed
+    /// keeps it: an install copies the build into the lease dir.
+    pub fn delete_build(&self, user: &User, app_id: &str) -> Result<bool> {
+        let Some(app) = self.store.take_app(app_id, user.id)? else { return Ok(false) };
+        self.remove_build_files(&app, "deleted");
+        Ok(true)
+    }
+
+    /// Deletes the directory of a build whose row is already gone.
+    fn remove_build_files(&self, app: &App, reason: &str) {
+        match std::fs::remove_dir_all(self.apps_dir(app.user_id, &app.id)) {
+            Ok(()) => tracing::info!(app = %app.id, user_id = app.user_id, reason, "build deleted"),
+            Err(e) => tracing::warn!(app = %app.id, "deleting {reason} build: {e}"),
+        }
     }
 
     async fn download_app(&self, user: &User, url: &str) -> Result<App> {
@@ -676,9 +701,7 @@ impl Pool {
         let t = now();
         self.viewers.prune(t);
         for app in self.store.take_apps_before(t - self.config.app_retention_hours * 3600)? {
-            if let Err(e) = std::fs::remove_dir_all(self.apps_dir(app.user_id, &app.id)) {
-                tracing::warn!(app = %app.id, "deleting expired build: {e}");
-            }
+            self.remove_build_files(&app, "expired");
         }
         for run in self.store.take_runs_before(t - self.config.evidence.retention_hours * 3600)? {
             let dir = crate::evidence::run_dir(&self.config, run.user_id, &run.id);

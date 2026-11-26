@@ -53,7 +53,7 @@ Seiji reads one JSON file, `seiji.json`. This document is the reference for ever
 | `ios.bootTimeoutSeconds` is above 0 | `ios.bootTimeoutSeconds must be > 0` |
 | `seats` is at least 1 | `seats must be >= 1` |
 | `capacity.ios` and `capacity.android` are not negative | `capacity values must be >= 0` |
-| `defaultQuota.monthlyMinutes` is at least 0, and `maxConcurrent`, `maxLeaseMinutes` and `idleMinutes` are at least 1 | `defaultQuota: monthlyMinutes must be >= 0 and the other limits >= 1` |
+| `defaultQuota.monthlyMinutes` is at least 0, and `maxConcurrent`, `maxLeaseMinutes`, `idleMinutes` and `maxBuilds` (when set) are at least 1 | `defaultQuota: monthlyMinutes must be >= 0 and the other limits >= 1` |
 | `listen.allowedHosts` is not empty | `listen.allowedHosts must not be empty` |
 | `maestro.flowTimeoutSeconds` (when `maestro` is set), `appRetentionHours` and `maxBuildsPerUser` are above 0 | `maestro.flowTimeoutSeconds, appRetentionHours and maxBuildsPerUser must be > 0` |
 | `evidence.retentionHours`, `evidence.maxRunSeconds`, `evidence.maxSteps`, `evidence.maxRunBytes` and `evidence.maxBytesPerUser` are above 0 | `evidence.retentionHours, maxRunSeconds, maxSteps, maxRunBytes and maxBytesPerUser must be > 0` |
@@ -134,8 +134,9 @@ The quota that `seiji user add` gives a new user for each flag you omit. Changin
 | `defaultQuota.maxConcurrent` | integer | required | Devices one user may hold at the same time. At least 1. |
 | `defaultQuota.maxLeaseMinutes` | integer | required | Longest wall-clock length of one lease, boot included. The reaper releases the lease with `max_lease_duration`. At least 1. |
 | `defaultQuota.idleMinutes` | integer | required | A `ready` lease with no tool call for this long is released with `idle`. The clock starts when the device becomes ready, then restarts at each tool call. A running operation is never idle. At least 1. |
+| `defaultQuota.maxBuilds` | integer | none | Builds the user may keep at the same time, uploaded and downloaded together. At least 1. Without it, the user has no build limit of its own and follows [`maxBuildsPerUser`](#maxbuildsperuser). |
 
-`monthlyMinutes`, `maxConcurrent`, `maxLeaseMinutes` and `idleMinutes` are required. `monthlyUnlimited` defaults to `false`. `Config::parse` checks the same limits, so a bad `defaultQuota` stops every command at load time. [concepts.md](concepts.md) explains how Seiji counts device-minutes and applies each limit.
+`monthlyMinutes`, `maxConcurrent`, `maxLeaseMinutes` and `idleMinutes` are required. `monthlyUnlimited` defaults to `false`. `maxBuilds` is optional; leave it out so that new users follow `maxBuildsPerUser`. `Config::parse` checks the same limits, so a bad `defaultQuota` stops every command at load time. [concepts.md](concepts.md) explains how Seiji counts device-minutes and applies each limit.
 
 ## `adminUsers`
 
@@ -333,9 +334,11 @@ The reaper checks every 15 s. A build already installed on a device stays on tha
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `maxBuildsPerUser` | integer | `10` | Builds one user may keep at the same time, uploaded and downloaded together. At least 1. |
+| `maxBuildsPerUser` | integer | `10` | Builds a user may keep at the same time, uploaded and downloaded together, when its quota has no `maxBuilds`. At least 1. |
 
-When the user already keeps this many builds, `POST /v1/apps` answers `429` and `install_app` with a `url` fails, both with `you already keep <N> builds, the limit is <maxBuildsPerUser>; they expire <appRetentionHours>h after upload`. Builds leave the count only when the reaper deletes them after `appRetentionHours`; there is no tool to delete one earlier.
+`maxBuildsPerUser` is the default. A user's own `maxBuilds` overrides it: set it with `seiji user add|set --max-builds N` ([cli.md](cli.md#seiji-user)) or `max_builds` in `PUT /v1/admin/users/{id}/limits` ([mcp.md](mcp.md#put-v1adminusersidlimits)). Give a service user, one account that many agents share, a higher limit than a person. `--max-builds default` returns the user to `maxBuildsPerUser`. A change applies to the next upload.
+
+When the user already keeps its limit of builds, `POST /v1/apps` answers `429` and `install_app` with a `url` fails, both with `you already keep <N> builds, the limit is <limit>; they expire <appRetentionHours>h after upload`. Builds leave the count when the reaper deletes them after `appRetentionHours`, or earlier when the user deletes one with `DELETE /v1/apps/{app_id}` ([mcp.md](mcp.md#delete-v1appsapp_id)). `GET /v1/me` (`quota.maxBuilds`, `app_retention_hours`) and `budget_status` (`max_builds`, `app_retention_hours`) report the user's limit and the retention.
 
 ## Full example
 
@@ -480,7 +483,7 @@ Seiji controls the environment of every command it runs for a user:
 |---|---|---|
 | `dataDir` itself | `0711`, set at each start of `serve` and `doctor` | Tenant accounts can pass through it to reach `run/pids`, but cannot list it. Its parent directories must also let them pass. |
 | `seiji.db` (and `seiji.db-wal`, `seiji.db-shm`) | `0600` | SQLite database in WAL mode. Tables `users` (name, token hash, tenant account, quota, disabled), `leases` (the usage ledger: every lease with its times, ports, end reason and whether it is billed), `apps` (builds) and `runs` (every run with its kind, name, tags, status, times, bytes and verdict). |
-| `apps/<user id>/<app id>/<file name>` | `0700` directories, `0600` files | Builds from `POST /v1/apps` and from `install_app` URLs. `<user id>` is the numeric id of the row in `users`. The reaper deletes each one after `appRetentionHours`; `seiji user remove` deletes `apps/<user id>`. |
+| `apps/<user id>/<app id>/<file name>` | `0700` directories, `0600` files | Builds from `POST /v1/apps` and from `install_app` URLs. `<user id>` is the numeric id of the row in `users`. The reaper deletes each one after `appRetentionHours`; `DELETE /v1/apps/{app_id}` deletes one earlier; `seiji user remove` deletes `apps/<user id>`. |
 | `runs/<user id>/<run id>/` | `0700` directories, `0600` files | The evidence of one run (see below). The reaper deletes it `evidence.retentionHours` after the run ended. |
 | `run/` | `0711`, set at each start | Scratch files, each deleted when its command ends: flow YAML (`<uuid>.yaml`), typed text (`<uuid>.txt`) and APNs payloads (`<uuid>.apns`) that commands read as stdin, image previews (`<uuid>.jpg`, made by `sips` running as the daemon account on the run's copy of a tenant image), `evidence.zip` while it is sent (`<uuid>.zip`, built again for every request), the output of a screen recording (`cap-<uuid>.log`), and the log of `seiji doctor`'s capture (`doctor-<8 hex>-doctor.log`). Also emulator logs (`emulator-<lease id>.log`, deleted at release). |
 | `run/pids/` | `1733`, set at each start | Under `os_user`, `exec-drop` writes the process-group id of each command here as the tenant account (`<uuid>.pid`, mode `0644`), so the daemon can signal the group through `kill-as`. The daemon deletes the file when the command ends. The mode lets tenant accounts create files but not list or remove other files. |

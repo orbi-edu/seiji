@@ -180,6 +180,8 @@ Your device-minute budget for this month, your limits, and the devices you hold.
 | `max_concurrent` | integer | Devices you can hold at the same time (`maxConcurrent`) |
 | `max_lease_minutes` | integer | The longest lease (`maxLeaseMinutes`) |
 | `idle_minutes` | integer | A lease with no device call for this long is released (`idleMinutes`) |
+| `max_builds` | integer | Builds you can keep at the same time: your quota's `maxBuilds`, or `maxBuildsPerUser` when it has none |
+| `app_retention_hours` | integer | Hours a build is kept after it arrives (`appRetentionHours`) |
 | `estimated_cost_usd` | number | `used_minutes / 60 × costPerDeviceHourUsd`, rounded to cents. Present only when `costPerDeviceHourUsd` is set |
 | `active_leases` | array | Your active leases, as lease objects (see [`acquire_device`](#acquire_device)) |
 
@@ -200,6 +202,8 @@ Your device-minute budget for this month, your limits, and the devices you hold.
   "max_concurrent": 2,
   "max_lease_minutes": 60,
   "idle_minutes": 15,
+  "max_builds": 10,
+  "app_retention_hours": 72,
   "estimated_cost_usd": 3.91,
   "active_leases": []
 }
@@ -352,7 +356,7 @@ Installs an app on your device from an uploaded build (`app_id`) or from an `htt
 **What happens:**
 
 1. Seiji checks the lease first: it must exist, be yours and be `ready`. A bad lease fails before any download (see [Lease errors](#lease-errors)).
-2. With `app_id`, Seiji finds your build. With `url`, it checks that you have room for one more build (`maxBuildsPerUser`), downloads the file and stores it as a new build of yours (see [Builds](#builds)). The download has a timeout of 600 seconds. Redirects must stay on `https`, at most 5. A partial file is deleted.
+2. With `app_id`, Seiji finds your build. With `url`, it checks that you have room for one more build (your build limit, see [Builds](#builds)), downloads the file and stores it as a new build of yours. The download has a timeout of 600 seconds. Redirects must stay on `https`, at most 5. A partial file is deleted.
 3. Seiji copies the build into `<lease dir>/app/<filename>`, as the tenant account under `os_user` isolation.
 4. Seiji installs it. The file name extension decides the format (see [Accepted formats](#accepted-formats)). On iOS, it reads `CFBundleIdentifier`, `CFBundleExecutable` and `CFBundleShortVersionString` from the app's `Info.plist`.
 5. Seiji remembers the app as the [default app](#the-default-app) of the lease. Recorded runs use its executable to filter the log and to find crash reports.
@@ -377,7 +381,7 @@ Installs an app on your device from an uploaded build (`app_id`) or from an `htt
 | `invalid url: <cause>` | The URL does not parse |
 | `only https URLs are accepted` | The scheme is not `https` |
 | `url has no file name` | The URL path ends with `/` or is empty |
-| `you already keep <n> builds, the limit is <maxBuildsPerUser>; they expire <appRetentionHours>h after upload` | `url`, and you already keep `maxBuildsPerUser` builds |
+| `you already keep <n> builds, the limit is <limit>; they expire <appRetentionHours>h after upload` | `url`, and you already keep as many builds as your build limit |
 | `HTTP status client error (404 Not Found) for url (...)` and similar | The download server returned an error status |
 | `error following redirect for url (...)` with the cause `redirect to a non-https URL` or `too many redirects` | A redirect left `https`, or there were more than 5 |
 | A request error that names the timeout | The download took more than 600 seconds |
@@ -1490,6 +1494,7 @@ These routes exist besides `/mcp`. Error bodies of `/v1/apps`, `/v1/runs/…` an
 |---|---|---|
 | `GET /healthz` | None | `200`, plain text `ok` |
 | `POST /v1/apps` | Bearer token | `200` `{"app_id", "filename", "size"}` |
+| `DELETE /v1/apps/{app_id}` | Bearer token | `204`, the build is deleted |
 | `GET /v1/runs/{run_id}/files/{*path}` | Bearer token | `200`, one file of the run |
 | `GET /v1/runs/{run_id}/evidence.zip` | Bearer token | `200`, the whole run as a zip |
 | `GET /v1/runs/{run_id}/report.md` | Bearer token | `200`, the Markdown of `export_evidence` |
@@ -1532,7 +1537,7 @@ Uploads a build or an XCTest bundle. The request body is the raw file, not a mul
 | `401` | `missing, invalid or disabled bearer token` | See [Authentication](#authentication) |
 | `400` | `{"error": "upload failed: <cause>"}` | Reading the body failed, for example because the client broke the connection |
 | `413` | `{"error": "upload exceeds maxUploadBytes (<maxUploadBytes> bytes)"}` | The body is larger than `maxUploadBytes` (default 1 GiB). Seiji stops reading at the limit |
-| `429` | `{"error": "you already keep <n> builds, the limit is <maxBuildsPerUser>; they expire <appRetentionHours>h after upload"}` | You already keep `maxBuildsPerUser` builds (default 10) |
+| `429` | `{"error": "you already keep <n> builds, the limit is <limit>; they expire <appRetentionHours>h after upload"}` | You already keep as many builds as your build limit (default 10) |
 | `500` | `{"error": "<cause>"}` | A file or SQLite write failed |
 
 Seiji checks the header, then the build count, then reads the body. After a `400` or `413` on the body, Seiji deletes the partial file. Nothing is stored.
@@ -1543,7 +1548,7 @@ Seiji checks the header, then the build count, then reads the body. After a `400
 - A build belongs to the user who uploaded it. Another user's `app_id` gives `no uploaded app "<app id>"`.
 - You can install one build on many leases until it expires. An XCTest bundle is a build too, and `run_xctest` takes its `app_id`.
 - The reaper deletes a build `appRetentionHours` (default 72) after it arrived. Upload it again after that. A device that has the app installed keeps it.
-- You can keep at most `maxBuildsPerUser` builds (default 10) at the same time, uploads and `url` downloads together. Older builds free their place when they expire. There is no delete route.
+- Your **build limit** is the number of builds you can keep at the same time, uploads and `url` downloads together: your quota's `maxBuilds`, or `maxBuildsPerUser` (default 10) when it has none. `budget_status` (`max_builds`) and `GET /v1/me` (`quota.maxBuilds`) show it. Older builds free their place when they expire, or earlier with [`DELETE /v1/apps/{app_id}`](#delete-v1appsapp_id).
 - `seiji user remove` deletes the user's builds and runs (`<dataDir>/apps/<user id>` and `<dataDir>/runs/<user id>`).
 
 **File name sanitizing:** Seiji replaces each character other than `A-Z`, `a-z`, `0-9`, `.`, `-` and `_` with `_`, then removes leading dots. An empty result becomes `app`. `My App.zip` becomes `My_App.zip`. The same rule applies to the last path segment of a `url`.
@@ -1592,6 +1597,27 @@ If an archive has more than one `.app`, Seiji installs the first one that `find`
    ```
 
 5. Pass the `app_id` to `install_app`.
+
+### `DELETE /v1/apps/{app_id}`
+
+Deletes one of your builds before it expires: its row and `<dataDir>/apps/<user id>/<app_id>/`. Its place in your build limit is free at once, so the next upload succeeds.
+
+| Header | Required | Meaning |
+|---|---|---|
+| `Authorization` | Yes | `Bearer <token>` |
+
+| Status | Body | Cause |
+|---|---|---|
+| `204` | None | The build is deleted |
+| `401` | `missing, invalid or disabled bearer token` | See [Authentication](#authentication) |
+| `404` | `{"error": "no uploaded app \"<app id>\""}` | You have no build with this id: it never existed, it belongs to another user, it expired, or you deleted it already |
+| `500` | `{"error": "<cause>"}` | The SQLite delete failed |
+
+A build in use is no obstacle. `install_app` and `run_xctest` copy the build into the lease dir when they start, and a device that has the app installed keeps it. Only an `install_app` or a `run_xctest` that has not yet opened the build fails, with `no uploaded app "<app id>"` or a copy error.
+
+```sh
+curl -s -o /dev/null -w '%{http_code}\n' -X DELETE -H "Authorization: Bearer $SEIJI_TOKEN" https://seiji.example.com/v1/apps/a_5e1d0c9b8a72
+```
 
 ### `GET /v1/runs/{run_id}/files/{*path}`
 
@@ -1643,11 +1669,13 @@ Returns the Markdown of [`export_evidence`](#export_evidence) with `Content-Type
 
 ### `GET /v1/me`
 
-Returns the user that the token belongs to, its quota, whether the user is an admin, and the server's build. `seiji login` and the Tern plugin use it to check a token ([cli.md](cli.md#seiji-login)).
+Returns the user that the token belongs to, its quota, how long builds are kept, whether the user is an admin, and the server's build. `seiji login` and the Tern plugin use it to check a token ([cli.md](cli.md#seiji-login)).
 
 ```json
-{"user": "alice", "quota": {"monthlyMinutes": 1200, "monthlyUnlimited": false, "maxConcurrent": 2, "maxLeaseMinutes": 60, "idleMinutes": 15}, "is_admin": true, "server": {"version": "0.1.0", "commit": "f05d477e95a5d0200598d40e2d87f0576c63f308"}}
+{"user": "alice", "quota": {"monthlyMinutes": 1200, "monthlyUnlimited": false, "maxConcurrent": 2, "maxLeaseMinutes": 60, "idleMinutes": 15, "maxBuilds": 10}, "app_retention_hours": 72, "is_admin": true, "server": {"version": "0.1.0", "commit": "f05d477e95a5d0200598d40e2d87f0576c63f308"}}
 ```
+
+`quota.maxBuilds` is the user's build limit in effect: its own `maxBuilds`, or `maxBuildsPerUser` when it has none. `app_retention_hours` is `appRetentionHours`. With both, a client that reuses builds can tell how many it may keep and for how long.
 
 `is_admin` is `true` when the user's name is in `adminUsers` ([configuration.md](configuration.md#adminusers)). Clients use it to show or hide the admin UI; the server enforces permission on every admin request.
 
@@ -1659,7 +1687,7 @@ Lists all users with their quotas, current-month usage and active device count. 
 
 | Status | Body | Cause |
 |---|---|---|
-| `200` | `{"users": [...], "capacity": {"ios": N, "android": N}, "in_use": {"ios": N, "android": N}}` | Success |
+| `200` | `{"users": [...], "capacity": {"ios": N, "android": N}, "in_use": {"ios": N, "android": N}, "max_builds_per_user": N}` | Success |
 | `401` | plain text | Missing or invalid token |
 | `403` | `{"error": "admin access required"}` | The caller is not in `adminUsers` |
 
@@ -1676,18 +1704,19 @@ Each entry in `users`:
 | `max_concurrent` | integer |
 | `max_lease_minutes` | integer |
 | `idle_minutes` | integer |
+| `max_builds` | integer, or `null` when the user follows `max_builds_per_user` |
 | `used_minutes` | number (this month, rounded to 0.1) |
 | `active_devices` | integer |
 
 ### `PUT /v1/admin/users/{id}/limits`
 
-Updates a user's admin-editable limits. Authenticated admin only. The request body has exactly three required fields:
+Updates a user's admin-editable limits. Authenticated admin only. The request body has three required fields and the optional `max_builds`:
 
 ```json
-{"monthly_minutes": 9600, "monthly_unlimited": true, "max_concurrent": 2}
+{"monthly_minutes": 9600, "monthly_unlimited": true, "max_concurrent": 2, "max_builds": 50}
 ```
 
-Unknown fields are rejected. `monthly_minutes` must be ≥ 0, `max_concurrent` must be ≥ 1. The update is serialized with admission, so a concurrent `acquire_device` sees the new limits.
+Unknown fields are rejected. `monthly_minutes` must be ≥ 0, `max_concurrent` must be ≥ 1, `max_builds` must be ≥ 1 or `null`. A `max_builds` that is `null` or left out removes the user's own build limit, so the user follows `maxBuildsPerUser` again. The update is serialized with admission, so a concurrent `acquire_device` sees the new limits.
 
 | Status | Body | Cause |
 |---|---|---|
@@ -1697,7 +1726,7 @@ Unknown fields are rejected. `monthly_minutes` must be ≥ 0, `max_concurrent` m
 | `403` | `{"error": "admin access required"}` | The caller is not in `adminUsers` |
 | `404` | `{"error": "user not found"}` | No user with that id |
 
-Lowering `max_concurrent` blocks new acquisitions but does not evict already-held devices. Reducing `monthly_minutes` can end leases on the next reaper pass. The response carries the updated `used_minutes` and `active_devices`.
+Lowering `max_concurrent` blocks new acquisitions but does not evict already-held devices. Reducing `monthly_minutes` can end leases on the next reaper pass. Lowering `max_builds` blocks new uploads but does not delete kept builds. The response carries the updated `used_minutes` and `active_devices`.
 
 ### `GET /v1/admin/leases`
 
@@ -2192,7 +2221,7 @@ Example:
 4. Install the app under test with `install_app` (upload the `.app` zip of [Examples](#examples)), so that the run captures its log and crash reports.
 5. Call `run_xctest` with the `app_id` of step 3. Use `only_testing` to run a part.
 
-The zip must fit in `maxUploadBytes` and counts against `maxBuildsPerUser`. When the Products folder has more than one `.xctestrun` file (one for each test plan), pass `xctestrun` with the file name.
+The zip must fit in `maxUploadBytes` and counts against your build limit ([Builds](#builds)). When the Products folder has more than one `.xctestrun` file (one for each test plan), pass `xctestrun` with the file name.
 
 ## Writing flows
 

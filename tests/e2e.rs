@@ -250,6 +250,93 @@ async fn uploads_respect_size_and_count_limits() {
 }
 
 #[tokio::test]
+async fn deleting_a_build_frees_its_place() {
+    let env = setup(2).await;
+    let alice = add_user(&env, "alice", QUOTA);
+    let bob = add_user(&env, "bob", QUOTA);
+    let user = env.pool.store.user_by_name("alice").unwrap().unwrap();
+    let http = reqwest::Client::new();
+    let upload = |body: &'static str| {
+        http.post(format!("{}/v1/apps", env.url)).bearer_auth(&alice).header("X-Filename", "app.apk").body(body).send()
+    };
+    let delete = |token: &str, app_id: &str| {
+        http.delete(format!("{}/v1/apps/{app_id}", env.url)).bearer_auth(token.to_string()).send()
+    };
+    let first: Value = upload("one").await.unwrap().json().await.unwrap();
+    let app_id = first["app_id"].as_str().unwrap();
+    assert_eq!(upload("two").await.unwrap().status(), 200);
+    assert_eq!(upload("three").await.unwrap().status(), 429);
+
+    let foreign = delete(&bob, app_id).await.unwrap();
+    assert_eq!(foreign.status(), 404);
+    assert_eq!(foreign.json::<Value>().await.unwrap()["error"], format!("no uploaded app \"{app_id}\""));
+    let dir = env.pool.apps_dir(user.id, app_id);
+    assert!(dir.exists());
+
+    assert_eq!(delete(&alice, app_id).await.unwrap().status(), 204);
+    assert!(!dir.exists());
+    assert!(env.pool.store.app(app_id, user.id).unwrap().is_none());
+    assert_eq!(upload("three").await.unwrap().status(), 200);
+
+    let again = delete(&alice, app_id).await.unwrap();
+    assert_eq!(again.status(), 404);
+    assert_eq!(again.json::<Value>().await.unwrap()["error"], format!("no uploaded app \"{app_id}\""));
+    assert_eq!(delete("sj_invalid", app_id).await.unwrap().status(), 401);
+}
+
+#[tokio::test]
+async fn a_user_build_limit_overrides_the_default() {
+    let env = setup_with(2, json!({ "maxBuildsPerUser": 10 })).await;
+    let service = add_user(&env, "alice", seiji::config::Quota { max_builds: Some(3), ..QUOTA });
+    let person = add_user(&env, "bob", QUOTA);
+    let http = reqwest::Client::new();
+    let upload = |token: &str| {
+        http.post(format!("{}/v1/apps", env.url))
+            .bearer_auth(token.to_string())
+            .header("X-Filename", "app.apk")
+            .body("x")
+            .send()
+    };
+    let me = |token: &str| {
+        let req = http.get(format!("{}/v1/me", env.url)).bearer_auth(token.to_string());
+        async move { req.send().await.unwrap().json::<Value>().await.unwrap() }
+    };
+    let full =
+        |n: i64, limit: i64| format!("you already keep {n} builds, the limit is {limit}; they expire 72h after upload");
+
+    for _ in 0..3 {
+        assert_eq!(upload(&service).await.unwrap().status(), 200);
+    }
+    let fourth = upload(&service).await.unwrap();
+    assert_eq!(fourth.status(), 429);
+    assert_eq!(fourth.json::<Value>().await.unwrap()["error"], full(3, 3));
+    for _ in 0..10 {
+        assert_eq!(upload(&person).await.unwrap().status(), 200);
+    }
+    let eleventh = upload(&person).await.unwrap();
+    assert_eq!(eleventh.status(), 429);
+    assert_eq!(eleventh.json::<Value>().await.unwrap()["error"], full(10, 10));
+
+    let alice = me(&service).await;
+    assert_eq!(alice["quota"]["maxBuilds"], 3);
+    assert_eq!(alice["app_retention_hours"], 72);
+    assert_eq!(me(&person).await["quota"]["maxBuilds"], 10);
+
+    // A new limit applies to the next upload, without a restart.
+    let quota = env.pool.store.user_by_name("alice").unwrap().unwrap().quota;
+    env.pool.store.set_quota("alice", seiji::config::Quota { max_builds: Some(5), ..quota }).unwrap();
+    assert_eq!(upload(&service).await.unwrap().status(), 200);
+    assert_eq!(upload(&service).await.unwrap().status(), 200);
+    assert_eq!(upload(&service).await.unwrap().json::<Value>().await.unwrap()["error"], full(5, 5));
+    assert_eq!(me(&service).await["quota"]["maxBuilds"], 5);
+
+    let c = client(&env, &service).await;
+    let budget = ok_json(&call(&c, "budget_status", json!({})).await);
+    assert_eq!(budget["max_builds"], 5);
+    assert_eq!(budget["app_retention_hours"], 72);
+}
+
+#[tokio::test]
 async fn reaper_ends_leases_of_disabled_users_and_overlong_leases() {
     let env = setup(2).await;
     let alice = client(&env, &add_user(&env, "alice", QUOTA)).await;

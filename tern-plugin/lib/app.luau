@@ -144,6 +144,7 @@ local function clear_admin(state: any)
 	state.data.admin_viewer = nil
 	state.data.capacity = nil
 	state.data.in_use = nil
+	state.data.max_builds_per_user = nil
 	state.errs.admin_users = nil
 	state.errs.admin_leases = nil
 	state.errs.admin_viewer = nil
@@ -310,6 +311,7 @@ read_admin_users = function(state: any)
 		state.data.admin_users = data.users
 		state.data.capacity = data.capacity
 		state.data.in_use = data.in_use
+		state.data.max_builds_per_user = data.max_builds_per_user
 	end)
 	read_admin(state, "admin_leases", apimod.admin_leases, function(data)
 		state.data.admin_leases = data.leases
@@ -399,6 +401,8 @@ local function start_edit(state: any, u: any)
 		monthly_minutes = tostring(u.monthly_minutes or 0),
 		monthly_unlimited = u.monthly_unlimited == true,
 		max_concurrent = tostring(u.max_concurrent or 1),
+		-- nil: the user follows the server's maxBuildsPerUser.
+		max_builds = if type(u.max_builds) == "number" then tostring(u.max_builds) else nil,
 	}
 end
 
@@ -426,12 +430,19 @@ local function save_edit(state: any)
 		state.cx:render()
 		return
 	end
+	local builds = if ed.max_builds then tonumber(ed.max_builds) else nil
+	if ed.max_builds and (not builds or builds < 1 or builds ~= math.floor(builds)) then
+		state.edit_error = "Max builds must be at least 1."
+		state.cx:render()
+		return
+	end
 	state.saving = true
 	state.edit_error = nil
 	apimod.admin_update_user(state.api, ed.user_id, {
 		monthly_minutes = mins,
 		monthly_unlimited = ed.monthly_unlimited,
 		max_concurrent = conc,
+		max_builds = builds,
 	}, function(data, err)
 		state.saving = false
 		if state.stopped then
@@ -843,6 +854,8 @@ local function on_action(state: any, act: string, value: string?)
 					state.editing.monthly_minutes = tostring(fv.value or "")
 				elseif fv.field == "max_concurrent" then
 					state.editing.max_concurrent = tostring(fv.value or "")
+				elseif fv.field == "max_builds" then
+					state.editing.max_builds = if fv.value == "default" then nil else tostring(fv.value or "")
 				end
 				state.edit_error = nil
 			end
