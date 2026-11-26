@@ -1,6 +1,6 @@
 # `seiji` (command line)
 
-`seiji` is one binary. It runs the MCP server, manages users, prints usage, creates tenant accounts, checks the host, and holds the root helpers that the daemon reaches through sudo. On a developer's Mac, the same binary is the client that signs in to a server for the Tern plugin (`seiji login`, `seiji logout`, `seiji token print`) and opens a tunnel to your dev server (`seiji forward`). This document lists every command and flag, the account that must run each one, and what each prints. [install.md](install.md) shows the commands in order on a new host. [configuration.md](configuration.md) is the reference of the config file they read.
+`seiji` is one binary. It runs the MCP server, manages users, prints usage, creates tenant accounts, checks the host, and holds the root helpers that the daemon reaches through sudo. On a developer's Mac, the same binary is the client that signs in to a server for the Tern plugin (`seiji login`, `seiji logout`, `seiji token print`), keeps itself and the plugin at the server's commit (`seiji update`) and opens a tunnel to your dev server (`seiji forward`). This document lists every command and flag, the account that must run each one, and what each prints. [install.md](install.md) shows the commands in order on a new host. [configuration.md](configuration.md) is the reference of the config file they read.
 
 ## Contents
 
@@ -14,6 +14,7 @@
 - [`seiji login`](#seiji-login)
 - [`seiji logout`](#seiji-logout)
 - [`seiji token print`](#seiji-token-print)
+- [`seiji update`](#seiji-update)
 - [`seiji forward`](#seiji-forward)
 - [Exit codes and errors](#exit-codes-and-errors)
 - [Root helpers (internal)](#root-helpers-internal)
@@ -21,9 +22,9 @@
 ## Conventions
 
 - `--config PATH` (`-c PATH`) selects the config file. It is a global flag, so it may come before or after the subcommand: `seiji user add alice -c /path/seiji.json` and `seiji user -c /path/seiji.json add alice` are the same. The default is `/usr/local/etc/seiji/seiji.json`, or `$SEIJI_CONFIG` when it is set. `sudo` drops `SEIJI_CONFIG`, so pass `-c` with `sudo` when the file is somewhere else.
-- The root helpers (`exec-as`, `exec-drop`, `kill-as`) take no `--config` and never read the config. The client commands (`login`, `logout`, `token print`, `forward`) do not read it either.
+- The root helpers (`exec-as`, `exec-drop`, `kill-as`) take no `--config` and never read the config. The client commands (`login`, `logout`, `token print`, `update`, `forward`) do not read it either.
 - User names have 1 to 32 characters of `[a-z0-9-]`. Other names fail with `user names must be 1-32 chars of [a-z0-9-]`.
-- `seiji --help` and `seiji <command> --help` print the usage. `seiji --version` prints `seiji <version>`.
+- `seiji --help` and `seiji <command> --help` print the usage. `seiji --version` prints `seiji <version> (<commit>)`: the first 10 characters of the git commit the binary is built from. A build outside a git checkout prints `seiji <version>`.
 
 ## Which account runs what
 
@@ -34,7 +35,7 @@
 | `seiji doctor` | daemon account: `sudo -u seiji seiji doctor …` | It uses the same data directory, runner and sudo chain as the daemon. |
 | `seiji tenant provision` | root: `sudo seiji tenant provision …` | It creates macOS accounts and groups. |
 | `seiji exec-as`, `seiji exec-drop`, `seiji kill-as` | root, reached only by the daemon through sudo | Internal. See [Root helpers](#root-helpers-internal). |
-| `seiji login`, `seiji logout`, `seiji token print`, `seiji forward` | yourself, on a developer's Mac, not on the server | Client commands. They use your login keychain and your `~/Library/Application Support/seiji/`. |
+| `seiji login`, `seiji logout`, `seiji token print`, `seiji update`, `seiji forward` | yourself, on a developer's Mac, not on the server | Client commands. They use your login keychain and your `~/Library/Application Support/seiji/`. |
 | `seiji --help`, `seiji --version` | any account | They read nothing. |
 
 The examples below use `sudo -u seiji` as on a host. In local development (shared mode) you run everything as yourself ([install.md](install.md#15-local-development-shared-mode)).
@@ -247,6 +248,46 @@ When you are not signed in, it fails with ``You are not signed in. Run `seiji lo
 ```
 
 The token is a secret: do not paste the output into logs or chats.
+
+## `seiji update`
+
+```sh
+seiji update [--check] [--json] [--tern-plugin DIR]
+```
+
+A client command. It brings this CLI, and with `--tern-plugin` the Tern plugin in `DIR`, to the git commit the server runs. The server reports its commit in `GET /v1/me` ([mcp.md](mcp.md#get-v1me)). The clients follow the server, never `main`, so they never call an API the server does not have yet. The Tern plugin runs it when its panel opens and then every hour ([tern.md](tern.md#updates)).
+
+Each part gets one status:
+
+| Status | Meaning |
+|---|---|
+| `current` | It is built from the server's commit. |
+| `outdated` | It is not, and `seiji update` replaces it. |
+| `unmanaged` | It is not, but it is not where an install puts it, so `seiji update` leaves it alone. `reason` says why. The CLI is managed only when it runs from `$CARGO_HOME/bin/seiji` (`~/.cargo/bin/seiji`), where `cargo install` puts it; a build in a clone is not. The plugin is managed only when `DIR` is in Tern's plugins directory (`tern plugin dir`); a linked copy (`tern plugin link`) is not. |
+| `updated` | `seiji update` just replaced it. |
+
+To update, it fetches the server's commit from the repository into `~/Library/Caches/seiji/source` (a shallow git checkout kept between updates). Then:
+
+1. The CLI: `cargo install --locked --force --path <source>`, with its build directory in `~/Library/Caches/seiji/target`, so the next build reuses it. A first build takes a few minutes.
+2. The plugin: it writes the commit to `<source>/tern-plugin/commit` and runs `tern plugin install <source>/tern-plugin --force`. Tern reloads its plugins. The `commit` file tells the next `seiji update` which commit the plugin has; a plugin without it counts as outdated.
+
+`--check` only reports and changes nothing. `--json` prints one object, and the output of git, cargo and Tern goes to stderr:
+
+```json
+{"server":"f05d477e95…","cli":{"commit":"9437de6902…","status":"outdated"},"plugin":{"commit":"f05d477e95…","status":"current"}}
+```
+
+On failure, `--json` prints `{"error":{"code","message"}}` and exits 1. The codes:
+
+| Code | Cause |
+|---|---|
+| `not_logged_in` | No credential ([`seiji token print`](#seiji-token-print)). |
+| `unreachable` | `GET /v1/me` failed, or the server refused the token. |
+| `no_commit` | The server does not report its commit: it runs a Seiji older than `seiji update`, or one built outside a git checkout. |
+| `busy` | Another `seiji update` holds `~/Library/Caches/seiji/update.lock`. |
+| `failed` | git, cargo or Tern failed. The message names the step. |
+
+Tern is `$TERN_EXE`, then `/Applications/Tern.app/Contents/MacOS/tern`, then `tern` on `PATH`. Cargo is `$CARGO_HOME/bin/cargo`, else `cargo` on `PATH`, and it runs with `$CARGO_HOME/bin` first on `PATH`.
 
 ## `seiji forward`
 

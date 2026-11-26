@@ -1,4 +1,4 @@
-//! Client side of the CLI: `seiji login`, `seiji logout`, `seiji token print`.
+//! Client side of the CLI: `seiji login`, `seiji logout`, `seiji token print`, `seiji update`.
 //!
 //! The token lives in the macOS keychain (service `seiji`, account = the server URL); the
 //! current server URL and user name live in `~/Library/Application Support/seiji/client.json`.
@@ -6,7 +6,8 @@
 
 use std::borrow::Cow;
 use std::io::{IsTerminal, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -139,6 +140,245 @@ pub fn token_print(json: bool) -> Result<()> {
     match credential() {
         Ok(c) if json => println!("{}", serde_json::to_string(&c)?),
         Ok(c) => println!("{}", c.token),
+        Err((code, message)) => {
+            if json {
+                println!("{}", serde_json::json!({ "error": { "code": code, "message": message } }));
+                std::process::exit(1);
+            }
+            bail!("{message}");
+        }
+    }
+    Ok(())
+}
+
+/// An error for `--json` output: a code and a message for a person.
+type Fail = (&'static str, String);
+
+fn failed(what: &str) -> impl FnOnce(anyhow::Error) -> Fail + '_ {
+    move |e| ("failed", format!("{what}: {e:#}"))
+}
+
+/// One part `seiji update` looks after: the CLI or the Tern plugin.
+#[derive(Serialize)]
+struct Part {
+    /// The commit it is built from, when known.
+    commit: Option<String>,
+    /// `current`, `outdated`, `unmanaged` (not where `cargo install` or Tern put it, so left
+    /// alone) or `updated`.
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
+impl Part {
+    fn new(commit: Option<String>, server: &str, managed: Result<(), String>) -> Self {
+        let (status, reason) = if commit.as_deref() == Some(server) {
+            ("current", None)
+        } else {
+            match managed {
+                Ok(()) => ("outdated", None),
+                Err(reason) => ("unmanaged", Some(reason)),
+            }
+        };
+        Part { commit, status, reason }
+    }
+
+    fn outdated(&self) -> bool {
+        self.status == "outdated"
+    }
+}
+
+#[derive(Serialize)]
+struct Report {
+    server: String,
+    cli: Part,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    plugin: Option<Part>,
+}
+
+fn home() -> Result<PathBuf, Fail> {
+    std::env::var_os("HOME").map(PathBuf::from).ok_or(("failed", "HOME is not set".to_string()))
+}
+
+fn cargo_home() -> Result<PathBuf, Fail> {
+    match std::env::var_os("CARGO_HOME") {
+        Some(dir) if !dir.is_empty() => Ok(PathBuf::from(dir)),
+        _ => Ok(home()?.join(".cargo")),
+    }
+}
+
+fn same_file(a: &Path, b: &Path) -> bool {
+    matches!((a.canonicalize(), b.canonicalize()), (Ok(a), Ok(b)) if a == b)
+}
+
+/// The CLI is managed when it runs from `$CARGO_HOME/bin/seiji`, where `cargo install` puts it.
+/// A build in a clone (`target/…`) is left alone.
+fn cli_managed() -> Result<(), String> {
+    let installed = cargo_home().map_err(|(_, m)| m)?.join("bin/seiji");
+    let exe = std::env::current_exe().map_err(|e| format!("this CLI's path: {e}"))?;
+    if same_file(&exe, &installed) {
+        Ok(())
+    } else {
+        Err(format!("{} is not {}, where cargo install puts it", exe.display(), installed.display()))
+    }
+}
+
+/// Tern: `TERN_EXE` (set in Tern's processes), the app bundle, or `tern` on `PATH`.
+fn tern_bin() -> PathBuf {
+    match std::env::var_os("TERN_EXE") {
+        Some(exe) if !exe.is_empty() => PathBuf::from(exe),
+        _ => {
+            let app = PathBuf::from("/Applications/Tern.app/Contents/MacOS/tern");
+            if app.exists() { app } else { PathBuf::from("tern") }
+        }
+    }
+}
+
+/// The plugin is managed when it sits in Tern's plugins directory. A linked copy (`tern plugin
+/// link`) is read where it is, in a clone, and is left alone.
+fn plugin_managed(dir: &Path) -> Result<(), String> {
+    let out = Command::new(tern_bin())
+        .args(["plugin", "dir"])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("tern plugin dir: {e}"))?;
+    let plugins = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+    if !out.status.success() || plugins.as_os_str().is_empty() {
+        return Err("tern plugin dir failed".to_string());
+    }
+    match dir.parent() {
+        Some(parent) if same_file(parent, &plugins) => Ok(()),
+        _ => Err(format!("{} is not in Tern's plugins directory {}", dir.display(), plugins.display())),
+    }
+}
+
+/// The commit the plugin was installed from: the `commit` file `seiji update` writes into it.
+fn plugin_commit(dir: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(dir.join("commit")).ok()?;
+    let commit = text.trim();
+    (!commit.is_empty()).then(|| commit.to_string())
+}
+
+async fn server_commit(c: &Credential) -> Result<Option<String>> {
+    let resp = reqwest::Client::builder()
+        .user_agent(reqwest::header::HeaderValue::from_static(crate::USER_AGENT))
+        .timeout(std::time::Duration::from_secs(15))
+        .build()?
+        .get(format!("{}/v1/me", c.url))
+        .bearer_auth(&c.token)
+        .send()
+        .await
+        .with_context(|| format!("reaching {}", c.url))?;
+    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+        bail!("the server refused the token");
+    }
+    let doc: serde_json::Value = serde_json::from_slice(&resp.error_for_status()?.bytes().await?)?;
+    Ok(doc["server"]["commit"].as_str().map(str::to_string))
+}
+
+/// Runs a step with its output on stderr, so `--json` keeps stdout to one object.
+fn step(what: &str, cmd: &mut Command) -> Result<(), Fail> {
+    let status = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(std::io::stderr()))
+        .status()
+        .map_err(|e| ("failed", format!("{what}: {e}")))?;
+    if status.success() { Ok(()) } else { Err(("failed", format!("{what} failed ({status})"))) }
+}
+
+/// Puts the repository at `commit` in `<cache>/source`, a shallow checkout kept between updates.
+fn fetch_source(cache: &Path, commit: &str) -> Result<PathBuf, Fail> {
+    let src = cache.join("source");
+    if !src.join(".git").exists() {
+        std::fs::create_dir_all(&src).map_err(|e| failed("creating the source directory")(e.into()))?;
+        step("git init", Command::new("git").arg("init").arg("-q").arg(&src))?;
+    }
+    let git = || {
+        let mut cmd = Command::new("git");
+        cmd.arg("-C").arg(&src);
+        cmd
+    };
+    let repo = env!("CARGO_PKG_REPOSITORY");
+    step(&format!("git fetch {repo} {commit}"), git().args(["fetch", "-q", "--depth", "1", repo, commit]))?;
+    step("git checkout", git().args(["checkout", "-q", "--force", "--detach", "FETCH_HEAD"]))?;
+    step("git clean", git().args(["clean", "-q", "-f", "-d", "-x"]))?;
+    Ok(src)
+}
+
+async fn run_update(check: bool, tern_plugin: Option<&Path>) -> Result<Report, Fail> {
+    let c = credential()?;
+    let server = server_commit(&c).await.map_err(|e| ("unreachable", format!("{e:#}")))?.ok_or((
+        "no_commit",
+        "The server does not report its commit: it runs a Seiji older than `seiji update`.".to_string(),
+    ))?;
+    let mut cli = Part::new(crate::COMMIT.map(str::to_string), &server, cli_managed());
+    let mut plugin = tern_plugin.map(|dir| Part::new(plugin_commit(dir), &server, plugin_managed(dir)));
+    if check || !(cli.outdated() || plugin.as_ref().is_some_and(Part::outdated)) {
+        return Ok(Report { server, cli, plugin });
+    }
+
+    let cache = home()?.join("Library/Caches/seiji");
+    std::fs::create_dir_all(&cache).map_err(|e| failed("creating the cache directory")(e.into()))?;
+    let lock = std::fs::File::create(cache.join("update.lock")).map_err(|e| failed("update.lock")(e.into()))?;
+    match lock.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => return Err(("busy", "Another seiji update is running.".to_string())),
+        Err(std::fs::TryLockError::Error(e)) => return Err(failed("locking update.lock")(e.into())),
+    }
+    let src = fetch_source(&cache, &server)?;
+
+    // The CLI first: installing the plugin reloads Tern's plugins, which may end this process
+    // when the plugin started it.
+    if cli.outdated() {
+        let cargo_home = cargo_home()?;
+        let cargo = cargo_home.join("bin/cargo");
+        let cargo = if cargo.exists() { cargo } else { PathBuf::from("cargo") };
+        // Tern started from the Dock has no ~/.cargo/bin on PATH; cargo needs rustc from there.
+        let path = std::env::join_paths(
+            std::iter::once(cargo_home.join("bin"))
+                .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())),
+        )
+        .map_err(|e| failed("PATH")(e.into()))?;
+        step(
+            "cargo install",
+            Command::new(cargo)
+                .env("PATH", path)
+                .args(["install", "--locked", "--force", "--path"])
+                .arg(&src)
+                .arg("--root")
+                .arg(&cargo_home)
+                .arg("--target-dir")
+                .arg(cache.join("target")),
+        )?;
+        cli = Part { commit: Some(server.clone()), status: "updated", reason: None };
+    }
+    if let Some(part) = plugin.as_mut()
+        && part.outdated()
+    {
+        let package = src.join("tern-plugin");
+        std::fs::write(package.join("commit"), format!("{server}\n"))
+            .map_err(|e| failed("writing the plugin's commit")(e.into()))?;
+        step("tern plugin install", Command::new(tern_bin()).args(["plugin", "install", "--force"]).arg(&package))?;
+        *part = Part { commit: Some(server.clone()), status: "updated", reason: None };
+    }
+    Ok(Report { server, cli, plugin })
+}
+
+/// `seiji update`: brings this CLI (when `cargo install` put it in `$CARGO_HOME/bin`) and, with
+/// `--tern-plugin`, the plugin in Tern's plugins directory to the commit the server runs.
+pub async fn update(check: bool, json: bool, tern_plugin: Option<&Path>) -> Result<()> {
+    match run_update(check, tern_plugin).await {
+        Ok(report) if json => println!("{}", serde_json::to_string(&report)?),
+        Ok(report) => {
+            let short = |c: &Option<String>| c.as_deref().map_or("unknown", |c| &c[..c.len().min(10)]).to_string();
+            println!("server  {}", &report.server[..report.server.len().min(10)]);
+            for (name, part) in [("cli", Some(&report.cli)), ("plugin", report.plugin.as_ref())] {
+                if let Some(p) = part {
+                    let reason = p.reason.as_deref().map(|r| format!(": {r}")).unwrap_or_default();
+                    println!("{name:<7} {} {}{reason}", short(&p.commit), p.status);
+                }
+            }
+        }
         Err((code, message)) => {
             if json {
                 println!("{}", serde_json::json!({ "error": { "code": code, "message": message } }));

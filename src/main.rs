@@ -18,7 +18,7 @@ use seiji::{http, tenant};
 #[derive(Parser)]
 #[command(
     name = "seiji",
-    version,
+    version = env!("SEIJI_VERSION"),
     about = "Budgeted iOS simulator / Android emulator pool for AI agents (MCP + Maestro)"
 )]
 struct Cli {
@@ -80,6 +80,18 @@ enum Cmd {
     },
     /// Client: let your device reach a port on this machine (Metro, a dev server) until Ctrl-C.
     Forward(ForwardCli),
+    /// Client: bring this CLI and the Tern plugin to the commit the server runs.
+    Update {
+        /// Only report what is current or outdated; change nothing.
+        #[arg(long)]
+        check: bool,
+        /// Print one JSON object (or `{"error":{"code","message"}}` and exit 1), for Tern's plugin.
+        #[arg(long)]
+        json: bool,
+        /// The Tern plugin's directory, to update it as well.
+        #[arg(long, value_name = "DIR")]
+        tern_plugin: Option<PathBuf>,
+    },
     /// [root helper] Run a command as a tenant account inside its launchd domain.
     #[command(hide = true)]
     ExecAs(ExecArgsCli),
@@ -255,6 +267,9 @@ fn main() -> Result<()> {
         Cmd::Login { url } => runtime()?.block_on(seiji::client::login(&url)),
         Cmd::Logout => seiji::client::logout(),
         Cmd::Token { cmd: TokenCmd::Print { json } } => seiji::client::token_print(json),
+        Cmd::Update { check, json, tern_plugin } => {
+            runtime()?.block_on(seiji::client::update(check, json, tern_plugin.as_deref()))
+        }
         Cmd::Forward(f) => {
             use seiji::client::Point;
             let point = if f.expo_go {

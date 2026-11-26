@@ -525,6 +525,8 @@ Seiji has no schema migrations: at start it creates missing tables (`CREATE TABL
 
 After an upgrade, run `sudo -u seiji seiji doctor <user> --platform ios`. It checks AXe, the screen helper and the capture as the user's account. If the host predates recorded runs, install AXe first ([AXe](#axe)); the `runs` table is created at the next start.
 
+The clients follow the server. Within an hour, every Tern plugin runs `seiji update`, which brings it and the user's CLI to the commit the server now reports ([cli.md](cli.md#seiji-update)). The clients fetch that commit from the repository, so build the server only from a pushed commit. The server reports the commit it is built from (`git rev-parse HEAD`), even when the clone has local changes.
+
 ## 14. Uninstall
 
 1. Stop and unload the daemon. This releases every device:

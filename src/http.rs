@@ -198,10 +198,13 @@ async fn run_report(
     }
 }
 
-/// `GET /v1/me`: who the token belongs to, for clients that sign in (`seiji login`, Tern).
+/// `GET /v1/me`: who the token belongs to, for clients that sign in (`seiji login`, Tern), and
+/// the server's build, which `seiji update` brings the clients to.
 async fn me(State(pool): State<Arc<Pool>>, Extension(AuthedUser(user)): Extension<AuthedUser>) -> Response {
     let is_admin = pool.config.admin_users.contains(&user.name);
-    Json(serde_json::json!({ "user": user.name, "quota": user.quota, "is_admin": is_admin })).into_response()
+    let server = serde_json::json!({ "version": env!("CARGO_PKG_VERSION"), "commit": crate::COMMIT });
+    Json(serde_json::json!({ "user": user.name, "quota": user.quota, "is_admin": is_admin, "server": server }))
+        .into_response()
 }
 
 /// A user entry for the admin endpoints.

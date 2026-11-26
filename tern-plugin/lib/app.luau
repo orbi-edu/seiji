@@ -19,6 +19,9 @@ local AUTH_RETRY_MS = 5000
 local FLASH_MS = 6000
 -- Booting takes 30-90 s; the tool answers when the device is ready.
 local ACQUIRE_MS = 180000
+-- `seiji update` checks hourly; building the CLI with cargo takes minutes.
+local UPDATE_MS = 3600000
+local UPDATE_RUN_MS = 1800000
 
 local function running(pane: number): boolean
 	for _, p in tern.pane.list() do
@@ -155,6 +158,46 @@ local function clear_admin(state: any)
 	end
 end
 
+-- Brings the CLI and this plugin to the commit the server runs (`seiji update`), when the panel
+-- opens and then hourly. Installing the plugin reloads it, which restarts this panel.
+local function auto_update(state: any)
+	if state.updating or (state.update_at and tern.now() - state.update_at < UPDATE_MS) then
+		return
+	end
+	state.update_at = tern.now()
+	state.updating = true
+	local dir = tern.plugin.dir
+	local ok = cli.run({ "update", "--check", "--json", "--tern-plugin", dir }, { timeout_ms = 30000 }, function(data, err)
+		local cli_old = type(data) == "table" and type(data.cli) == "table" and data.cli.status == "outdated"
+		local plugin_old = type(data) == "table" and type(data.plugin) == "table" and data.plugin.status == "outdated"
+		if err or state.stopped or not (cli_old or plugin_old) then
+			state.updating = nil
+			if err then
+				tern.log.warn("seiji update --check failed", cli.describe(err))
+			end
+			return
+		end
+		local to = string.sub(tostring(data.server), 1, 7)
+		flash(state, "info", "Updating Seiji to " .. to .. " in the background" .. (if cli_old then " (building the CLI takes a few minutes)." else "."))
+		state.cx:render()
+		cli.run({ "update", "--json", "--tern-plugin", dir }, { timeout_ms = UPDATE_RUN_MS }, function(_, e)
+			state.updating = nil
+			if state.stopped or (e and e.code == "busy") then
+				return
+			end
+			if e then
+				fail(state, "Could not update Seiji", e)
+			else
+				flash(state, "success", "Updated Seiji to " .. to .. ".")
+			end
+			state.cx:render()
+		end)
+	end)
+	if not ok then
+		state.updating = nil
+	end
+end
+
 poll = function(state: any)
 	local api = state.api
 	if api.auth ~= "ok" then
@@ -171,6 +214,7 @@ poll = function(state: any)
 		end
 		return
 	end
+	auto_update(state)
 	-- Detect admin; re-check on every auth cycle (is_admin == nil).
 	if state.is_admin == nil and not state.inflight.me then
 		state.inflight.me = true

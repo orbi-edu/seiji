@@ -50,21 +50,21 @@ seiji --version
 
 ```sh
 tern plugin install github.com/orbi-edu/seiji/tern-plugin
-tern plugin list            # seiji 0.5.0 Seiji — 1 blocks, 0 lenses, window  ready
+tern plugin list            # seiji 0.6.0 Seiji — 1 blocks, 0 lenses, window  ready
 ```
 
-Tern loads it at once; no restart. This installs the plugin from `main`.
+Tern loads it at once; no restart. This installs the plugin from `main`. From then on it follows the server's commit ([Updates](#updates)).
 
 To install the plugin of a release instead, take its `seiji-tern-plugin-<tag>.tar.gz` from the [releases](https://github.com/orbi-edu/seiji/releases) (each release carries one, with a `.sha256` file), unpack it and install the `seiji` folder:
 
 ```sh
-gh release download v0.5.0 --repo orbi-edu/seiji --pattern 'seiji-tern-plugin-*'
-shasum -a 256 -c seiji-tern-plugin-v0.5.0.tar.gz.sha256
-tar -xzf seiji-tern-plugin-v0.5.0.tar.gz
+gh release download v0.6.0 --repo orbi-edu/seiji --pattern 'seiji-tern-plugin-*'
+shasum -a 256 -c seiji-tern-plugin-v0.6.0.tar.gz.sha256
+tar -xzf seiji-tern-plugin-v0.6.0.tar.gz
 tern plugin install ./seiji --force
 ```
 
-The workflow attaches the plugin only when the release's tag matches `version` in `tern-plugin/plugin.toml` (`v0.5.0` for `0.5.0`). Otherwise it fails, and the release has no plugin: bump the version before you tag.
+The workflow attaches the plugin only when the release's tag matches `version` in `tern-plugin/plugin.toml` (`v0.6.0` for `0.6.0`). Otherwise it fails, and the release has no plugin: bump the version before you tag.
 
 **3. Let Tern find the CLI.** The plugin checks `SEIJI_BIN`, then `$CARGO_HOME/bin/seiji` (or `~/.cargo/bin/seiji`), then `PATH`. Tern started from the Dock may not have `~/.cargo/bin` on its PATH; since Cargo installs to `~/.cargo/bin` by default, the plugin finds it there without extra setup. If it still says *The seiji CLI is missing*, set the path explicitly and start Tern again:
 
@@ -73,6 +73,12 @@ launchctl setenv SEIJI_BIN "$HOME/.cargo/bin/seiji"
 ```
 
 To work on the plugin itself, use the copy in a clone instead: `tern plugin link tern-plugin` from the repository's root. Tern then reads the files where they are. `tern plugin remove seiji` (installed) or `tern plugin unlink seiji` (linked) takes it out.
+
+### Updates
+
+The plugin keeps itself and the CLI at the commit the server runs. When the panel opens, and then every hour, it runs `seiji update --check --json --tern-plugin <its directory>` ([cli.md](cli.md#seiji-update)). When one of them is outdated, the panel shows *Updating Seiji to `<commit>` in the background* and runs `seiji update`. Building the CLI takes a few minutes; then Tern installs the new plugin, which reloads the panel. The clients follow the server, not `main`: after an admin upgrades the server, the clients follow within the hour.
+
+Only installed copies update: the CLI in `~/.cargo/bin` (from `cargo install`) and the plugin in Tern's plugins directory. A linked plugin and a CLI built in a clone stay as they are. A CLI older than `seiji update` cannot update itself: install it once more with step 1. A failed check only goes to Tern's log; a failed update shows in the panel.
 
 ## Sign in
 
