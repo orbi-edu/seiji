@@ -74,14 +74,10 @@ const FIRST_RTT: Duration = Duration::from_millis(300);
 const MAX_IN_FLIGHT: usize = 60;
 /// The base round trip is the lowest seen in this long.
 const RTT_WINDOW: Duration = Duration::from_secs(10);
+/// The most frames a page may say its decoder holds (`decoder`).
+const MAX_HOLD: u8 = 16;
 /// Keyframe requests to the helper are at least this far apart.
 const KEYFRAME_GAP: Duration = Duration::from_millis(500);
-/// What `Hub::pending` holds.
-const PENDING_NONE: u8 = 0;
-const PENDING_REFRESH: u8 = 1;
-const PENDING_KEYFRAME: u8 = 2;
-/// Long-term reference frames counted at once, waiting for every viewer to have them.
-const LTR_WINDOW: usize = 64;
 /// A finger left down this long without a move is lifted, and the device is free again.
 const GESTURE_IDLE: Duration = Duration::from_secs(10);
 /// How long a hardware button is held.
@@ -184,28 +180,10 @@ struct Encoded {
     key: bool,
     /// No other frame refers to it: a viewer may skip it without a keyframe after.
     droppable: bool,
-    /// A long-term reference frame's token: acknowledged once every viewer has the frame.
-    ltr: Option<u64>,
-    /// The frame a refresh asked for: a viewer that skipped frames may resume here.
-    refresh: bool,
     /// Unix microseconds when the daemon read the frame from the helper.
     received_us: i64,
     /// The whole binary WebSocket message.
     message: Bytes,
-}
-
-/// Which long-term reference frames the viewers have. The helper may refer to one once every
-/// viewer acknowledged it, and a viewer that skipped frames resumes at a refresh frame that
-/// refers to it, a delta frame, where it would otherwise need a keyframe.
-#[derive(Default)]
-struct Ltr {
-    /// Tokens since `floor`, with how many viewers have each.
-    counts: VecDeque<(u64, usize)>,
-    /// The newest token every viewer has, sent to the helper.
-    acked: Option<u64>,
-    /// Acknowledgements of frames before this one do not count: they came before the last
-    /// keyframe or change of viewers.
-    floor: u32,
 }
 
 /// The bitrate the helper encodes at, adapted to the slowest viewer.
@@ -267,10 +245,8 @@ struct Hub {
     next_cap: AtomicU64,
     rate: StdMutex<Rate>,
     keyframe_at: StdMutex<Option<Instant>>,
-    /// A keyframe or refresh asked for inside `KEYFRAME_GAP`, or when the helper was not there to
-    /// take it: `PENDING_KEYFRAME` wins over `PENDING_REFRESH`.
-    pending: AtomicU8,
-    ltr: StdMutex<Ltr>,
+    /// A keyframe asked for inside `KEYFRAME_GAP`, or when the helper was not there to take it.
+    pending: AtomicBool,
     stats: StreamStats,
 }
 
@@ -288,8 +264,7 @@ impl Hub {
             next_cap: AtomicU64::new(0),
             rate: StdMutex::new(Rate::new(StreamPreset::Balanced, target, HashMap::new())),
             keyframe_at: StdMutex::new(None),
-            pending: AtomicU8::new(PENDING_NONE),
-            ltr: StdMutex::new(Ltr::default()),
+            pending: AtomicBool::new(false),
             stats: StreamStats {
                 started_at_ms: now_ms(),
                 frame_count: AtomicU64::new(0),
@@ -360,76 +335,16 @@ impl Hub {
         if force || at.is_none_or(|t| t.elapsed() >= KEYFRAME_GAP) {
             *at = Some(Instant::now());
             let sent = self.send(ScreenCommand::Keyframe);
-            self.pending.store(if sent { PENDING_NONE } else { PENDING_KEYFRAME }, Ordering::SeqCst);
+            self.pending.store(!sent, Ordering::SeqCst);
         } else {
-            self.pending.store(PENDING_KEYFRAME, Ordering::SeqCst);
-        }
-    }
-
-    /// A viewer skipped frames: it resumes at a refresh frame, a delta frame that refers only to
-    /// a long-term reference every viewer has, or at a keyframe while there is none. Paced like
-    /// keyframes.
-    fn resume(&self) {
-        if self.ltr.lock().expect("ltr mutex").acked.is_none() {
-            return self.keyframe(false);
-        }
-        let mut at = self.keyframe_at.lock().expect("keyframe mutex");
-        if at.is_none_or(|t| t.elapsed() >= KEYFRAME_GAP) {
-            *at = Some(Instant::now());
-            if !self.send(ScreenCommand::Refresh) {
-                let _ =
-                    self.pending.compare_exchange(PENDING_NONE, PENDING_REFRESH, Ordering::SeqCst, Ordering::SeqCst);
-            }
-        } else {
-            let _ = self.pending.compare_exchange(PENDING_NONE, PENDING_REFRESH, Ordering::SeqCst, Ordering::SeqCst);
+            self.pending.store(true, Ordering::SeqCst);
         }
     }
 
     fn flush_keyframe(&self) {
-        match self.pending.swap(PENDING_NONE, Ordering::SeqCst) {
-            PENDING_KEYFRAME => self.keyframe(false),
-            PENDING_REFRESH => self.resume(),
-            _ => {}
+        if self.pending.swap(false, Ordering::SeqCst) {
+            self.keyframe(false);
         }
-    }
-
-    /// From frame `floor` on, no long-term reference is known to be with every viewer yet: a
-    /// keyframe started the stream over (`keep` false), or the viewers changed. A viewer that
-    /// left takes nothing away from the others (`keep` true).
-    fn ltr_reset(&self, floor: u32, keep: bool) {
-        let mut ltr = self.ltr.lock().expect("ltr mutex");
-        let acked = if keep { ltr.acked } else { None };
-        *ltr = Ltr { counts: VecDeque::new(), acked, floor };
-    }
-
-    /// A viewer has frame `seq`, a long-term reference: once every viewer has it, the helper may
-    /// refer to it.
-    fn ltr_received(&self, seq: u32, token: u64) {
-        {
-            let mut ltr = self.ltr.lock().expect("ltr mutex");
-            if seq < ltr.floor || ltr.acked.is_some_and(|a| a >= token) {
-                return;
-            }
-            let count = match ltr.counts.iter_mut().find(|(t, _)| *t == token) {
-                Some((_, n)) => {
-                    *n += 1;
-                    *n
-                }
-                None => {
-                    if ltr.counts.len() >= LTR_WINDOW {
-                        ltr.counts.pop_front();
-                    }
-                    ltr.counts.push_back((token, 1));
-                    1
-                }
-            };
-            if count < self.viewers.load(Ordering::SeqCst) {
-                return;
-            }
-            ltr.acked = Some(token);
-            ltr.counts.retain(|(t, _)| *t > token);
-        }
-        self.send(ScreenCommand::LtrAck(token));
     }
 
     /// A viewer could not keep up: lower the bitrate.
@@ -498,9 +413,6 @@ impl Hub {
                 self.stats.frame_bytes.fetch_add(f.data.len() as u64, Ordering::Relaxed);
                 self.stats.last_frame_at_ms.store(f.captured_us / 1000, Ordering::Relaxed);
                 let seq = self.next_seq.fetch_add(1, Ordering::Relaxed) as u32;
-                if f.key {
-                    self.ltr_reset(seq, false);
-                }
                 let _ = self.video.send(Video::Frame(Arc::new(frame_message(seq, &f, now_us()))));
             }
         }
@@ -518,26 +430,17 @@ fn format_message(f: &ScreenFormat) -> String {
     .to_string()
 }
 
-/// Flags (bit 0: keyframe, bit 1: a refresh frame, a delta frame that refers only to a long-term
-/// reference), frame number, then the capture, encode and receipt times in Unix microseconds (the
-/// encode time is the capture time for an older helper), then the sample.
+/// Flags (bit 0: keyframe), frame number, then the capture, encode and receipt times in Unix
+/// microseconds (the encode time is the capture time for an older helper), then the sample.
 fn frame_message(seq: u32, f: &VideoFrame, received_us: i64) -> Encoded {
     let mut out = Vec::with_capacity(FRAME_HEADER + f.data.len());
-    out.push(u8::from(f.key) | (u8::from(f.refresh && !f.key) << 1));
+    out.push(u8::from(f.key));
     out.extend_from_slice(&seq.to_be_bytes());
     out.extend_from_slice(&f.captured_us.to_be_bytes());
     out.extend_from_slice(&f.encoded_us.unwrap_or(f.captured_us).to_be_bytes());
     out.extend_from_slice(&received_us.to_be_bytes());
     out.extend_from_slice(&f.data);
-    Encoded {
-        seq,
-        key: f.key,
-        droppable: !f.key && unreferenced(&f.data),
-        ltr: f.ltr,
-        refresh: f.refresh && !f.key,
-        received_us,
-        message: Bytes::from(out),
-    }
+    Encoded { seq, key: f.key, droppable: !f.key && unreferenced(&f.data), received_us, message: Bytes::from(out) }
 }
 
 /// Whether no other frame refers to this AVCC sample: every slice in it has `nal_ref_idc` 0
@@ -950,9 +853,6 @@ impl Drop for Joined {
             if hubs.get(&self.lease_id).is_some_and(|h| Arc::ptr_eq(h, &self.hub)) {
                 hubs.remove(&self.lease_id);
             }
-        } else {
-            // Counts that included this viewer could pass for every viewer's now.
-            self.hub.ltr_reset(self.hub.next_seq.load(Ordering::Relaxed) as u32, true);
         }
     }
 }
@@ -972,8 +872,6 @@ fn join(
             return Err(ViewError::Full(max));
         }
         hub.viewers.fetch_add(1, Ordering::SeqCst);
-        // The new viewer has no long-term reference yet; its keyframe starts everyone over.
-        hub.ltr_reset(hub.next_seq.load(Ordering::Relaxed) as u32, false);
         let rx = hub.video.subscribe();
         hub.keyframe(true);
         let joined = Joined { pool: pool.clone(), lease_id: ctx.lease_id.clone(), hub: hub.clone() };
@@ -1122,11 +1020,12 @@ enum ClientMsg {
     VideoVia {
         via: Via,
     },
-    /// What the page's decoder takes. `refresh`: after skipped frames, a delta frame that refers
-    /// to a long-term reference it has, where any decoder takes a keyframe. Checked in WebKit and
-    /// Chrome on macOS: the pictures after it match the full stream.
+    /// What the page's decoder takes: how many later frames it needs before it outputs one
+    /// (WebKit's waits for as many as the stream has reference frames, Chrome's for none), as
+    /// the page measured it.
     Decoder {
-        refresh: bool,
+        #[serde(default)]
+        hold: u8,
     },
     /// The page's timings of the last frames, every 5 s; see `pipeline`.
     Telemetry {
@@ -1183,40 +1082,30 @@ enum Via {
     Rtc,
 }
 
-/// Which frames a viewer gets: all of them while it keeps up, then none until a refresh frame
-/// or a keyframe once frames queue up on the way to it.
+/// Which frames a viewer gets: all of them while it keeps up, then none until a keyframe once
+/// frames queue up on the way to it.
 struct Flow {
-    /// Frames sent and not yet acknowledged, oldest first, with when they were sent and the
-    /// long-term reference token they carry.
-    in_flight: VecDeque<(u32, Instant, Option<u64>)>,
+    /// Frames sent and not yet acknowledged, oldest first, with when they were sent.
+    in_flight: VecDeque<(u32, Instant)>,
     /// The lowest round trip in the current window, and when the window started.
     base_rtt: Option<(Duration, Instant)>,
     need_key: bool,
-    /// Congested: ask for a refresh (or keyframe) once the queue drains.
+    /// Congested: ask for a keyframe once the queue drains.
     resync: bool,
-    /// The decoder has every frame up to where it was skipped, so a refresh frame will do in
-    /// place of a keyframe. Not so for a new viewer or one whose page asked for a keyframe.
-    refresh_ok: bool,
-    /// The page said its decoder takes a refresh frame after skipped frames (`decoder`).
-    refresh_capable: bool,
+    /// How many later frames the page's decoder needs before it outputs a frame (`decoder`).
+    /// It cannot acknowledge a frame before that many more reach it, so a frame is late only
+    /// once the frame that many after it is: the frames it holds are no sign of congestion.
+    hold: usize,
 }
 
 impl Flow {
     fn new() -> Self {
-        Self {
-            in_flight: VecDeque::new(),
-            base_rtt: None,
-            need_key: true,
-            resync: false,
-            refresh_ok: false,
-            refresh_capable: false,
-        }
+        Self { in_flight: VecDeque::new(), base_rtt: None, need_key: true, resync: false, hold: 0 }
     }
 
     /// The page needs a keyframe: its decoder was reset or fell behind.
     fn want_key(&mut self) {
         self.need_key = true;
-        self.refresh_ok = false;
     }
 
     /// How old the oldest unacknowledged frame may get.
@@ -1224,17 +1113,21 @@ impl Flow {
         self.base_rtt.map_or(FIRST_RTT, |(rtt, _)| rtt) + QUEUE_BUDGET
     }
 
+    /// When the oldest frame the page could have shown by now went out.
+    fn oldest_due(&self) -> Option<Instant> {
+        self.in_flight.get(self.hold).map(|(_, at)| *at)
+    }
+
     fn queued(&self) -> bool {
-        self.in_flight.len() >= MAX_IN_FLIGHT
-            || self.in_flight.front().is_some_and(|(_, at, _)| at.elapsed() > self.limit())
+        self.in_flight.len() >= MAX_IN_FLIGHT + self.hold
+            || self.oldest_due().is_some_and(|at| at.elapsed() > self.limit())
     }
 
     /// Half way to `queued`: the viewer falls behind, but skipping frames that nothing refers to
     /// may be enough. It costs no keyframe, where `queued` costs one.
     fn behind(&self) -> bool {
         let half = self.base_rtt.map_or(FIRST_RTT, |(rtt, _)| rtt) + QUEUE_BUDGET / 2;
-        self.in_flight.len() >= MAX_IN_FLIGHT / 2
-            || self.in_flight.front().is_some_and(|(_, at, _)| at.elapsed() > half)
+        self.in_flight.len() >= MAX_IN_FLIGHT / 2 + self.hold || self.oldest_due().is_some_and(|at| at.elapsed() > half)
     }
 
     fn admit(&mut self, f: &Encoded, hub: &Hub) -> bool {
@@ -1243,44 +1136,38 @@ impl Flow {
         }
         if self.queued() {
             hub.congested();
-            if !self.need_key && self.refresh_capable {
-                // It had every frame so far: a refresh frame from a reference it has will do.
-                self.refresh_ok = true;
-            }
             self.need_key = true;
             self.resync = true;
             return false;
         }
-        if self.need_key && !f.key && !(f.refresh && self.refresh_ok) {
+        if self.need_key && !f.key {
             if !self.resync {
-                if self.refresh_ok { hub.resume() } else { hub.keyframe(false) }
+                hub.keyframe(false);
             }
             return false;
         }
         self.need_key = false;
         self.resync = false;
-        self.refresh_ok = false;
-        self.in_flight.push_back((f.seq, Instant::now(), f.ltr));
+        self.in_flight.push_back((f.seq, Instant::now()));
         true
     }
 
     fn ack(&mut self, seq: u32, hub: &Hub) {
-        if let Some(pos) = self.in_flight.iter().position(|(s, _, _)| *s == seq) {
-            let rtt = self.in_flight[pos].1.elapsed();
+        if let Some(pos) = self.in_flight.iter().position(|(s, _)| *s == seq) {
+            // The round trip of the frame that let the decoder output this one.
+            let rtt =
+                self.in_flight.get(pos + self.hold).unwrap_or(&self.in_flight[self.in_flight.len() - 1]).1.elapsed();
             // The page shows frames in order: it has every one up to this.
-            for (seq, _, token) in self.in_flight.drain(..=pos) {
-                if let Some(token) = token {
-                    hub.ltr_received(seq, token);
-                }
-            }
+            self.in_flight.drain(..=pos);
             self.base_rtt = match self.base_rtt {
                 Some((base, since)) if rtt >= base && since.elapsed() < RTT_WINDOW => Some((base, since)),
                 _ => Some((rtt, Instant::now())),
             };
         }
-        if self.resync && !self.queued() && self.in_flight.len() <= 1 {
+        // Frames sent are all shown, but for the ones the decoder holds until the next arrive.
+        if self.resync && !self.queued() && self.in_flight.len() <= self.hold + 1 {
             self.resync = false;
-            if self.refresh_ok { hub.resume() } else { hub.keyframe(false) }
+            hub.keyframe(false);
         }
     }
 }
@@ -1318,8 +1205,10 @@ enum Ctl {
     Keyframe,
     /// The page shows the WebRTC stream (`true`) or the WebSocket's.
     Rtc(bool),
-    /// The page's decoder takes refresh frames.
-    Refresh(bool),
+    /// How many frames the page's decoder holds.
+    Decoder {
+        hold: u8,
+    },
     /// The page's timings.
     Report(Box<pipeline::PageReport>),
     /// What the page showed, for the viewer trace.
@@ -1413,7 +1302,7 @@ async fn session(live: Live, mut video: broadcast::Receiver<Video>, socket: WebS
                             "ev": "frame", "lease": live.ctx.lease_id, "viewer": viewer, "seq": f.seq, "key": f.key,
                             "bytes": f.message.len(), "capture_us": at(5), "encode_us": at(13),
                             "read_us": f.received_us, "written_us": sent.then_some(written_us), "skipped": !sent,
-                            "droppable": f.droppable, "ltr": f.ltr, "refresh": f.refresh,
+                            "droppable": f.droppable,
                         })
                     });
                 }
@@ -1443,13 +1332,13 @@ async fn session(live: Live, mut video: broadcast::Receiver<Video>, socket: WebS
                     rtc_video = on;
                     if !on {
                         // Back on the WebSocket: start over at a keyframe.
-                        let capable = flow.refresh_capable;
+                        let hold = flow.hold;
                         flow = Flow::new();
-                        flow.refresh_capable = capable;
+                        flow.hold = hold;
                         hub.keyframe(false);
                     }
                 }
-                Some(Ctl::Refresh(capable)) => flow.refresh_capable = capable,
+                Some(Ctl::Decoder { hold }) => flow.hold = usize::from(hold.min(MAX_HOLD)),
                 Some(Ctl::Report(r)) => pipe.lock().expect("pipeline mutex").page = Some(*r),
                 Some(Ctl::Trace(t)) => t.write(&live.pool.viewers.trace, &live.ctx.lease_id, viewer),
                 // The page closed its socket.
@@ -1563,8 +1452,8 @@ async fn read_page(
                     )
                 }
             }
-            Ok(ClientMsg::Decoder { refresh }) => {
-                if ctl.send(Ctl::Refresh(refresh)).await.is_err() {
+            Ok(ClientMsg::Decoder { hold }) => {
+                if ctl.send(Ctl::Decoder { hold }).await.is_err() {
                     return;
                 }
                 None

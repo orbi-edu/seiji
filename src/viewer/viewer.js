@@ -155,12 +155,7 @@
       resetLoss();
       lastPong = performance.now();
       ping();
-      // After skipped frames, the server may resume this page at a delta frame that refers to a
-      // long-term reference it has, not at a keyframe. Checked with the WebCodecs of WebKit and
-      // Chrome on macOS (both VideoToolbox), where the pictures match the full stream; any other
-      // decoder gets keyframes.
-      const ua = navigator.userAgent;
-      send({ t: "decoder", refresh: /Macintosh/.test(ua) && !/Firefox\//.test(ua) });
+      send({ t: "decoder", hold: decoderHold });
       startRtc();
     };
     ws.onmessage = (ev) => (typeof ev.data === "string" ? onText(JSON.parse(ev.data)) : onFrame(ev.data));
@@ -432,6 +427,25 @@
   // A jittery link delivers frames in bursts: the decoder takes 2–5 ms a frame and catches up,
   // where a drop costs a keyframe's round trip.
   const MAX_DECODE_QUEUE = 16;
+  // How many later frames the decoder needs before it outputs one: the fewest still in it at
+  // an output, over the last 30. Chrome's needs none. WebKit's needs 1 or 2 (with one reference
+  // frame), from one output to the next: the page says one more than the fewest, so that the
+  // server never takes a frame the decoder still holds for one the link lost, and waits for it
+  // forever. The server judges this page's lag past them, and a decoder that holds them is not
+  // stalled.
+  let decoderHold = 0;
+  const holds = [];
+  function noteHold() {
+    holds.push(decoding.size);
+    if (holds.length > 30) holds.shift();
+    if (holds.length < 30) return;
+    const fewest = Math.min(...holds);
+    const hold = fewest === 0 ? 0 : fewest + 1;
+    if (hold !== decoderHold) {
+      decoderHold = hold;
+      send({ t: "decoder", hold });
+    }
+  }
 
   function base64Bytes(s) {
     const bin = atob(s);
@@ -467,6 +481,7 @@
         if (entry !== undefined) {
           decoding.delete(frame.timestamp);
           send({ t: "ack", seq: entry[0] });
+          noteHold();
           sample("decode", performance.now() - entry[1]);
           if (tracing) traced.frames.push([entry[0], serverMs(entry[1]), serverMs(performance.now())]);
         }
@@ -554,8 +569,7 @@
     const encodedUs = Number(view.getBigInt64(13));
     const receivedUs = Number(view.getBigInt64(21));
     if (diagHooks.arrive) {
-      const refresh = (view.getUint8(0) & 2) === 2;
-      diagHooks.arrive({ seq, key, refresh, capturedUs, encodedUs, receivedUs, at: performance.now(), bytes: buf.byteLength });
+      diagHooks.arrive({ seq, key, capturedUs, encodedUs, receivedUs, at: performance.now(), bytes: buf.byteLength });
     }
     stats.bytes.push([Date.now(), buf.byteLength]);
     sample("encode", (encodedUs - capturedUs) / 1000);
@@ -590,10 +604,11 @@
     decoder.decode(new EncodedVideoChunk({ type: key ? "key" : "delta", timestamp: capturedUs, data: new Uint8Array(buf, 29) }));
   }
 
-  // A decoder that holds a frame for a second has stalled: let the stream go on.
+  // A decoder that holds a frame for a second while more than its usual frames wait behind it
+  // has stalled: let the stream go on. With nothing new behind it, it only waits for the next.
   setInterval(() => {
     const oldest = decoding.values().next().value;
-    if (oldest && performance.now() - oldest[1] > 1000) flushDecoding();
+    if (oldest && performance.now() - oldest[1] > 1000 && decoding.size > decoderHold + 1) flushDecoding();
   }, 500);
 
   // ── WebRTC ─────────────────────────────────────────────────────────────

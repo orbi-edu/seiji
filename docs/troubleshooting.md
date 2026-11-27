@@ -574,7 +574,7 @@ To measure a browser end to end, with known inputs, run the [viewer diagnosis](m
 | Encode | The Mac's media engine is busy (many watched leases) | Fewer streams, or a lower `viewer.scale` |
 | Helper → server, or in server | The daemon is behind (CPU), or the write waits on the viewer's socket | Check the host's load; "in server" that grows with the network means the link is full |
 | Network | The path between the host and the viewer: the TLS proxy, the internet, the viewer's own link | Compare `rtt` with a ping from the viewer's machine to `1.1.1.1`; pick **Smooth** |
-| Decode | The viewer's machine decodes slowly. In Safari and Tern (WebKit), the decoder holds about 7 frames before it shows one: the diagnosis measured 120 ms at 60 fps and 240 ms at 30 fps, where Chrome took 2 ms | Close other video in the browser; a lower `viewer.scale`; Chrome |
+| Decode | The viewer's machine decodes slowly. In Safari and Tern (WebKit), the decoder holds 2 frames before it shows one, about 37 ms at 60 fps and 70 ms at 30 fps, where Chrome takes 2 ms; a lower frame rate makes it longer | Close other video in the browser; a lower `viewer.scale`; 60 fps; Chrome |
 | Upload | The path from the viewer to the host, as for the network | As for the network |
 | Input in server: lock | A run holds the device, or another viewer's finger is down | Wait for the run |
 | Input in server: pacing | The link bunched a gesture's points, and Seiji spaces them again (up to `viewer.paceMaxMs`) | A lower cap in **Viewer settings** ([tern.md](tern.md)), at the cost of swipes that fling |

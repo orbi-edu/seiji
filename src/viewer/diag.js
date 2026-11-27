@@ -180,7 +180,6 @@
     if (!rec) return;
     rec.arrivals.set(a.seq, a);
     if (a.key) rec.phase.keyframes++;
-    if (a.refresh) rec.phase.refreshes++;
     if (rec.lastSeq !== null && a.seq > rec.lastSeq + 1) rec.phase.skipped += a.seq - rec.lastSeq - 1;
     rec.lastSeq = a.seq;
     rec.phase.arrived++;
@@ -301,7 +300,7 @@
     return s || 1;
   }
 
-  // What came just before a damaged frame: was it a keyframe, a refresh, or after skipped frames?
+  // What came just before a damaged frame: was it a keyframe, or after skipped frames?
   function context(seq) {
     if (seq === null || seq === undefined) return {};
     const a = rec.arrivals.get(seq);
@@ -314,7 +313,7 @@
       }
     }
     const prev = rec.arrivals.get(seq - 1);
-    return { seq, key: a ? a.key : null, refresh: a ? a.refresh : null, after_skip: !prev, frames_since_key: sinceKey };
+    return { seq, key: a ? a.key : null, after_skip: !prev, frames_since_key: sinceKey };
   }
 
   // The server-clock time an input went out: when the helper had it, or when the page sent it.
@@ -362,7 +361,7 @@
     // but still before it move the base on as they come (`match`).
     const last = rec.frames.findLast((f) => f.taps !== undefined);
     const p = {
-      name, start: now(), end: null, shown: 0, arrived: 0, keyframes: 0, refreshes: 0, skipped: 0, damaged: 0, unread: 0,
+      name, start: now(), end: null, shown: 0, arrived: 0, keyframes: 0, skipped: 0, damaged: 0, unread: 0,
       queueMax: 0, firstUs: null, baseTaps: last ? last.taps : null, baseKeys: last ? last.keys : null,
     };
     if (rec.phase) rec.phase.end = p.start;
@@ -521,7 +520,6 @@
         fps_captured: Math.round(caps / secs),
         fps_device: frames.length > 1 ? Math.round(raf / ((frames.at(-1).at - frames[0].at) / 1000)) : null,
         keyframes: p.keyframes,
-        refreshes: p.refreshes,
         skipped: p.skipped,
         damaged: p.damaged,
         decode_queue_max: p.queueMax,
@@ -645,9 +643,8 @@
     for (const [w, n] of Object.entries(where)) lines.push(`${n} stalls over 150 ms: ${w}`);
     const damaged = r.phases.reduce((s, p) => s + p.damaged, 0);
     if (damaged) {
-      const after = r.damage.filter((d) => d.refresh).length;
       const skip = r.damage.filter((d) => d.after_skip).length;
-      lines.push(`${damaged} damaged frames (${after} at a refresh frame, ${skip} after skipped frames)`);
+      lines.push(`${damaged} damaged frames (${skip} after skipped frames)`);
     }
     return lines;
   }
@@ -657,9 +654,9 @@
     const read = r.read_ms ? `${r.read_ms.p50}/${r.read_ms.p95} ms a frame` : "—";
     const out = [`Seiji viewer diagnosis · ${r.transport} · ${r.codec} ${r.size} · rtt ${r.rtt_ms} ms · read ${read}`, ""];
     out.push(...r.verdict.map((l) => `• ${l}`), "");
-    out.push("phase       fps shown/arrived/captured/device  key ref skip dmg  queue");
+    out.push("phase       fps shown/arrived/captured/device  key skip dmg  queue");
     for (const p of r.phases) {
-      out.push(`${p.name.padEnd(11)} ${String(p.fps_shown).padStart(3)}/${String(p.fps_arrived ?? "—").padStart(3)}/${String(p.fps_captured).padStart(3)}/${String(p.fps_device ?? "—").padStart(3)}                 ${String(p.keyframes).padStart(3)} ${String(p.refreshes).padStart(3)} ${String(p.skipped).padStart(4)} ${String(p.damaged).padStart(3)}  ${p.decode_queue_max}`);
+      out.push(`${p.name.padEnd(11)} ${String(p.fps_shown).padStart(3)}/${String(p.fps_arrived ?? "—").padStart(3)}/${String(p.fps_captured).padStart(3)}/${String(p.fps_device ?? "—").padStart(3)}                 ${String(p.keyframes).padStart(3)} ${String(p.skipped).padStart(4)} ${String(p.damaged).padStart(3)}  ${p.decode_queue_max}`);
     }
     out.push("", "input (p50/p95 ms)  total     upload  server  device  pipeline  (encode helper server+net decode)");
     for (const p of r.phases) {

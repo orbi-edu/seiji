@@ -71,7 +71,7 @@ type Socket = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStre
 #[derive(Debug)]
 enum Msg {
     Text(Value),
-    Frame { key: bool, seq: u32, refresh: bool },
+    Frame { key: bool, seq: u32 },
     Closed(u16, String),
 }
 
@@ -108,8 +108,7 @@ async fn next(ws: &mut Socket) -> Msg {
         match m {
             Some(Ok(tungstenite::Message::Text(t))) => return Msg::Text(serde_json::from_str(&t).unwrap()),
             Some(Ok(tungstenite::Message::Binary(b))) => {
-                let seq = u32::from_be_bytes(b[1..5].try_into().unwrap());
-                return Msg::Frame { key: b[0] & 1 == 1, seq, refresh: b[0] & 2 == 2 };
+                return Msg::Frame { key: b[0] & 1 == 1, seq: u32::from_be_bytes(b[1..5].try_into().unwrap()) };
             }
             Some(Ok(tungstenite::Message::Close(f))) => {
                 return f.map_or(Msg::Closed(1005, String::new()), |f| {
@@ -158,18 +157,12 @@ async fn format(ws: &mut Socket) -> Value {
 
 /// The next frame, acknowledged; text messages on the way are skipped.
 async fn frame(ws: &mut Socket) -> (bool, u32) {
-    let (key, seq, _) = frame_flags(ws).await;
-    (key, seq)
-}
-
-/// As `frame`, with whether it is a refresh frame.
-async fn frame_flags(ws: &mut Socket) -> (bool, u32, bool) {
     within("frame", async {
         loop {
             match next(ws).await {
-                Msg::Frame { key, seq, refresh } => {
+                Msg::Frame { key, seq } => {
                     send(ws, json!({"t": "ack", "seq": seq})).await;
-                    return (key, seq, refresh);
+                    return (key, seq);
                 }
                 Msg::Text(_) => {}
                 Msg::Closed(code, why) => panic!("closed {code}: {why}"),
@@ -366,7 +359,7 @@ async fn a_still_screen_reaches_a_viewer_that_joins_later() {
 
 /// Acknowledges nothing for 1.5 s, then the last frame it got: returns that frame's number and
 /// the next frame.
-async fn stall_then_catch_up(env: &Env, ws: &mut Socket) -> (u32, (bool, u32, bool)) {
+async fn stall_then_catch_up(env: &Env, ws: &mut Socket) -> (u32, (bool, u32)) {
     // Frames queue up on the way, and past half a second the server stops sending instead of
     // queueing more.
     let started = std::time::Instant::now();
@@ -385,53 +378,58 @@ async fn stall_then_catch_up(env: &Env, ws: &mut Socket) -> (u32, (bool, u32, bo
     // A congested viewer lowers the shared bitrate.
     assert!(env.fake.log().iter().any(|l| l.starts_with("encode 60 0.5 1750000")), "{:?}", env.fake.log());
     send(ws, json!({"t": "ack", "seq": last})).await;
-    (last, frame_flags(ws).await)
+    (last, frame(ws).await)
 }
 
 #[tokio::test]
-async fn a_slow_viewer_gets_no_stale_frames_and_resumes_at_a_refresh_frame() {
+async fn a_slow_viewer_gets_no_stale_frames_and_resumes_at_a_keyframe() {
     let env = setup_with(2, json!({"viewer": {"fps": 60}})).await;
     let (token, lease) = device(&env, "alice").await;
     let mut ws = open(&env, &token, &lease, false).await.ws().await;
     format(&mut ws).await;
-    send(&mut ws, json!({"t": "decoder", "refresh": true})).await;
-    // Its acknowledgement tells the helper that every viewer has the long-term references up to
-    // there, so it resumes at a delta frame that refers to one, not at a keyframe.
-    let (last, (key, seq, refresh)) = stall_then_catch_up(&env, &mut ws).await;
-    assert!(!key && refresh, "after a gap the next frame is a refresh frame, and says so");
+    let (last, (key, seq)) = stall_then_catch_up(&env, &mut ws).await;
+    assert!(key, "after a gap the next frame is a keyframe");
     assert!(seq > last + 1, "frames were skipped, not queued");
-    assert_eq!(env.fake.refreshes.load(Ordering::SeqCst), 1);
-    assert!(env.fake.ltr_acks.lock().unwrap().iter().any(|t| *t <= u64::from(last)), "{:?}", env.fake.ltr_acks);
 }
 
+/// A decoder that holds frames shows each one only when more come (WebKit's holds as many as the
+/// stream has reference frames), so its page cannot acknowledge the last ones until the stream
+/// goes on. A page that says so resumes after a stall like any other; were its held frames
+/// counted as in flight, the server would wait for them forever.
 #[tokio::test]
-async fn a_slow_viewer_whose_decoder_may_not_take_refresh_frames_resumes_at_a_keyframe() {
+async fn a_decoder_that_holds_frames_resumes_after_a_stall() {
+    const HOLD: usize = 3;
+    // Shows (and acknowledges) a frame once `HOLD` later ones came.
+    async fn watch(ws: &mut Socket, ms: u64, ack: bool, got: &mut Vec<(u32, bool)>) {
+        let _ = tokio::time::timeout(Duration::from_millis(ms), async {
+            loop {
+                if let Msg::Frame { key, seq } = next(ws).await {
+                    got.push((seq, key));
+                    if ack && got.len() > HOLD {
+                        send(ws, json!({"t": "ack", "seq": got[got.len() - 1 - HOLD].0})).await;
+                    }
+                }
+            }
+        })
+        .await;
+    }
     let env = setup_with(2, json!({"viewer": {"fps": 60}})).await;
     let (token, lease) = device(&env, "alice").await;
     let mut ws = open(&env, &token, &lease, false).await.ws().await;
     format(&mut ws).await;
-    // The page did not say its decoder takes refresh frames.
-    let (last, (key, seq, refresh)) = stall_then_catch_up(&env, &mut ws).await;
-    assert!(key && !refresh, "after a gap the next frame is a keyframe");
-    assert!(seq > last + 1, "frames were skipped, not queued");
-    assert!(!env.fake.ltr_acks.lock().unwrap().is_empty(), "the reference was acknowledged all the same");
-    assert_eq!(env.fake.refreshes.load(Ordering::SeqCst), 0);
-}
-
-#[tokio::test]
-async fn a_slow_viewer_resumes_at_a_keyframe_while_another_has_no_reference() {
-    let env = setup_with(2, json!({"viewer": {"fps": 60}})).await;
-    let (token, lease) = device(&env, "alice").await;
-    let mut ws = open(&env, &token, &lease, false).await.ws().await;
-    format(&mut ws).await;
-    send(&mut ws, json!({"t": "decoder", "refresh": true})).await;
-    // A second viewer that acknowledges nothing: no long-term reference is with every viewer.
-    let _other = open(&env, &token, &lease, false).await.ws().await;
-    let (last, (key, seq, refresh)) = stall_then_catch_up(&env, &mut ws).await;
-    assert!(key && !refresh, "after a gap the next frame is a keyframe");
-    assert!(seq > last + 1, "frames were skipped, not queued");
-    assert!(env.fake.ltr_acks.lock().unwrap().is_empty(), "{:?}", env.fake.ltr_acks);
-    assert_eq!(env.fake.refreshes.load(Ordering::SeqCst), 0);
+    send(&mut ws, json!({"t": "decoder", "hold": HOLD})).await;
+    let mut got = Vec::new();
+    watch(&mut ws, 500, true, &mut got).await;
+    // The page stalls: the server stops sending.
+    watch(&mut ws, 1500, false, &mut got).await;
+    assert!(env.fake.log().iter().any(|l| l.starts_with("encode 60 0.5 1750000")), "{:?}", env.fake.log());
+    // It catches up: it shows all but the last `HOLD` frames.
+    send(&mut ws, json!({"t": "ack", "seq": got[got.len() - 1 - HOLD].0})).await;
+    let before = got.len();
+    watch(&mut ws, 1500, true, &mut got).await;
+    let after = &got[before..];
+    assert!(after.first().is_some_and(|(_, key)| *key), "it resumes at a keyframe: {after:?}");
+    assert!(after.len() > 30, "and the stream goes on: {} frames in 1.5 s", after.len());
 }
 
 /// A frame's flags, frame number, and whether nothing refers to it (its first NAL unit has
