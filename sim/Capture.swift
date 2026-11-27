@@ -37,6 +37,11 @@ final class Capture {
     private static let maxInFlight = 3
     /// Pace of retries for pending work (keyframe, new session) on an unchanged screen.
     private static let retryInterval: UInt64 = 200_000_000
+    /// A decoder may hold the newest frames until more come: WebKit's holds 2 with one reference
+    /// frame. When the screen goes still, the last picture is encoded this many times more (each
+    /// a small frame with nothing changed), so every viewer shows it at once rather than at the
+    /// next change.
+    private static let repeats = 2
 
     private let io: NSObject
     private let pointScale: Double?
@@ -57,8 +62,8 @@ final class Capture {
     private var lastCaptureNanos: UInt64 = 0
     private var lastAttemptNanos: UInt64 = 0
     private var keyframeRequested = true
-    /// The daemon asks for a refresh (see `Encoder.encode`).
-    private var refreshRequested = false
+    /// Repeats of the last picture still to send (see `repeats`).
+    private var repeatsOwed = 0
     /// The surface `sourceBuffer` wraps.
     private var bufferSurface: IOSurface?
     private var sourceBuffer: CVPixelBuffer?
@@ -128,17 +133,6 @@ final class Capture {
             keyframeRequested = true
             tick(force: true)
         }
-    }
-
-    func requestRefresh() {
-        queue.async { [self] in
-            refreshRequested = true
-            tick(force: true)
-        }
-    }
-
-    func acknowledge(ltr token: UInt64) {
-        queue.async { [self] in encoder.acknowledge(ltr: token) }
     }
 
     func update(fps: Int?, scale: Double?, bitrate: Int?) {
@@ -245,10 +239,11 @@ final class Capture {
         else { return }
         let seed = IOSurfaceGetSeed(surface)
         let changed = surface !== lastSurface || seed != lastSeed
-        // Work a static screen would never trigger again: a requested keyframe or refresh, one the
+        // Work a static screen would never trigger again: a requested keyframe, one the
         // encoder or stdout dropped, or a session still to be created at a new size.
-        let pending = keyframeRequested || refreshRequested || encoder.needsKeyframe
-        guard changed || pending || force else { return }
+        let pending = keyframeRequested || encoder.needsKeyframe
+        let repeating = !changed && !pending && repeatsOwed > 0
+        guard changed || pending || force || repeating else { return }
         let now = monotonicNanos()
         // A keyframe line flood must not queue frames without bound: forced work over the limit
         // stays pending for a paced retry.
@@ -257,7 +252,7 @@ final class Capture {
             // Encoding what stdout would refuse only wastes time; the change or pending work is
             // picked up by a later tick.
             guard Output.shared.acceptsFrames else { return }
-            if changed {
+            if changed || repeating {
                 // At most `fps` frames a second.
                 let interval = 1_000_000_000 / UInt64(fps)
                 guard now &- lastCaptureNanos >= interval - interval / 8 else { return }
@@ -283,10 +278,9 @@ final class Capture {
         lastSeed = seed
         lastCaptureNanos = now
         let keyframe = keyframeRequested
-        let refresh = refreshRequested
         keyframeRequested = false
-        refreshRequested = false
-        encoder.encode(output, capturedMicros: unixMicros(), forceKeyframe: keyframe, refresh: refresh)
+        repeatsOwed = repeating ? repeatsOwed - 1 : Self.repeats
+        encoder.encode(output, capturedMicros: unixMicros(), forceKeyframe: keyframe)
         debugLog("captured seed=\(seed) force=\(force) changed=\(changed) in \(Double(monotonicNanos() - now) / 1e6) ms")
     }
 

@@ -51,11 +51,8 @@ pub struct FakeDevices {
     pub signed_in: AtomicBool,
     pub stopped_captures: AtomicUsize,
     pub streams_started: AtomicUsize,
-    /// The LTR tokens the daemon acknowledged, in order.
-    pub ltr_acks: Mutex<Vec<u64>>,
-    /// Refresh frames sent, as asked for with an LTR acknowledged; without one, a refresh is a
-    /// keyframe, as with VideoToolbox.
-    pub refreshes: AtomicUsize,
+    /// Keyframe requests the helper got.
+    pub keyframes: AtomicUsize,
     /// JPEGs `screenshot` returns; a tiny placeholder when empty.
     pub frames: Mutex<Vec<Vec<u8>>>,
     /// A still screen: the helper sends frames only when asked for a keyframe.
@@ -247,16 +244,14 @@ impl Devices for FakeDevices {
         let size = self.frame_bytes.load(Ordering::SeqCst);
         // One length-prefixed NAL unit, an IDR slice (5) or a non-IDR one (1), that carries the
         // frame number. Like the encoder: two temporal layers, so every odd delta is one nothing
-        // refers to (`nal_ref_idc` 0); every other frame is a long-term reference, with its frame
-        // number as the token; a refresh frame is a referenced delta.
-        let frame = |n: u64, key: bool, refresh: bool| {
+        // refers to (`nal_ref_idc` 0).
+        let frame = |n: u64, key: bool| {
             let captured_us =
                 std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_micros()
                     as i64;
-            let referenced = key || refresh || n.is_multiple_of(2);
             let header = if key {
                 0x65
-            } else if referenced {
+            } else if n.is_multiple_of(2) {
                 0x41
             } else {
                 0x01
@@ -267,21 +262,11 @@ impl Devices for FakeDevices {
             let mut data = (nal.len() as u32).to_be_bytes().to_vec();
             data.extend_from_slice(&nal);
             let encoded_us = Some(captured_us + 2_000);
-            let ltr = referenced.then_some(n);
-            ScreenEvent::Frame(VideoFrame {
-                key,
-                captured_us,
-                encoded_us,
-                ltr,
-                refresh,
-                data: bytes::Bytes::from(data),
-            })
+            ScreenEvent::Frame(VideoFrame { key, captured_us, encoded_us, data: bytes::Bytes::from(data) })
         };
-        // Acknowledged since the last keyframe: a refresh can refer to it.
-        let mut acked = false;
         events.send(ScreenEvent::Ready).await?;
         events.send(ScreenEvent::Format(format)).await?;
-        events.send(frame(0, true, false)).await?;
+        events.send(frame(0, true)).await?;
         let mut tick = tokio::time::interval(Duration::from_millis(1000 / u64::from(opts.fps.max(1))));
         tick.tick().await;
         let mut n: u64 = 1;
@@ -289,26 +274,15 @@ impl Devices for FakeDevices {
             tokio::select! {
                 _ = cancel.cancelled() => return Ok(()),
                 _ = tick.tick(), if !self.still.load(Ordering::SeqCst) => {
-                    events.send(frame(n, false, false)).await?;
+                    events.send(frame(n, false)).await?;
                     n += 1;
                 }
                 cmd = commands.recv() => match cmd {
                     None => return Ok(()),
                     Some(ScreenCommand::Keyframe) => {
-                        acked = false;
-                        events.send(frame(n, true, false)).await?;
+                        self.keyframes.fetch_add(1, Ordering::SeqCst);
+                        events.send(frame(n, true)).await?;
                         n += 1;
-                    }
-                    Some(ScreenCommand::Refresh) => {
-                        if acked {
-                            self.refreshes.fetch_add(1, Ordering::SeqCst);
-                        }
-                        events.send(frame(n, !acked, acked)).await?;
-                        n += 1;
-                    }
-                    Some(ScreenCommand::LtrAck(token)) => {
-                        acked = true;
-                        self.ltr_acks.lock().unwrap().push(token);
                     }
                     Some(ScreenCommand::Touch { phase, x, y, edge }) => self.note(format!(
                         "touch {} {x:.2},{y:.2}{}",
